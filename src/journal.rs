@@ -56,20 +56,34 @@ fn record_path(dir: &Path, lease_id: &Uuid, resource: &ResourceId) -> PathBuf {
 #[derive(Debug)]
 pub(crate) struct JournalStore {
     dir: PathBuf,
+    #[cfg(feature = "test-util")]
+    fail_writes: std::sync::atomic::AtomicBool,
 }
 
 impl JournalStore {
     pub(crate) fn open(dir: PathBuf) -> Result<Self> {
         ensure_private_dir(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            #[cfg(feature = "test-util")]
+            fail_writes: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn dir(&self) -> &Path {
-        &self.dir
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn write(&self, record: &JournalRecord) -> Result<()> {
+        #[cfg(feature = "test-util")]
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::platform(
+                record.backend,
+                format_args!("injected journal write failure"),
+            ));
+        }
         let path = record_path(&self.dir, &record.lease_id, &record.resource);
         let bytes = serde_json::to_vec_pretty(record).map_err(|e| {
             Error::platform(

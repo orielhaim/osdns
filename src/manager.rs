@@ -102,13 +102,13 @@ impl Inner {
     }
 }
 
-struct MutatePoints {
+pub(crate) struct MutatePoints {
     apply: TxPoint,
     readback: TxPoint,
     verify: TxPoint,
 }
 
-const INITIAL_POINTS: MutatePoints = MutatePoints {
+pub(crate) const INITIAL_POINTS: MutatePoints = MutatePoints {
     apply: TxPoint::AfterApply,
     readback: TxPoint::AfterReadback,
     verify: TxPoint::AfterVerify,
@@ -147,7 +147,7 @@ impl Inner {
         Ok(())
     }
 
-    fn mutate_and_verify(
+    pub(crate) fn mutate_and_verify(
         &self,
         resource: &ResourceId,
         plan: &NormalizedConfig,
@@ -652,6 +652,18 @@ impl DnsManager {
     /// Under [`ConflictPolicy::Enforce`] this also starts the reconciliation
     /// worker, which rebases onto externally modified base state and reapplies
     /// the desired overlay of every active lease.
+    /// Registers a callback for native DNS change notifications.
+    ///
+    /// Events are coalesced per resource within a small window, and events
+    /// caused by this manager's own mutations are suppressed for the
+    /// user-callback path.
+    ///
+    /// Under [`ConflictPolicy::Enforce`] every event is also fed to the
+    /// reconciliation worker *before* suppression: the worker reads the
+    /// authoritative state, treats events matching our applied overlay as
+    /// no-ops (state-aware suppression), and rebases/reapplies on genuine
+    /// external changes. Events deferred by the worker's scheduler are
+    /// pending, never dropped.
     pub fn watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let feed = if self.inner.conflict_policy == ConflictPolicy::Enforce {
             Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?)
@@ -662,17 +674,16 @@ impl DnsManager {
             crate::watch::spawn_coalescer(self.inner.backend.kind(), callback, COALESCE_WINDOW)?;
         let suppressions = Arc::clone(&self.inner.suppressions);
         let filtered: WatchCallback = Arc::new(move |event| {
-            if suppressions.is_suppressed(event.resource()) {
-                return;
-            }
             if let Some(feed) = &feed {
                 let _ = feed.send(event.resource().clone());
+            }
+            if suppressions.is_suppressed(event.resource()) {
+                return;
             }
             coalescer(event);
         });
         self.inner.backend.start_watch(filtered)
     }
-
     /// Flushes the OS DNS cache, when the backend supports it.
     ///
     /// Best-effort only; correctness never depends on cache state.
@@ -711,6 +722,35 @@ impl DnsManager {
             .hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// Toggles injected journal write failures (testing only).
+    #[cfg(feature = "test-util")]
+    pub fn set_journal_fail_writes(&self, fail: bool) {
+        self.inner.journal.set_fail_writes(fail);
+    }
+
+    /// Runs one synchronous reconciliation pass for `resource` (testing
+    /// only), so Enforce semantics can be exercised deterministically
+    /// without timing races against the worker thread.
+    #[cfg(feature = "test-util")]
+    pub fn debug_reconcile(&self, resource: &str) -> Result<crate::testing::DebugReconcile> {
+        use crate::reconciliation::ReconcileOutcome;
+        let resource: ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        Ok(
+            match self
+                .inner
+                .reconcile_resource(&resource, &self.inner.reconciler)
+            {
+                ReconcileOutcome::NoActiveLease => crate::testing::DebugReconcile::NotOwned,
+                ReconcileOutcome::StillOurs => crate::testing::DebugReconcile::StillOurs,
+                ReconcileOutcome::Rebased => crate::testing::DebugReconcile::Rebased,
+                ReconcileOutcome::Deferred => crate::testing::DebugReconcile::Deferred,
+                ReconcileOutcome::Failed => crate::testing::DebugReconcile::Failed,
+            },
+        )
     }
 }
 

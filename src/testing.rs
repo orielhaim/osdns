@@ -158,6 +158,50 @@ pub fn manager_for_testing_with_policy(
     })))
 }
 
+/// Builds a [`DnsManager`] pinned to a specific real backend, bypassing
+/// detection. Used by the real-backend integration matrix; unavailable
+/// backends fail with [`Error::BackendUnavailable`].
+pub fn manager_for_backend(
+    owner: &str,
+    state_dir: &Path,
+    kind: crate::capability::BackendKind,
+    lock_timeout: Duration,
+) -> Result<DnsManager> {
+    use std::collections::HashMap;
+    ensure_private_dir(state_dir)?;
+    let locks = ResourceLockManager::new(state_dir.join("locks"), lock_timeout);
+    locks.ensure_dir()?;
+    let journal = JournalStore::open(state_dir.join("journal"))?;
+    let backend = crate::platform::construct_backend(kind, owner)?;
+    Ok(DnsManager::from_inner(Arc::new(Inner {
+        owner: owner.to_string(),
+        backend,
+        locks,
+        journal,
+        conflict_policy: ConflictPolicy::Cooperative,
+        hook: Mutex::new(None),
+        suppressions: std::sync::Arc::new(SuppressionRegistry::new()),
+        active: Mutex::new(HashMap::new()),
+        lease_tokens: Mutex::new(HashMap::new()),
+        reconciler: crate::reconciliation::Reconciler::default(),
+    })))
+}
+
+/// Deterministic reconciliation outcome for tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugReconcile {
+    /// No active lease owns the resource.
+    NotOwned,
+    /// The state still matches the lease's applied overlay.
+    StillOurs,
+    /// The external base was adopted and the overlay reapplied.
+    Rebased,
+    /// The pass was deferred (unstable, busy, or circuit breaker).
+    Deferred,
+    /// The pass failed and was deferred with an error.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 enum FaultSpec {
     Crash,

@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 env:
@@ -39,6 +38,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.0 --profile minimal
+      # openresolv makes the resolvconf/openresolv backend exercisable on the
+      # Ubuntu runner instead of silently skipping.
+      - run: sudo apt-get update && sudo apt-get install -y openresolv
+        if: runner.os == 'Linux'
       - run: cargo +1.98.0 test
       - run: cargo +1.98.0 test --features test-util
       - run: cargo +1.98.0 test --features tracing
@@ -48,6 +51,13 @@ jobs:
         if: runner.os == 'Windows' || runner.os == 'macOS'
         env:
           OSDNS_ALLOW_SYSTEM_MUTATION: '1'
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.89.0 --profile minimal
+      - run: cargo +1.89.0 check --all-features --all-targets
 
   doc:
     runs-on: ubuntu-latest

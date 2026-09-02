@@ -118,6 +118,44 @@ pub(crate) trait Backend: Send + Sync {
     }
 }
 
+/// Constructs a specific backend by kind, bypassing detection. Used by the
+/// testing module and the real-backend integration matrix.
+#[cfg_attr(not(feature = "test-util"), allow(dead_code))]
+pub(crate) fn construct_backend(
+    kind: BackendKind,
+    owner: &str,
+) -> Result<std::sync::Arc<dyn Backend>> {
+    use std::sync::Arc;
+    match kind {
+        #[cfg(target_os = "linux")]
+        BackendKind::SystemdResolved => {
+            linux::resolved::SystemdResolved::connect().map(|b| Arc::new(b) as Arc<dyn Backend>)
+        }
+        #[cfg(target_os = "linux")]
+        BackendKind::NetworkManager => linux::network_manager::NetworkManager::connect()
+            .map(|b| Arc::new(b) as Arc<dyn Backend>),
+        #[cfg(target_os = "linux")]
+        BackendKind::Resolvconf => {
+            let probe = linux::resolvconf::probe().ok_or_else(|| {
+                Error::BackendUnavailable("resolvconf/openresolv is not available".to_string())
+            })?;
+            Ok(Arc::new(linux::resolvconf::Resolvconf::new(probe, owner)))
+        }
+        #[cfg(target_os = "linux")]
+        BackendKind::ResolvConfFile => Ok(Arc::new(linux::direct::DirectResolvConf::new())),
+        #[cfg(target_os = "windows")]
+        BackendKind::WindowsIpHelper => Ok(Arc::new(windows::WindowsBackend::new(owner))),
+        #[cfg(target_os = "macos")]
+        BackendKind::MacosSystemConfiguration => Ok(Arc::new(macos::MacosBackend::new(owner))),
+        #[cfg(feature = "test-util")]
+        BackendKind::Fake => Ok(Arc::new(fake::FakeBackend::new())),
+        #[allow(unreachable_patterns)]
+        _ => Err(Error::BackendUnavailable(format!(
+            "{kind} is not available on this platform"
+        ))),
+    }
+}
+
 /// Selects the platform backend. Real backends are introduced phase by
 /// phase; until then only explicitly-provided test backends work.
 pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn Backend>> {

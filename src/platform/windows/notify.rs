@@ -213,7 +213,7 @@ pub(crate) fn start_nrpt_registry_watch(
         .name("osdns-nrpt-watch".to_string())
         .spawn(move || {
             let watch = watch;
-            let mut seen = list_nrpt_rule_keys();
+            let mut seen = snapshot_nrpt_rule_states();
             loop {
                 if !watch.wait() {
                     break;
@@ -221,19 +221,14 @@ pub(crate) fn start_nrpt_registry_watch(
                 if worker_flag.load(Ordering::Acquire) {
                     break;
                 }
-                // The change notification cannot identify which subkey
-                // changed, so diff the current rule-key set against the
-                // previously seen one and emit one event per rule resource.
-                let current = list_nrpt_rule_keys();
-                for key in &current {
-                    if !seen.contains(key) {
-                        continue_with(&callback, key, false);
-                    }
-                }
-                for key in &seen {
-                    if !current.contains(key) {
-                        continue_with(&callback, key, true);
-                    }
+                // The change notification cannot identify which subkey or
+                // value changed, so fingerprint the relevant rule values
+                // (namespaces, servers, options) and diff against the
+                // previously seen state: new/missing keys and in-place value
+                // mutations all emit resource events.
+                let current = snapshot_nrpt_rule_states();
+                for (key, removed) in diff_rule_states(&seen, &current) {
+                    continue_with(&callback, &key, removed);
                 }
                 seen = current;
                 if rearm_notify(&watch).is_err() {
@@ -302,14 +297,119 @@ fn continue_with(callback: &Arc<dyn Fn(&DnsEvent) + Send + Sync>, key: &str, rem
     callback(&event);
 }
 
-fn list_nrpt_rule_keys() -> std::collections::BTreeSet<String> {
+/// Fingerprints the NRPT-relevant values of one rule key. Any change to
+/// namespaces, servers, options, or version produces a different string.
+fn rule_fingerprint(key: &windows_registry::Key) -> Option<String> {
+    let name = key.get_multi_string("Name").ok()?.join("\u{1}");
+    let servers = key.get_string("GenericDNSServers").ok()?;
+    let config_options = key.get_u32("ConfigOptions").unwrap_or_default();
+    let version = key.get_u32("Version").unwrap_or_default();
+    Some(format!(
+        "{name}\u{1}{servers}\u{1}{config_options}\u{1}{version}"
+    ))
+}
+
+/// Snapshots every NRPT rule key with its value fingerprint.
+fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
     use windows_registry::LOCAL_MACHINE;
     const NRPT_BASE: &str = "SYSTEM/CurrentControlSet/Services/Dnscache/Parameters/DnsPolicyConfig";
-    match LOCAL_MACHINE.open(NRPT_BASE) {
-        Ok(base) => base
-            .keys()
-            .map(|keys| keys.into_iter().collect())
-            .unwrap_or_default(),
-        Err(_) => Default::default(),
+    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
+        Ok(base) => base,
+        Err(_) => return Default::default(),
+    };
+    let mut out = std::collections::BTreeMap::new();
+    let key_names = match base.keys() {
+        Ok(keys) => keys,
+        Err(_) => return out,
+    };
+    for key_name in key_names {
+        let Some(rule_key) = base.open(&key_name).ok() else {
+            continue;
+        };
+        if let Some(fingerprint) = rule_fingerprint(&rule_key) {
+            out.insert(key_name, fingerprint);
+        }
+    }
+    out
+}
+
+/// Diffs two rule-state snapshots: `(key, removed)` pairs where `removed`
+/// marks a disappearing key and `false` marks a new key or an in-place value
+/// change.
+fn diff_rule_states(
+    previous: &std::collections::BTreeMap<String, String>,
+    current: &std::collections::BTreeMap<String, String>,
+) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for (key, fingerprint) in current {
+        if previous.get(key) != Some(fingerprint) {
+            out.push((key.clone(), false));
+        }
+    }
+    for key in previous.keys() {
+        if !current.contains_key(key) {
+            out.push((key.clone(), true));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn states(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn diff_detects_new_and_removed_keys() {
+        let previous = states(&[("rule-a", "v1")]);
+        let current = states(&[("rule-b", "v1")]);
+        let diff = diff_rule_states(&previous, &current);
+        assert!(diff.contains(&("rule-b".to_string(), false)));
+        assert!(diff.contains(&("rule-a".to_string(), true)));
+    }
+
+    #[test]
+    fn diff_detects_in_place_value_mutation() {
+        let previous = states(&[("rule-a", "servers=1.1.1.1;names=.corp.example")]);
+        let current = states(&[("rule-a", "servers=8.8.8.8;names=.corp.example")]);
+        let diff = diff_rule_states(&previous, &current);
+        assert_eq!(diff, vec![("rule-a".to_string(), false)]);
+    }
+
+    #[test]
+    fn diff_ignores_identical_state() {
+        let previous = states(&[("rule-a", "v1"), ("rule-b", "v2")]);
+        let current = states(&[("rule-a", "v1"), ("rule-b", "v2")]);
+        assert!(diff_rule_states(&previous, &current).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_tracks_namespaces_servers_and_options() {
+        let base = windows_registry::CURRENT_USER
+            .create("SOFTWARE/osdns-fingerprint-test")
+            .unwrap();
+        let rule = base.create("rule-x").unwrap();
+        rule.set_multi_string("Name", &[".corp.example"]).unwrap();
+        rule.set_string("GenericDNSServers", "1.1.1.1").unwrap();
+        rule.set_u32("ConfigOptions", 8).unwrap();
+        rule.set_u32("Version", 1).unwrap();
+        let before = rule_fingerprint(&rule).unwrap();
+
+        rule.set_string("GenericDNSServers", "8.8.8.8").unwrap();
+        let after_servers = rule_fingerprint(&rule).unwrap();
+        assert_ne!(before, after_servers);
+
+        rule.set_multi_string("Name", &[".other.example"]).unwrap();
+        let after_names = rule_fingerprint(&rule).unwrap();
+        assert_ne!(after_servers, after_names);
+
+        let _ = base.remove_tree("rule-x");
+        let _ = windows_registry::CURRENT_USER.remove_tree("SOFTWARE/osdns-fingerprint-test");
     }
 }

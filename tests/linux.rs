@@ -12,6 +12,7 @@ mod common;
 
 use common::*;
 use osdns::capability::BackendKind;
+use osdns::testing::manager_for_backend;
 
 #[test]
 fn detection_selects_a_real_backend_or_reports_honestly() {
@@ -123,11 +124,10 @@ fn direct_resolv_conf_backend_lifecycle_when_enabled() {
         return;
     }
     let dir = temp_dir("linux-direct");
-    let fake = FakeDns::new();
-    let manager = manager_for_testing(
+    let manager = manager_for_backend(
         "io.osdns.test",
         &dir,
-        &fake,
+        osdns::BackendKind::ResolvConfFile,
         std::time::Duration::from_secs(30),
     )
     .unwrap();
@@ -166,11 +166,10 @@ fn dhcp_file_replacement_race_is_transitional() {
         return;
     }
     let dir = temp_dir("linux-dhcp-race");
-    let fake = FakeDns::new();
-    let manager = manager_for_testing(
+    let manager = manager_for_backend(
         "io.osdns.test",
         &dir,
-        &fake,
+        osdns::BackendKind::ResolvConfFile,
         std::time::Duration::from_secs(30),
     )
     .unwrap();

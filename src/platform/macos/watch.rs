@@ -150,6 +150,23 @@ fn resolver_resource_from_path(path: &std::path::Path) -> Option<ResourceId> {
     ResourceId::new(format!("macos:resolver:{domain}")).ok()
 }
 
+/// Whether this path is the resolver directory itself being created. When it
+/// appears, the watcher must be armed on it so its children are observed.
+fn is_resolver_dir_creation(path: &std::path::Path, created: bool) -> bool {
+    created && path.to_string_lossy() == RESOLVER_DIR
+}
+
+#[cfg(target_os = "macos")]
+fn arm_resolver_dir_watcher(
+    watcher: &mut notify::RecommendedWatcher,
+) -> std::result::Result<(), notify::Error> {
+    use notify::Watcher;
+    watcher.watch(
+        std::path::Path::new(RESOLVER_DIR),
+        notify::RecursiveMode::NonRecursive,
+    )
+}
+
 pub(crate) fn start_resolver_watch(
     flag: Arc<std::sync::atomic::AtomicBool>,
     callback: WatchCallback,
@@ -157,10 +174,36 @@ pub(crate) fn start_resolver_watch(
     use notify::Watcher;
 
     let (tx, rx) = mpsc::channel::<DnsEvent>();
-    let watcher = notify::recommended_watcher(
+    // The watcher lives behind a shared slot: the event handler needs it to
+    // arm watching of /etc/resolver when that directory is created late, and
+    // the cancel closure drops it to stop the watcher.
+    let watcher_slot: Arc<Mutex<Option<notify::RecommendedWatcher>>> = Arc::new(Mutex::new(None));
+    let handler_slot = Arc::clone(&watcher_slot);
+    let handler_flag = flag.clone();
+    let mut watcher = notify::recommended_watcher(
         move |event: std::result::Result<notify::Event, notify::Error>| {
+            if handler_flag.load(Ordering::Acquire) {
+                return;
+            }
             let Ok(event) = event else { return };
+            let created = matches!(event.kind, notify::event::EventKind::Create(_));
             for path in event.paths {
+                // Late creation of /etc/resolver: arm the watcher on it so
+                // its children are observed from now on. Disappearance is
+                // handled by re-arming here on the next creation event.
+                if is_resolver_dir_creation(&path, created) && path.is_dir() {
+                    let arm_result = match handler_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .as_mut()
+                    {
+                        Some(watcher) => arm_resolver_dir_watcher(watcher),
+                        None => continue,
+                    };
+                    if arm_result.is_err() {
+                        continue;
+                    }
+                }
                 let Some(resource) = resolver_resource_from_path(&path) else {
                     continue;
                 };
@@ -195,28 +238,62 @@ pub(crate) fn start_resolver_watch(
             message: format!("cannot spawn resolver worker thread: {e}"),
         })?;
 
-    // Watching /etc/resolver fails when the directory does not exist yet; in
-    // that case watch /etc and filter paths to resolver children, so early
-    // creation of the directory itself is observed too.
-    let watch_path = std::path::Path::new(RESOLVER_DIR);
-    let mut watcher = watcher;
-    match watcher.watch(watch_path, notify::RecursiveMode::NonRecursive) {
-        Ok(()) => {}
-        Err(_) => {
-            watcher
-                .watch(
-                    std::path::Path::new("/etc"),
-                    notify::RecursiveMode::NonRecursive,
-                )
-                .map_err(|e| Error::Platform {
-                    backend: crate::capability::BackendKind::MacosSystemConfiguration,
-                    message: format!("cannot watch /etc for resolver changes: {e}"),
-                })?;
-        }
+    // Always watch /etc: it observes creation of /etc/resolver itself (so the
+    // watcher can be armed on it when the directory appears late), and it
+    // doubles as the resolver-children watch until /etc/resolver exists.
+    // When /etc/resolver exists at startup it is watched directly as well; if
+    // it later disappears and is recreated, the /etc create event re-arms it.
+    watcher
+        .watch(
+            std::path::Path::new("/etc"),
+            notify::RecursiveMode::NonRecursive,
+        )
+        .map_err(|e| Error::Platform {
+            backend: crate::capability::BackendKind::MacosSystemConfiguration,
+            message: format!("cannot watch /etc for resolver changes: {e}"),
+        })?;
+    if std::path::Path::new(RESOLVER_DIR).is_dir() {
+        let _ = watcher.watch(
+            std::path::Path::new(RESOLVER_DIR),
+            notify::RecursiveMode::NonRecursive,
+        );
     }
+    *watcher_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
 
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        drop(watcher);
+        drop(watcher_slot);
     }))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolver_paths_map_to_resources() {
+        let path = std::path::Path::new("/etc/resolver/corp.example");
+        let resource = resolver_resource_from_path(path).unwrap();
+        assert_eq!(resource.as_str(), "macos:resolver:corp.example");
+    }
+
+    #[test]
+    fn non_resolver_paths_do_not_map() {
+        assert!(resolver_resource_from_path(std::path::Path::new("/etc/hosts")).is_none());
+        assert!(
+            resolver_resource_from_path(std::path::Path::new("/etc/resolver/.hidden")).is_none()
+        );
+    }
+
+    #[test]
+    fn resolver_dir_creation_is_detected() {
+        let path = std::path::Path::new("/etc/resolver");
+        assert!(is_resolver_dir_creation(path, true));
+        assert!(!is_resolver_dir_creation(path, false));
+        assert!(!is_resolver_dir_creation(
+            std::path::Path::new("/etc/hosts"),
+            true
+        ));
+    }
 }

@@ -233,11 +233,17 @@ impl Lease {
                 self.inner.fire(TxPoint::AfterUpdateResolve)?;
                 let mut first_error = None;
                 for record in &live {
-                    let mut record = record
+                    let resource = record
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .record
+                        .resource
+                        .clone();
+                    let token = self.inner.lease_token(&resource);
+                    let _token_guard = token
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let token = self.inner.lease_token(&record.record.resource);
-                    let _token_guard = token
+                    let mut record = record
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Err(error) = self.inner.update_owned(&mut record.record, &plan) {
@@ -292,12 +298,17 @@ impl Lease {
             LeaseState::Owned { live, _locks } => {
                 let mut first_error = None;
                 for record in &live {
-                    let record = record
+                    let resource = record
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let resource = record.record.resource.clone();
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .record
+                        .resource
+                        .clone();
                     let token = self.inner.lease_token(&resource);
                     let _token_guard = token
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let record = record
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Err(error) = self.inner.restore_lease_state(&record.record) {
@@ -339,10 +350,19 @@ impl Lease {
                 LeaseState::Owned { live, _locks } => {
                     let mut failure = None;
                     for record in &live {
+                        let resource = record
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record
+                            .resource
+                            .clone();
+                        let token = self.inner.lease_token(&resource);
+                        let _token_guard = token
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let record = record
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let resource = record.record.resource.clone();
                         if failure.is_none()
                             && let Err(error) = self
                                 .inner
@@ -412,10 +432,19 @@ impl Drop for Lease {
                 }
                 LeaseState::Owned { live, _locks } => {
                     for record in &live {
+                        let resource = record
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .record
+                            .resource
+                            .clone();
+                        let token = self.inner.lease_token(&resource);
+                        let _token_guard = token
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
                         let record = record
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let resource = record.record.resource.clone();
                         self.inner.best_effort_restore(&record.record);
                         self.inner.unregister_active(&resource);
                     }
