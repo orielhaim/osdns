@@ -49,9 +49,15 @@ fn resolved_backend_roundtrip_when_available() {
         return;
     }
     let interfaces = manager.interfaces().unwrap();
+    let selected = std::env::var_os("OSDNS_TEST_INTERFACE");
     let target = interfaces
         .iter()
-        .find(|i| i.is_up && i.name.to_string_lossy() != "lo")
+        .find(|i| {
+            i.is_up
+                && selected
+                    .as_ref()
+                    .map_or_else(|| i.name.to_string_lossy() != "lo", |name| &i.name == name)
+        })
         .expect("a non-loopback interface");
     let config = osdns::DnsConfig::builder(osdns::DnsScope::Interface(
         osdns::InterfaceSelector::Name(target.name.clone()),

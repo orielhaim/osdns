@@ -33,7 +33,7 @@ fn sc_callout(_store: SCDynamicStore, changed_keys: CFArray<CFString>, info: &mu
         let key = key.to_string();
         let resource = if let Some(rest) = key.strip_prefix("State:/Network/Service/") {
             rest.strip_suffix("/DNS")
-                .and_then(|id| ResourceId::new(format!("macos:service:{id}")).ok())
+                .and_then(|id| super::MacosBackend::service_resource(id).ok())
         } else if key == "State:/Network/Global/IPv4" {
             ResourceId::new("macos:global").ok()
         } else {

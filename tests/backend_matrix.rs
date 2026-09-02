@@ -59,19 +59,25 @@ fn matrix_systemd_resolved_lifecycle() {
     );
     let target = up_interface(&manager).expect("the disposable interface must be up");
     let scope = DnsScope::Interface(InterfaceSelector::Name(target.name.clone()));
+    let before = manager.snapshot(&scope).unwrap();
     let config = DnsConfig::builder(scope.clone())
         .nameserver(ip("127.0.0.1"))
+        .nameserver(ip("::1"))
+        .search_domain("search.test")
+        .routing_domain("route.test")
+        .routing_domain(".")
         .build()
         .unwrap();
 
     let lease = manager
         .apply(&config)
         .expect("systemd-resolved apply must succeed when opted in");
-    assert_eq!(
-        manager.snapshot(&scope).unwrap().nameservers(),
-        &[ip("127.0.0.1")]
-    );
+    let actual = manager.snapshot(&scope).unwrap();
+    assert_eq!(actual.nameservers(), config.nameservers());
+    assert_eq!(actual.search_domains(), config.search_domains());
+    assert_eq!(actual.routing_domains(), config.routing_domains());
     lease.restore().unwrap();
+    assert_eq!(manager.snapshot(&scope).unwrap(), before);
 }
 
 #[test]

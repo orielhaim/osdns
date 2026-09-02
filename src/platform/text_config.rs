@@ -45,30 +45,21 @@ pub(crate) fn resolved_dns_from_plan(plan: &NormalizedConfig) -> Vec<(i32, Vec<u
     plan.nameservers
         .iter()
         .map(|ip| match ip {
-            IpAddr::V4(v4) => (0i32, v4_bytes(v4)),
-            IpAddr::V6(v6) => (0i32, v6_bytes(v6)),
+            // Linux AF_INET/AF_INET6 are the tuple's first field, not a
+            // byte prepended to the address. These are wire constants,
+            // independent of the host compiling this shared module.
+            IpAddr::V4(v4) => (2, v4.octets().to_vec()),
+            IpAddr::V6(v6) => (10, v6.octets().to_vec()),
         })
         .collect()
 }
 
-fn v4_bytes(ip: &Ipv4Addr) -> Vec<u8> {
-    let mut bytes = vec![2u8];
-    bytes.extend_from_slice(&ip.octets());
-    bytes
-}
-
-fn v6_bytes(ip: &Ipv6Addr) -> Vec<u8> {
-    let mut bytes = vec![10u8];
-    bytes.extend_from_slice(&ip.octets());
-    bytes
-}
-
 pub(crate) fn resolved_dns_to_nameservers(dns: &[(i32, Vec<u8>)]) -> Vec<IpAddr> {
     dns.iter()
-        .filter_map(|(_, bytes)| match bytes.as_slice() {
-            [2, a, b, c, d] => Some(IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d))),
-            [10, rest @ ..] => {
-                let octets: [u8; 16] = rest.try_into().ok()?;
+        .filter_map(|(family, bytes)| match (*family, bytes.as_slice()) {
+            (2, [a, b, c, d]) => Some(IpAddr::V4(Ipv4Addr::new(*a, *b, *c, *d))),
+            (10, bytes) => {
+                let octets: [u8; 16] = bytes.try_into().ok()?;
                 Some(IpAddr::V6(Ipv6Addr::from(octets)))
             }
             _ => None,
@@ -80,17 +71,17 @@ pub(crate) fn resolved_domains_from_plan(plan: &NormalizedConfig) -> Vec<(String
     let mut domains: Vec<(String, bool)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for domain in &plan.search_domains {
-        let name = domain.as_str().to_string();
-        if !seen.contains(&name) {
-            seen.push(name.clone());
-            domains.push((name, true));
-        }
-    }
-    for domain in &plan.routing_domains {
-        let name = domain.as_str().to_string();
+        let name = domain.to_string();
         if !seen.contains(&name) {
             seen.push(name.clone());
             domains.push((name, false));
+        }
+    }
+    for domain in &plan.routing_domains {
+        let name = domain.to_string();
+        if !seen.contains(&name) {
+            seen.push(name.clone());
+            domains.push((name, true));
         }
     }
     domains
@@ -101,11 +92,11 @@ pub(crate) fn resolved_domains_to_public(
 ) -> (Vec<DnsSuffix>, Vec<DnsSuffix>) {
     let mut search = Vec::new();
     let mut routing = Vec::new();
-    for (name, is_search) in domains {
+    for (name, route_only) in domains {
         let Ok(suffix) = DnsSuffix::parse(name) else {
             continue;
         };
-        if *is_search {
+        if !route_only {
             if !search.contains(&suffix) {
                 search.push(suffix);
             }
@@ -336,10 +327,13 @@ mod tests {
     fn resolved_dns_mapping() {
         let p = plan(&["1.1.1.1", "2606:4700:4700::1111"], &[], &[], None);
         let dns = resolved_dns_from_plan(&p);
-        assert_eq!(dns[0].1, vec![2, 1, 1, 1, 1]);
+        assert_eq!(dns[0], (2, vec![1, 1, 1, 1]));
         assert_eq!(
-            dns[1].1,
-            vec![10, 38, 6, 71, 0, 71, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 17]
+            dns[1],
+            (
+                10,
+                vec![38, 6, 71, 0, 71, 0, 0, 0, 0, 0, 0, 0, 0, 0, 17, 17]
+            )
         );
         let back = resolved_dns_to_nameservers(&dns);
         assert_eq!(back, p.nameservers);
@@ -357,8 +351,8 @@ mod tests {
         assert_eq!(
             domains,
             vec![
-                ("corp.example".to_string(), true),
-                ("internal.example".to_string(), false),
+                ("corp.example".to_string(), false),
+                ("internal.example".to_string(), true),
             ]
         );
         let (search, routing) = resolved_domains_to_public(&domains);
@@ -367,10 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn resolved_root_routing_domain_maps_to_empty_name() {
+    fn resolved_root_routing_domain_uses_dot_and_route_only() {
         let p = plan(&[], &[], &["."], None);
         let domains = resolved_domains_from_plan(&p);
-        assert_eq!(domains, vec![("".to_string(), false)]);
+        assert_eq!(domains, vec![(".".to_string(), true)]);
         let (search, routing) = resolved_domains_to_public(&domains);
         assert!(search.is_empty());
         assert_eq!(routing, vec![DnsSuffix::root()]);
