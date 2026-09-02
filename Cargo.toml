@@ -43,9 +43,11 @@ windows-registry = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 system-configuration = "0.8.0"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["stable"] }
 osdns = { path = ".", features = ["test-util"] }
 rstest = "0.26.1"
 serde = { version = "1", features = ["derive"] }
@@ -57,3 +59,8 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+[[bench]]
+name = "engine"
+harness = false
+required-features = ["test-util"]

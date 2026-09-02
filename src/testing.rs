@@ -25,7 +25,8 @@ use crate::watch::{DnsEvent, SuppressionRegistry};
 pub use crate::fault::TxPoint;
 pub use crate::platform::fake::{FakeOp, FakeState};
 
-/// Handle for driving a [`FakeBackend`] from tests.
+/// Handle for driving the in-memory fake backend from tests.
+#[derive(Clone)]
 pub struct FakeDns {
     backend: Arc<FakeBackend>,
 }
@@ -119,6 +120,25 @@ pub fn manager_for_testing(
     fake: &FakeDns,
     lock_timeout: Duration,
 ) -> Result<DnsManager> {
+    manager_for_testing_with_policy(
+        owner,
+        state_dir,
+        fake,
+        lock_timeout,
+        ConflictPolicy::Cooperative,
+    )
+}
+
+/// Like [`manager_for_testing`], but with an explicit conflict policy, so
+/// Enforce-policy reconciliation can be tested against the fake backend.
+pub fn manager_for_testing_with_policy(
+    owner: &str,
+    state_dir: &Path,
+    fake: &FakeDns,
+    lock_timeout: Duration,
+    conflict_policy: ConflictPolicy,
+) -> Result<DnsManager> {
+    use std::collections::HashMap;
     ensure_private_dir(state_dir)?;
     let locks = ResourceLockManager::new(state_dir.join("locks"), lock_timeout);
     locks.ensure_dir()?;
@@ -129,9 +149,12 @@ pub fn manager_for_testing(
         backend,
         locks,
         journal,
-        conflict_policy: ConflictPolicy::Cooperative,
+        conflict_policy,
         hook: Mutex::new(None),
         suppressions: std::sync::Arc::new(SuppressionRegistry::new()),
+        active: Mutex::new(HashMap::new()),
+        lease_tokens: Mutex::new(HashMap::new()),
+        reconciler: crate::reconciliation::Reconciler::default(),
     })))
 }
 

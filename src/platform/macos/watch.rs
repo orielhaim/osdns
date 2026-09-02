@@ -1,10 +1,12 @@
-//! `SCDynamicStore` notifications on a dedicated run-loop thread.
+//! macOS change watchers.
 //!
-//! Watched patterns cover every service's runtime DNS dictionary and the
-//! global IPv4 state. Events are mapped to resources and forwarded through
-//! the manager's suppression and coalescing filter; the run loop itself is
-//! stopped from the cancel closure on another thread (CFRunLoopStop is
-//! thread-safe), never from inside the callback.
+//! `SCDynamicStore` notifications observe the runtime network state on a
+//! dedicated run-loop thread; FSEvents (via `notify`) observe
+//! `/etc/resolver` so that external resolver-file changes participate in
+//! reconciliation. Events are mapped to resources and forwarded through the
+//! manager's suppression and coalescing filter; run loops and watchers are
+//! stopped from the cancel closures on another thread, never from inside a
+//! callback.
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -129,5 +131,92 @@ pub(crate) fn start_store_watch(
         if let Some(handle) = handle {
             handle.0.stop();
         }
+    }))
+}
+
+const RESOLVER_DIR: &str = "/etc/resolver";
+
+/// Maps an FSEvents path to a scoped resolver resource. Only direct children
+/// of `/etc/resolver` map; the file name is the routing domain.
+fn resolver_resource_from_path(path: &std::path::Path) -> Option<ResourceId> {
+    let parent = path.parent()?.to_string_lossy().to_string();
+    if parent != RESOLVER_DIR {
+        return None;
+    }
+    let domain = path.file_name()?.to_string_lossy().to_string();
+    if domain.is_empty() || domain.starts_with('.') {
+        return None;
+    }
+    ResourceId::new(format!("macos:resolver:{domain}")).ok()
+}
+
+pub(crate) fn start_resolver_watch(
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    callback: WatchCallback,
+) -> Result<Box<dyn FnOnce() + Send>> {
+    use notify::Watcher;
+
+    let (tx, rx) = mpsc::channel::<DnsEvent>();
+    let watcher = notify::recommended_watcher(
+        move |event: std::result::Result<notify::Event, notify::Error>| {
+            let Ok(event) = event else { return };
+            for path in event.paths {
+                let Some(resource) = resolver_resource_from_path(&path) else {
+                    continue;
+                };
+                let removed = matches!(event.kind, notify::event::EventKind::Remove(_));
+                let event = if removed {
+                    DnsEvent::ResourceRemoved { resource }
+                } else {
+                    DnsEvent::ResourceChanged { resource }
+                };
+                let _ = tx.send(event);
+            }
+        },
+    )
+    .map_err(|e| Error::Platform {
+        backend: crate::capability::BackendKind::MacosSystemConfiguration,
+        message: format!("cannot create resolver file watcher: {e}"),
+    })?;
+
+    let worker_flag = flag.clone();
+    thread::Builder::new()
+        .name("osdns-resolver-worker".to_string())
+        .spawn(move || {
+            for event in rx {
+                if worker_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                callback(&event);
+            }
+        })
+        .map_err(|e| Error::Platform {
+            backend: crate::capability::BackendKind::MacosSystemConfiguration,
+            message: format!("cannot spawn resolver worker thread: {e}"),
+        })?;
+
+    // Watching /etc/resolver fails when the directory does not exist yet; in
+    // that case watch /etc and filter paths to resolver children, so early
+    // creation of the directory itself is observed too.
+    let watch_path = std::path::Path::new(RESOLVER_DIR);
+    let mut watcher = watcher;
+    match watcher.watch(watch_path, notify::RecursiveMode::NonRecursive) {
+        Ok(()) => {}
+        Err(_) => {
+            watcher
+                .watch(
+                    std::path::Path::new("/etc"),
+                    notify::RecursiveMode::NonRecursive,
+                )
+                .map_err(|e| Error::Platform {
+                    backend: crate::capability::BackendKind::MacosSystemConfiguration,
+                    message: format!("cannot watch /etc for resolver changes: {e}"),
+                })?;
+        }
+    }
+
+    Ok(Box::new(move || {
+        flag.store(true, Ordering::Release);
+        drop(watcher);
     }))
 }

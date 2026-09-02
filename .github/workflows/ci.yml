@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt
+      - run: cargo +1.98.0 fmt --all --check
+
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal --component clippy
+      - run: cargo +1.98.0 clippy --all-targets -- -D warnings
+      - run: cargo +1.98.0 clippy --all-targets --features test-util -- -D warnings
+      - run: cargo +1.98.0 clippy --all-targets --features tracing -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 test
+      - run: cargo +1.98.0 test --features test-util
+      - run: cargo +1.98.0 test --features tracing
+      # Windows and macOS runners provide the privileges needed for the
+      # destructive mutation suites; opt in explicitly.
+      - run: cargo +1.98.0 test --features test-util
+        if: runner.os == 'Windows' || runner.os == 'macOS'
+        env:
+          OSDNS_ALLOW_SYSTEM_MUTATION: '1'
+
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  cross-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: windows-latest
+            target: aarch64-apple-darwin
+          - host: windows-latest
+            target: x86_64-unknown-linux-gnu
+          - host: ubuntu-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.host }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      # --tests rather than --all-targets: benches pull criterion, whose
+      # alloca dependency needs a working C toolchain for the target.
+      - run: cargo check --target ${{ matrix.target }} --tests
+      - run: cargo check --target ${{ matrix.target }} --tests --features test-util
+
+  feature-powerset:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo install cargo-hack --locked
+      - run: cargo +1.98.0 hack check --each-feature --no-dev-deps
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo install cargo-audit --locked
+      - run: cargo +stable audit
+
+  bench-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 bench --features test-util --no-run

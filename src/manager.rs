@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,10 +12,11 @@ use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
 use crate::fsutil::ensure_private_dir;
 use crate::interface::InterfaceInfo;
 use crate::journal::{JournalRecord, JournalStore, Phase, SCHEMA_VERSION};
-use crate::lease::Lease;
+use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
 use crate::platform::{Backend, PlatformSnapshot, select_default_backend};
+use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
 use crate::watch::{WatchCallback, WatchHandle};
 
@@ -80,9 +82,25 @@ pub(crate) struct Inner {
     pub(crate) conflict_policy: ConflictPolicy,
     pub(crate) hook: Mutex<Option<Arc<dyn FaultHook>>>,
     pub(crate) suppressions: Arc<SuppressionRegistry>,
+    pub(crate) active: Mutex<HashMap<ResourceId, Arc<Mutex<LiveRecord>>>>,
+    pub(crate) lease_tokens: Mutex<HashMap<ResourceId, Arc<Mutex<()>>>>,
+    #[allow(dead_code)]
+    pub(crate) reconciler: Reconciler,
 }
 
 const COALESCE_WINDOW: Duration = Duration::from_millis(50);
+
+impl Inner {
+    pub(crate) fn share_records(&self, records: Vec<JournalRecord>) -> Vec<Arc<Mutex<LiveRecord>>> {
+        let mut live = Vec::with_capacity(records.len());
+        for record in records {
+            let shared = Arc::new(Mutex::new(LiveRecord { record }));
+            self.register_active(Arc::clone(&shared));
+            live.push(shared);
+        }
+        live
+    }
+}
 
 struct MutatePoints {
     apply: TxPoint,
@@ -267,7 +285,7 @@ impl Inner {
     #[allow(unused_variables)]
     fn revert_record(&self, record: &JournalRecord) {
         self.suppressions.suppress(&record.resource);
-        if let Err(_error) = self.backend.restore(&record.resource, &record.before) {
+        if let Err(error) = self.backend.restore(&record.resource, &record.before) {
             osdns_warn!(
                 resource = %record.resource,
                 error = %error,
@@ -297,9 +315,9 @@ impl Inner {
 
     pub(crate) fn update_owned(
         &self,
-        record: &JournalRecord,
+        record: &mut JournalRecord,
         plan: &NormalizedConfig,
-    ) -> Result<JournalRecord> {
+    ) -> Result<()> {
         let resource = &record.resource;
         self.fire(TxPoint::AfterUpdateResolve)?;
         let applied = record.applied.clone().ok_or_else(|| {
@@ -319,21 +337,20 @@ impl Inner {
         }
         if self.backend.matches_desired(&current, plan) {
             self.fire(TxPoint::AfterUpdateNoopCheck)?;
-            return Ok(record.clone());
+            return Ok(());
         }
-        let mut updated = record.clone();
-        updated.desired = plan.clone();
-        updated.phase = Phase::Prepared;
-        updated.applied = Some(applied.clone());
-        self.journal.write(&updated)?;
+        record.desired = plan.clone();
+        record.phase = Phase::Prepared;
+        record.applied = Some(applied.clone());
+        self.journal.write(record)?;
         self.fire(TxPoint::AfterUpdatePrepared)?;
         match self.mutate_and_verify(resource, plan, Some(&applied), UPDATE_POINTS) {
             Ok(actual) => {
-                updated.phase = Phase::Applied;
-                updated.applied = Some(actual);
-                self.journal.write(&updated)?;
+                record.phase = Phase::Applied;
+                record.applied = Some(actual);
+                self.journal.write(record)?;
                 self.fire(TxPoint::AfterUpdateApplied)?;
-                Ok(updated)
+                Ok(())
             }
             Err(error) => Err(error),
         }
@@ -631,14 +648,27 @@ impl DnsManager {
     /// caused by this manager's own mutations are suppressed so they are
     /// never reported as external changes. Callbacks must still only enqueue
     /// or coalesce; never perform expensive or mutating work inside them.
+    ///
+    /// Under [`ConflictPolicy::Enforce`] this also starts the reconciliation
+    /// worker, which rebases onto externally modified base state and reapplies
+    /// the desired overlay of every active lease.
     pub fn watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
-        let enqueue =
+        let feed = if self.inner.conflict_policy == ConflictPolicy::Enforce {
+            Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?)
+        } else {
+            None
+        };
+        let coalescer =
             crate::watch::spawn_coalescer(self.inner.backend.kind(), callback, COALESCE_WINDOW)?;
         let suppressions = Arc::clone(&self.inner.suppressions);
         let filtered: WatchCallback = Arc::new(move |event| {
-            if !suppressions.is_suppressed(event.resource()) {
-                enqueue(event);
+            if suppressions.is_suppressed(event.resource()) {
+                return;
             }
+            if let Some(feed) = &feed {
+                let _ = feed.send(event.resource().clone());
+            }
+            coalescer(event);
         });
         self.inner.backend.start_watch(filtered)
     }
@@ -775,6 +805,9 @@ impl DnsManagerBuilder {
             conflict_policy: self.conflict_policy,
             hook: Mutex::new(None),
             suppressions: Arc::new(SuppressionRegistry::new()),
+            active: Mutex::new(HashMap::new()),
+            lease_tokens: Mutex::new(HashMap::new()),
+            reconciler: Reconciler::default(),
         })))
     }
 }

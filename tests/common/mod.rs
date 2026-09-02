@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use osdns::testing::{FakeDns, manager_for_testing};
-use osdns::{DnsConfig, DnsManager, DnsScope, InterfaceSelector};
+pub use osdns::testing::{FakeDns, manager_for_testing};
+use osdns::{BackendKind, Capabilities, DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -92,7 +92,7 @@ pub fn state_with(ns: &str) -> osdns::testing::FakeState {
 
 pub fn new_multi_fixture(tag: &str) -> Fixture {
     let dir = temp_dir(tag);
-    let caps = osdns::Capabilities::new(osdns::BackendKind::Fake)
+    let caps = Capabilities::new(BackendKind::Fake)
         .with_read(true)
         .with_global_dns(true)
         .with_per_interface_dns(true)

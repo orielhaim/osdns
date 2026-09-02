@@ -128,55 +128,6 @@ pub(crate) fn delete_rule(key: &str) -> Result<()> {
     base.remove_tree(key).map_err(registry_error)
 }
 
-fn parse_servers(text: &str) -> Vec<IpAddr> {
-    text.split([';', ','])
-        .map(|entry| entry.trim())
-        .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| entry.parse::<IpAddr>().ok())
-        .collect()
-}
-
-fn read_rule(
-    base: &windows_registry::Key,
-    key_name: &str,
-    owner: &str,
-) -> Result<Option<NrptRule>> {
-    let rule_key = match base.open(key_name) {
-        Ok(rule_key) => rule_key,
-        Err(_) => return Ok(None),
-    };
-    let comment = rule_key.get_string("Comment").unwrap_or_default();
-    if comment != marker_for(owner) {
-        return Ok(None);
-    }
-    let namespaces = rule_key.get_multi_string("Name").unwrap_or_default();
-    if namespaces.is_empty() {
-        return Ok(None);
-    }
-    let servers = parse_servers(&rule_key.get_string("GenericDNSServers").unwrap_or_default());
-    Ok(Some(NrptRule {
-        key: key_name.to_string(),
-        namespaces,
-        servers,
-    }))
-}
-
-/// Reads every osdns-owned NRPT rule (matched by the owner marker).
-pub(crate) fn read_owned_rules(owner: &str) -> Result<Vec<NrptRule>> {
-    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
-        Ok(base) => base,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut rules = Vec::new();
-    for key_name in base.keys().map_err(registry_error)? {
-        if let Some(rule) = read_rule(&base, &key_name, owner)? {
-            rules.push(rule);
-        }
-    }
-    rules.sort_by(|a, b| a.key.cmp(&b.key));
-    Ok(rules)
-}
-
 fn registry_error<E: std::fmt::Display>(error: E) -> Error {
     let text = error.to_string();
     let lowered = text.to_ascii_lowercase();
@@ -191,12 +142,39 @@ fn registry_error<E: std::fmt::Display>(error: E) -> Error {
     }
 }
 
+/// Reads one rule by its registry key regardless of marker, so a captured
+/// `before` rule can be restored even if the marker changed.
+pub(crate) fn read_rule_by_key(key: &str) -> Result<Option<NrptRule>> {
+    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
+        Ok(base) => base,
+        Err(_) => return Ok(None),
+    };
+    let rule_key = match base.open(key) {
+        Ok(rule_key) => rule_key,
+        Err(_) => return Ok(None),
+    };
+    let namespaces = rule_key.get_multi_string("Name").unwrap_or_default();
+    if namespaces.is_empty() {
+        return Ok(None);
+    }
+    let servers = rule_key
+        .get_string("GenericDNSServers")
+        .unwrap_or_default()
+        .split([';', ','])
+        .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
+        .collect();
+    Ok(Some(NrptRule {
+        key: key.to_string(),
+        namespaces,
+        servers,
+    }))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::normalize::{DnsSuffix, NormalizedConfig};
 
-    fn plan(ns: &[&str], routing: &[&str], default_route: Option<bool>) -> NormalizedConfig {
+    fn plan(ns: &[&str], routing: &[&str]) -> NormalizedConfig {
         NormalizedConfig {
             nameservers: ns.iter().map(|s| s.parse().unwrap()).collect(),
             search_domains: vec![],
@@ -204,13 +182,13 @@ mod tests {
                 .iter()
                 .map(|s| DnsSuffix::parse(s).unwrap())
                 .collect(),
-            default_route,
+            default_route: None,
         }
     }
 
     #[test]
     fn namespaces_use_leading_dot_form() {
-        let p = plan(&["1.1.1.1"], &["corp.example", "."], None);
+        let p = plan(&["1.1.1.1"], &["corp.example", "."]);
         let chunks = namespaces_from_plan(&p);
         assert_eq!(
             chunks,
@@ -220,18 +198,18 @@ mod tests {
 
     #[test]
     fn default_route_implies_root_namespace() {
-        let p = plan(&["1.1.1.1"], &[], Some(true));
-        let chunks = namespaces_from_plan(&p);
-        assert_eq!(chunks, vec![vec![".".to_string()]]);
-        let p = plan(&["1.1.1.1"], &[], Some(false));
+        let mut p = plan(&["1.1.1.1"], &[]);
+        p.default_route = Some(true);
+        assert_eq!(namespaces_from_plan(&p), vec![vec![".".to_string()]]);
+        p.default_route = Some(false);
         assert!(namespaces_from_plan(&p).is_empty());
-        let p = plan(&["1.1.1.1"], &[], None);
+        p.default_route = None;
         assert!(namespaces_from_plan(&p).is_empty());
     }
 
     #[test]
     fn rule_keys_are_deterministic_per_owner_and_namespaces() {
-        let p = plan(&["1.1.1.1"], &["corp.example"], None);
+        let p = plan(&["1.1.1.1"], &["corp.example"]);
         let first = rules_from_plan(&p, "io.test.a");
         let again = rules_from_plan(&p, "io.test.a");
         assert_eq!(first, again);
@@ -239,14 +217,14 @@ mod tests {
         let other_owner = rules_from_plan(&p, "io.test.b");
         assert_ne!(first[0].key, other_owner[0].key);
 
-        let p2 = plan(&["1.1.1.1"], &["other.example"], None);
+        let p2 = plan(&["1.1.1.1"], &["other.example"]);
         let different = rules_from_plan(&p2, "io.test.a");
         assert_ne!(first[0].key, different[0].key);
     }
 
     #[test]
     fn servers_come_from_the_plan() {
-        let p = plan(&["1.1.1.1", "8.8.8.8"], &["corp.example"], None);
+        let p = plan(&["1.1.1.1", "8.8.8.8"], &["corp.example"]);
         let rules = rules_from_plan(&p, "io.test");
         assert_eq!(
             rules[0].servers,
@@ -260,11 +238,5 @@ mod tests {
     #[test]
     fn marker_includes_owner() {
         assert_eq!(marker_for("io.tunnet.agent"), "osdns owner=io.tunnet.agent");
-    }
-
-    #[test]
-    fn reading_owned_rules_never_mutates() {
-        let rules = read_owned_rules("io.nonexistent.test").unwrap();
-        let _ = rules;
     }
 }

@@ -213,6 +213,7 @@ pub(crate) fn start_nrpt_registry_watch(
         .name("osdns-nrpt-watch".to_string())
         .spawn(move || {
             let watch = watch;
+            let mut seen = list_nrpt_rule_keys();
             loop {
                 if !watch.wait() {
                     break;
@@ -220,9 +221,21 @@ pub(crate) fn start_nrpt_registry_watch(
                 if worker_flag.load(Ordering::Acquire) {
                     break;
                 }
-                if let Ok(resource) = ResourceId::new("windows:nrpt:rules") {
-                    callback(&DnsEvent::ResourceChanged { resource });
+                // The change notification cannot identify which subkey
+                // changed, so diff the current rule-key set against the
+                // previously seen one and emit one event per rule resource.
+                let current = list_nrpt_rule_keys();
+                for key in &current {
+                    if !seen.contains(key) {
+                        continue_with(&callback, key, false);
+                    }
                 }
+                for key in &seen {
+                    if !current.contains(key) {
+                        continue_with(&callback, key, true);
+                    }
+                }
+                seen = current;
                 if rearm_notify(&watch).is_err() {
                     break;
                 }
@@ -275,4 +288,28 @@ fn rearm_notify(watch: &RegistryWatch) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn continue_with(callback: &Arc<dyn Fn(&DnsEvent) + Send + Sync>, key: &str, removed: bool) {
+    let Ok(resource) = ResourceId::new(format!("windows:nrpt:{key}")) else {
+        return;
+    };
+    let event = if removed {
+        DnsEvent::ResourceRemoved { resource }
+    } else {
+        DnsEvent::ResourceChanged { resource }
+    };
+    callback(&event);
+}
+
+fn list_nrpt_rule_keys() -> std::collections::BTreeSet<String> {
+    use windows_registry::LOCAL_MACHINE;
+    const NRPT_BASE: &str = "SYSTEM/CurrentControlSet/Services/Dnscache/Parameters/DnsPolicyConfig";
+    match LOCAL_MACHINE.open(NRPT_BASE) {
+        Ok(base) => base
+            .keys()
+            .map(|keys| keys.into_iter().collect())
+            .unwrap_or_default(),
+        Err(_) => Default::default(),
+    }
 }

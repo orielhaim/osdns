@@ -107,3 +107,62 @@ fn mutation_requires_explicit_opt_in() {
         Err(error) => panic!("unexpected apply error: {error}"),
     }
 }
+
+#[test]
+fn watchers_start_and_stop_cleanly() {
+    let Some(manager) = real_manager("macos-watch") else {
+        return;
+    };
+    let handle = manager.watch(std::sync::Arc::new(|_| {})).unwrap();
+    handle.stop();
+}
+
+#[test]
+fn resolver_file_watch_reports_external_changes() {
+    if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
+        return;
+    }
+    let Some(manager) = real_manager("macos-watch-resolver") else {
+        return;
+    };
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    let events: StdArc<StdMutex<Vec<String>>> = StdArc::new(StdMutex::new(Vec::new()));
+    let sink = events.clone();
+    let handle = manager
+        .watch(StdArc::new(move |event| match event {
+            osdns::DnsEvent::ResourceChanged { resource } => {
+                sink.lock().unwrap().push(format!("changed:{resource}"))
+            }
+            osdns::DnsEvent::ResourceRemoved { resource } => {
+                sink.lock().unwrap().push(format!("removed:{resource}"))
+            }
+            _ => {}
+        }))
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    std::fs::create_dir_all("/etc/resolver").unwrap();
+    std::fs::write("/etc/resolver/watch-probe.test", b"nameserver 127.0.0.1\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.contains("watch-probe.test"))
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    handle.stop();
+    let _ = std::fs::remove_file("/etc/resolver/watch-probe.test");
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e.contains("watch-probe.test")),
+        "external resolver file changes must be reported"
+    );
+}

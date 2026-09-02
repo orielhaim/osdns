@@ -70,6 +70,15 @@
 //! written by another owner is never overwritten. Watchers use
 //! `SCDynamicStore` notifications on a dedicated run-loop thread. All three
 //! primary platforms are now supported.
+//!
+//! **Phase 5 — hardening** — completes the architecture: `ConflictPolicy::Enforce`
+//! reconciliation (stability detection, rate limiting, a feedback-loop
+//! circuit breaker, journal rebasing), Windows NRPT rules as their own
+//! transactionally-owned resources, native FSEvents watching of
+//! `/etc/resolver`, multi-process crash/lock tests, destructive race tests,
+//! event-storm and allocation-budget tests, criterion benchmarks, and the
+//! CI matrix (fmt/clippy/test/doc on all three OSes, cross-target checks,
+//! feature powerset, cargo-deny, cargo-audit).
 
 #[macro_use]
 mod macros;
@@ -100,6 +109,7 @@ mod fault;
 mod fsutil;
 mod journal;
 mod platform;
+mod reconciliation;
 
 pub use capability::{BackendKind, Capabilities};
 pub use config::{DnsConfig, DnsConfigBuilder, DnsScope, InterfaceSelector};

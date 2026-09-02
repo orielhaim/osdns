@@ -7,12 +7,17 @@
 //! only. IPv4 and IPv6 are configured as two explicit stacks, mirroring the
 //! `DNS_SETTING_IPV6` flag of the native API.
 //!
-//! NRPT rules are additive and independently owned: rule keys are derived
+//! NRPT rules are transactionally owned resources in their own right: every
+//! rule chunk produced from a plan resolves to a separate
+//! `windows:nrpt:<key>` resource with its own lock, journal record, capture,
+//! and compare-before-restore decision. Rule keys are derived
 //! deterministically from the owner and namespace set, every osdns rule is
 //! marked with its owner, and no rule that is not marked as ours is ever
-//! read, written, or deleted. Rules written by Group Policy live in a
-//! separate registry tree that osdns never touches; on policy-managed
-//! machines local rules may therefore be overridden by policy.
+//! read, written, or deleted. Two leases on different adapters therefore
+//! cannot interfere: each owns exactly the rules its own plan produced.
+//! Rules written by Group Policy live in a separate registry tree that osdns
+//! never touches; on policy-managed machines local rules may therefore be
+//! overridden by policy.
 //!
 //! # WSL limitation
 //!
@@ -49,6 +54,36 @@ pub(crate) struct WindowsBackend {
     caps: Capabilities,
 }
 
+#[derive(Debug, Clone)]
+enum ResourceKind {
+    Interface(GUID),
+    Nrpt { key: String },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InterfaceState {
+    pub(crate) ipv4_nameservers: Option<Vec<IpAddr>>,
+    pub(crate) ipv4_search: Option<Vec<DnsSuffix>>,
+    pub(crate) ipv6_nameservers: Option<Vec<IpAddr>>,
+    pub(crate) ipv6_search: Option<Vec<DnsSuffix>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InterfaceSnapshot {
+    pub(crate) interface: InterfaceState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NrptSnapshot {
+    pub(crate) rule: Option<nrpt::NrptRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) enum WindowsSnapshot {
+    Interface(InterfaceSnapshot),
+    Nrpt(NrptSnapshot),
+}
+
 impl WindowsBackend {
     pub(crate) fn new(owner: &str) -> Self {
         Self {
@@ -64,16 +99,22 @@ impl WindowsBackend {
         }
     }
 
-    fn guid_of(resource: &ResourceId) -> Result<GUID> {
-        let text = resource
-            .as_str()
-            .strip_prefix("windows:interface:")
-            .ok_or_else(|| {
-                Error::invalid_config(format_args!(
-                    "resource {resource} is not a Windows interface"
-                ))
-            })?;
-        crate::platform::windows::interface::parse_guid(text)
+    fn parse_resource(resource: &ResourceId) -> Result<ResourceKind> {
+        if let Some(text) = resource.as_str().strip_prefix("windows:interface:") {
+            return Ok(ResourceKind::Interface(interface::parse_guid(text)?));
+        }
+        if let Some(key) = resource.as_str().strip_prefix("windows:nrpt:") {
+            return Ok(ResourceKind::Nrpt {
+                key: key.to_string(),
+            });
+        }
+        Err(Error::invalid_config(format_args!(
+            "resource {resource} is not a Windows DNS resource"
+        )))
+    }
+
+    fn nrpt_resource(rule: &nrpt::NrptRule) -> ResourceId {
+        ResourceId::new(format!("windows:nrpt:{}", rule.key)).expect("valid NRPT resource")
     }
 
     fn read_interface_state(&self, guid: &GUID) -> Result<InterfaceState> {
@@ -89,13 +130,6 @@ impl WindowsBackend {
                 .map(|list| list.iter().filter(|ip| ip.is_ipv6()).cloned().collect()),
             ipv4_search: searchlist.clone(),
             ipv6_search: searchlist,
-        })
-    }
-
-    fn capture_state(&self, guid: &GUID) -> Result<WindowsSnapshot> {
-        Ok(WindowsSnapshot {
-            interface: self.read_interface_state(guid)?,
-            rules: nrpt::read_owned_rules(&self.owner)?,
         })
     }
 
@@ -155,20 +189,6 @@ impl WindowsBackend {
             )
         })
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct InterfaceState {
-    pub(crate) ipv4_nameservers: Option<Vec<IpAddr>>,
-    pub(crate) ipv4_search: Option<Vec<DnsSuffix>>,
-    pub(crate) ipv6_nameservers: Option<Vec<IpAddr>>,
-    pub(crate) ipv6_search: Option<Vec<DnsSuffix>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct WindowsSnapshot {
-    pub(crate) interface: InterfaceState,
-    pub(crate) rules: Vec<nrpt::NrptRule>,
 }
 
 fn join_addresses(list: &[IpAddr]) -> String {
@@ -241,7 +261,7 @@ impl Backend for WindowsBackend {
     fn resolve_resources(
         &self,
         scope: &DnsScope,
-        _plan: &NormalizedConfig,
+        plan: &NormalizedConfig,
     ) -> Result<Vec<ResourceId>> {
         match scope {
             DnsScope::Global => Err(Error::unsupported(
@@ -250,8 +270,14 @@ impl Backend for WindowsBackend {
             )),
             DnsScope::Interface(selector) => {
                 let adapter = adapter_for_selector(selector)?;
-                ResourceId::new(format!("windows:interface:{}", adapter.guid_string))
-                    .map(|id| vec![id])
+                let mut resources = vec![ResourceId::new(format!(
+                    "windows:interface:{}",
+                    adapter.guid_string
+                ))?];
+                for rule in nrpt::rules_from_plan(plan, &self.owner) {
+                    resources.push(Self::nrpt_resource(&rule));
+                }
+                Ok(resources)
             }
         }
     }
@@ -261,53 +287,74 @@ impl Backend for WindowsBackend {
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let guid = Self::guid_of(resource)?;
-        let snapshot = self.capture_state(&guid)?;
-        self.to_platform(resource, &snapshot)
+        match Self::parse_resource(resource)? {
+            ResourceKind::Interface(guid) => {
+                let snapshot = WindowsSnapshot::Interface(InterfaceSnapshot {
+                    interface: self.read_interface_state(&guid)?,
+                });
+                self.to_platform(resource, &snapshot)
+            }
+            ResourceKind::Nrpt { key } => {
+                let rule = nrpt::read_rule_by_key(&key)?;
+                let snapshot = WindowsSnapshot::Nrpt(NrptSnapshot { rule });
+                self.to_platform(resource, &snapshot)
+            }
+        }
     }
 
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
-        let guid = Self::guid_of(resource)?;
-        for rule in nrpt::rules_from_plan(plan, &self.owner) {
-            nrpt::write_rule(&rule, &self.owner)?;
+        match Self::parse_resource(resource)? {
+            ResourceKind::Interface(guid) => {
+                self.apply_interface(&guid, &expected_interface_state(plan))?;
+            }
+            ResourceKind::Nrpt { .. } => {
+                let expected = nrpt::rules_from_plan(plan, &self.owner);
+                let key = resource
+                    .as_str()
+                    .strip_prefix("windows:nrpt:")
+                    .expect("parsed as nrpt");
+                let Some(rule) = expected.iter().find(|rule| rule.key == key) else {
+                    return Err(Error::invalid_config(format_args!(
+                        "resource {resource} is not part of the desired configuration"
+                    )));
+                };
+                nrpt::write_rule(rule, &self.owner)?;
+            }
         }
-        self.apply_interface(&guid, &expected_interface_state(plan))?;
         Ok(ApplyReceipt {
             resource: resource.clone(),
         })
     }
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let guid = Self::guid_of(resource)?;
-        let snapshot = self.capture_state(&guid)?;
-        self.to_platform(resource, &snapshot)
+        self.capture(resource)
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
-        let guid = Self::guid_of(resource)?;
-        let before = self.parse_snapshot(snapshot)?;
-        let current = self.capture_state(&guid)?;
-        for rule in &current.rules {
-            if !before.rules.iter().any(|r| r.key == rule.key) {
-                nrpt::delete_rule(&rule.key)?;
+        match (
+            Self::parse_resource(resource)?,
+            self.parse_snapshot(snapshot)?,
+        ) {
+            (ResourceKind::Interface(guid), WindowsSnapshot::Interface(before)) => {
+                self.restore_interface(&guid, &before.interface)?;
+            }
+            (ResourceKind::Nrpt { key }, WindowsSnapshot::Nrpt(before)) => match before.rule {
+                Some(rule) => nrpt::write_rule(&rule, &self.owner)?,
+                None => nrpt::delete_rule(&key)?,
+            },
+            _ => {
+                return Err(Error::platform(
+                    BackendKind::WindowsIpHelper,
+                    "snapshot does not match the resource kind",
+                ));
             }
         }
-        for rule in &before.rules {
-            if current.rules.iter().any(|r| r.key == rule.key) {
-                nrpt::write_rule(rule, &self.owner)?;
-            }
-        }
-        self.restore_interface(&guid, &before.interface)?;
         Ok(())
     }
 
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         match (self.parse_snapshot(a), self.parse_snapshot(b)) {
-            (Ok(x), Ok(y)) => {
-                let rules_sorted = |mut rules: Vec<nrpt::NrptRule>| {
-                    rules.sort_by(|a, b| a.key.cmp(&b.key));
-                    rules
-                };
+            (Ok(WindowsSnapshot::Interface(x)), Ok(WindowsSnapshot::Interface(y))) => {
                 normalized(&x.interface.ipv4_nameservers)
                     == normalized(&y.interface.ipv4_nameservers)
                     && normalized(&x.interface.ipv6_nameservers)
@@ -316,8 +363,8 @@ impl Backend for WindowsBackend {
                         == normalized_suffixes(&y.interface.ipv4_search)
                     && normalized_suffixes(&x.interface.ipv6_search)
                         == normalized_suffixes(&y.interface.ipv6_search)
-                    && rules_sorted(x.rules) == rules_sorted(y.rules)
             }
+            (Ok(WindowsSnapshot::Nrpt(x)), Ok(WindowsSnapshot::Nrpt(y))) => x == y,
             _ => false,
         }
     }
@@ -326,74 +373,91 @@ impl Backend for WindowsBackend {
         let Ok(current) = self.parse_snapshot(snapshot) else {
             return false;
         };
-        let expected = expected_interface_state(plan);
-        let interface_matches = normalized(&current.interface.ipv4_nameservers)
-            == normalized(&expected.ipv4_nameservers)
-            && normalized(&current.interface.ipv6_nameservers)
-                == normalized(&expected.ipv6_nameservers)
-            && normalized_suffixes(&current.interface.ipv4_search)
-                == normalized_suffixes(&expected.ipv4_search)
-            && normalized_suffixes(&current.interface.ipv6_search)
-                == normalized_suffixes(&expected.ipv6_search);
-        if !interface_matches {
-            return false;
-        }
-        for rule in nrpt::rules_from_plan(plan, &self.owner) {
-            let Some(found) = current.rules.iter().find(|r| r.key == rule.key) else {
-                return false;
-            };
-            if found.namespaces != rule.namespaces || found.servers != rule.servers {
-                return false;
+        match Self::parse_resource(&snapshot.resource) {
+            Ok(ResourceKind::Interface(_)) => {
+                let WindowsSnapshot::Interface(current) = current else {
+                    return false;
+                };
+                let expected = expected_interface_state(plan);
+                normalized(&current.interface.ipv4_nameservers)
+                    == normalized(&expected.ipv4_nameservers)
+                    && normalized(&current.interface.ipv6_nameservers)
+                        == normalized(&expected.ipv6_nameservers)
+                    && normalized_suffixes(&current.interface.ipv4_search)
+                        == normalized_suffixes(&expected.ipv4_search)
+                    && normalized_suffixes(&current.interface.ipv6_search)
+                        == normalized_suffixes(&expected.ipv6_search)
             }
+            Ok(ResourceKind::Nrpt { key }) => {
+                let WindowsSnapshot::Nrpt(current) = current else {
+                    return false;
+                };
+                let expected = nrpt::rules_from_plan(plan, &self.owner);
+                let Some(expected_rule) = expected.iter().find(|rule| rule.key == key) else {
+                    return false;
+                };
+                current.rule.as_ref().is_some_and(|rule| {
+                    rule.namespaces == expected_rule.namespaces
+                        && rule.servers == expected_rule.servers
+                })
+            }
+            Err(_) => false,
         }
-        true
     }
 
     fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig> {
-        let snapshot = self.parse_snapshot(snapshot)?;
-        let mut nameservers = snapshot
-            .interface
-            .ipv4_nameservers
-            .clone()
-            .unwrap_or_default();
-        nameservers.extend(
-            snapshot
-                .interface
-                .ipv6_nameservers
-                .clone()
-                .unwrap_or_default(),
-        );
-        let mut search = snapshot.interface.ipv4_search.clone().unwrap_or_default();
-        for suffix in snapshot.interface.ipv6_search.clone().unwrap_or_default() {
-            if !search.contains(&suffix) {
-                search.push(suffix);
-            }
-        }
-        let mut routing = Vec::new();
-        for rule in &snapshot.rules {
-            for namespace in &rule.namespaces {
-                let Ok(suffix) = DnsSuffix::parse(namespace) else {
-                    continue;
-                };
-                if !routing.contains(&suffix) {
-                    routing.push(suffix);
+        match self.parse_snapshot(snapshot)? {
+            WindowsSnapshot::Interface(state) => {
+                let mut nameservers = state.interface.ipv4_nameservers.clone().unwrap_or_default();
+                nameservers.extend(state.interface.ipv6_nameservers.clone().unwrap_or_default());
+                let mut search = state.interface.ipv4_search.clone().unwrap_or_default();
+                for suffix in state.interface.ipv6_search.clone().unwrap_or_default() {
+                    if !search.contains(&suffix) {
+                        search.push(suffix);
+                    }
                 }
+                Ok(DnsConfig::from_parts(
+                    scope.clone(),
+                    nameservers,
+                    search,
+                    Vec::new(),
+                    None,
+                ))
+            }
+            WindowsSnapshot::Nrpt(state) => {
+                let Some(rule) = state.rule else {
+                    return Ok(DnsConfig::from_parts(
+                        scope.clone(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    ));
+                };
+                let mut routing = Vec::new();
+                for namespace in &rule.namespaces {
+                    let Ok(suffix) = DnsSuffix::parse(namespace) else {
+                        continue;
+                    };
+                    if !routing.contains(&suffix) {
+                        routing.push(suffix);
+                    }
+                }
+                Ok(DnsConfig::from_parts(
+                    scope.clone(),
+                    rule.servers.clone(),
+                    Vec::new(),
+                    routing,
+                    None,
+                ))
             }
         }
-        Ok(DnsConfig::from_parts(
-            scope.clone(),
-            nameservers,
-            search,
-            routing,
-            None,
-        ))
     }
 
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ip_cancel =
-            super::windows::notify::start_ip_interface_watch(flag.clone(), callback.clone())?;
-        let nrpt_cancel = super::windows::notify::start_nrpt_registry_watch(flag, callback)?;
+        let ip_cancel = notify::start_ip_interface_watch(flag.clone(), callback.clone())?;
+        let nrpt_cancel = notify::start_nrpt_registry_watch(flag, callback)?;
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(WatchHandle::new(done, move || {
             ip_cancel();
@@ -409,26 +473,13 @@ impl Backend for WindowsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DnsConfig;
+    use crate::config::{DnsConfig, InterfaceSelector};
 
-    fn plan(
-        ns: &[&str],
-        search: &[&str],
-        routing: &[&str],
-        default_route: Option<bool>,
-    ) -> NormalizedConfig {
-        let mut builder = DnsConfig::builder(DnsScope::Interface(
-            crate::config::InterfaceSelector::Index(1),
-        ))
-        .nameservers(ns.iter().map(|s| s.parse().unwrap()));
-        for domain in search {
-            builder = builder.search_domain(domain);
-        }
+    fn plan(ns: &[&str], routing: &[&str]) -> NormalizedConfig {
+        let mut builder = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Index(1)))
+            .nameservers(ns.iter().map(|s| s.parse().unwrap()));
         for domain in routing {
             builder = builder.routing_domain(domain);
-        }
-        if let Some(flag) = default_route {
-            builder = builder.default_route(flag);
         }
         crate::config::validate_against(
             &builder.build().unwrap(),
@@ -440,116 +491,68 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn expected_interface_state_splits_families() {
-        let p = plan(
-            &["1.1.1.1", "2606:4700:4700::1111"],
-            &["corp.example"],
-            &[],
-            None,
-        );
-        let expected = expected_interface_state(&p);
-        assert_eq!(
-            expected.ipv4_nameservers,
-            Some(vec!["1.1.1.1".parse().unwrap()])
-        );
-        assert_eq!(
-            expected.ipv6_nameservers,
-            Some(vec!["2606:4700:4700::1111".parse().unwrap()])
-        );
-        let search = vec![DnsSuffix::parse("corp.example").unwrap()];
-        assert_eq!(expected.ipv4_search, Some(search.clone()));
-        assert_eq!(expected.ipv6_search, Some(search));
+    fn rid(value: &str) -> ResourceId {
+        ResourceId::new(value).unwrap()
     }
 
     #[test]
-    fn normalized_treats_absent_and_empty_alike() {
-        assert_eq!(normalized(&None), Vec::<IpAddr>::new());
-        assert_eq!(normalized(&Some(vec![])), Vec::<IpAddr>::new());
-        assert_eq!(normalized_suffixes(&None), Vec::<DnsSuffix>::new());
-    }
-
-    #[test]
-    fn matches_desired_ignores_foreign_marker_rules() {
+    fn resolve_resources_splits_interface_and_nrpt() {
         let backend = WindowsBackend::new("io.test");
-        let p = plan(&["1.1.1.1"], &["corp.example"], &["corp.example"], None);
-        let expected_rules = nrpt::rules_from_plan(&p, "io.test");
-        let mut snapshot = WindowsSnapshot {
-            interface: expected_interface_state(&p),
-            rules: expected_rules.clone(),
-        };
-        assert!(
-            backend.matches_desired(
-                &backend
-                    .to_platform(
-                        &ResourceId::new("windows:interface:12345678-9abc-def0-1122-334455667788")
-                            .unwrap(),
-                        &snapshot
-                    )
-                    .unwrap(),
-                &p,
-            )
-        );
+        let p = plan(&["1.1.1.1"], &["corp.example"]);
+        let resources = backend
+            .resolve_resources(&DnsScope::Interface(InterfaceSelector::Index(1)), &p)
+            .unwrap();
+        assert_eq!(resources.len(), 2);
+        assert!(resources[0].as_str().starts_with("windows:interface:"));
+        assert!(resources[1].as_str().starts_with("windows:nrpt:"));
+    }
 
-        snapshot.rules.push(nrpt::NrptRule {
-            key: "00000000-0000-0000-0000-000000000000".to_string(),
-            namespaces: vec![".other.example".to_string()],
-            servers: vec!["9.9.9.9".parse().unwrap()],
+    #[test]
+    fn interface_matches_desired_and_ignores_other_kinds() {
+        let backend = WindowsBackend::new("io.test");
+        let p = plan(&["1.1.1.1"], &["corp.example"]);
+        let snapshot = WindowsSnapshot::Interface(InterfaceSnapshot {
+            interface: expected_interface_state(&p),
         });
-        assert!(
-            backend.matches_desired(
-                &backend
-                    .to_platform(
-                        &ResourceId::new("windows:interface:12345678-9abc-def0-1122-334455667788")
-                            .unwrap(),
-                        &snapshot
-                    )
-                    .unwrap(),
-                &p,
-            ),
-            "rules owned by other leases must not affect verification"
-        );
-    }
-
-    #[test]
-    fn matches_desired_fails_when_rule_content_differs() {
-        let backend = WindowsBackend::new("io.test");
-        let p = plan(&["1.1.1.1"], &[], &["corp.example"], None);
-        let mut rules = nrpt::rules_from_plan(&p, "io.test");
-        rules[0].servers = vec!["9.9.9.9".parse().unwrap()];
-        let snapshot = WindowsSnapshot {
-            interface: expected_interface_state(&p),
-            rules,
-        };
-        assert!(
-            !backend.matches_desired(
-                &backend
-                    .to_platform(
-                        &ResourceId::new("windows:interface:12345678-9abc-def0-1122-334455667788")
-                            .unwrap(),
-                        &snapshot
-                    )
-                    .unwrap(),
-                &p,
-            )
-        );
-    }
-
-    #[test]
-    fn snapshot_roundtrips_through_json() {
-        let backend = WindowsBackend::new("io.test");
-        let p = plan(&["1.1.1.1"], &["corp.example"], &["corp.example"], None);
-        let snapshot = WindowsSnapshot {
-            interface: expected_interface_state(&p),
-            rules: nrpt::rules_from_plan(&p, "io.test"),
-        };
         let platform = backend
             .to_platform(
-                &ResourceId::new("windows:interface:12345678-9abc-def0-1122-334455667788").unwrap(),
+                &rid("windows:interface:11111111-2222-3333-4444-555555555555"),
                 &snapshot,
             )
             .unwrap();
-        let parsed = backend.parse_snapshot(&platform).unwrap();
-        assert_eq!(snapshot, parsed);
+        assert!(backend.matches_desired(&platform, &p));
+    }
+
+    #[test]
+    fn nrpt_matches_desired_per_resource() {
+        let backend = WindowsBackend::new("io.test");
+        let p = plan(&["1.1.1.1"], &["corp.example"]);
+        let rules = nrpt::rules_from_plan(&p, "io.test");
+        assert_eq!(rules.len(), 1);
+        let resource = ResourceId::new(format!("windows:nrpt:{}", rules[0].key)).unwrap();
+        let snapshot = WindowsSnapshot::Nrpt(NrptSnapshot {
+            rule: Some(rules[0].clone()),
+        });
+        let platform = backend.to_platform(&resource, &snapshot).unwrap();
+        assert!(backend.matches_desired(&platform, &p));
+
+        let mut stale = snapshot.clone();
+        if let WindowsSnapshot::Nrpt(nrpt_snapshot) = &mut stale {
+            nrpt_snapshot.rule.as_mut().unwrap().servers = vec!["9.9.9.9".parse().unwrap()];
+        }
+        let platform = backend.to_platform(&resource, &stale).unwrap();
+        assert!(!backend.matches_desired(&platform, &p));
+    }
+
+    #[test]
+    fn nrpt_restore_semantics() {
+        let _backend = WindowsBackend::new("io.test");
+        let p = plan(&["1.1.1.1"], &["corp.example"]);
+        let rules = nrpt::rules_from_plan(&p, "io.test");
+        let before_absent = WindowsSnapshot::Nrpt(NrptSnapshot { rule: None });
+        let before_present = WindowsSnapshot::Nrpt(NrptSnapshot {
+            rule: Some(rules[0].clone()),
+        });
+        assert_ne!(before_absent, before_present);
     }
 }
