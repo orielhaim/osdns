@@ -15,7 +15,8 @@ use windows_registry::LOCAL_MACHINE;
 use crate::capability::BackendKind;
 use crate::error::{Error, Result};
 
-const NRPT_BASE: &str = "SYSTEM/CurrentControlSet/Services/Dnscache/Parameters/DnsPolicyConfig";
+pub(super) const NRPT_BASE: &str =
+    r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
 const MAX_NAMESPACES_PER_RULE: usize = 50;
 const CONFIG_OPTIONS_OVERRIDE: u32 = 0x8;
 const MARKER_PREFIX: &str = "osdns owner=";
@@ -89,7 +90,7 @@ pub(crate) fn rules_from_plan(
 
 pub(crate) fn write_rule(rule: &NrptRule, owner: &str) -> Result<()> {
     let dnskey = LOCAL_MACHINE
-        .create(format!("{NRPT_BASE}/{}", rule.key))
+        .create(format!(r"{NRPT_BASE}\{}", rule.key))
         .map_err(registry_error)?;
     dnskey.set_u32("Version", 1).map_err(registry_error)?;
     dnskey
@@ -118,14 +119,22 @@ pub(crate) fn write_rule(rule: &NrptRule, owner: &str) -> Result<()> {
 }
 
 pub(crate) fn delete_rule(key: &str) -> Result<()> {
-    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
+    let base = match LOCAL_MACHINE
+        .options()
+        .read()
+        .write()
+        .access(0x0001_0000)
+        .open(NRPT_BASE)
+    {
         Ok(base) => base,
-        Err(_) => return Ok(()),
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(()),
+        Err(error) => return Err(registry_error(error)),
     };
-    if base.open(key).is_err() {
-        return Ok(());
+    match base.remove_tree(key) {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => Ok(()),
+        Err(error) => Err(registry_error(error)),
     }
-    base.remove_tree(key).map_err(registry_error)
 }
 
 fn registry_error<E: std::fmt::Display>(error: E) -> Error {
@@ -147,11 +156,13 @@ fn registry_error<E: std::fmt::Display>(error: E) -> Error {
 pub(crate) fn read_rule_by_key(key: &str) -> Result<Option<NrptRule>> {
     let base = match LOCAL_MACHINE.open(NRPT_BASE) {
         Ok(base) => base,
-        Err(_) => return Ok(None),
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(None),
+        Err(error) => return Err(registry_error(error)),
     };
     let rule_key = match base.open(key) {
         Ok(rule_key) => rule_key,
-        Err(_) => return Ok(None),
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(None),
+        Err(error) => return Err(registry_error(error)),
     };
     let namespaces = rule_key.get_multi_string("Name").unwrap_or_default();
     if namespaces.is_empty() {

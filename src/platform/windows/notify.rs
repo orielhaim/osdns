@@ -311,8 +311,8 @@ fn rule_fingerprint(key: &windows_registry::Key) -> Option<String> {
 
 /// Snapshots every NRPT rule key with its value fingerprint.
 fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
+    use super::nrpt::NRPT_BASE;
     use windows_registry::LOCAL_MACHINE;
-    const NRPT_BASE: &str = "SYSTEM/CurrentControlSet/Services/Dnscache/Parameters/DnsPolicyConfig";
     let base = match LOCAL_MACHINE.open(NRPT_BASE) {
         Ok(base) => base,
         Err(_) => return Default::default(),

@@ -205,6 +205,42 @@ unsafe fn read_returned_settings(settings: &DNS_INTERFACE_SETTINGS) -> RawDnsSet
     }
 }
 
+/// GetInterfaceDnsSettings exposes IPv4 settings and requires Flags = 0;
+/// it has no supported selector for reading the IPv6 stack. Read that
+/// stack's configured overrides, rather than effective DHCP DNS addresses.
+pub(crate) fn get_ipv6_dns_settings(guid: &GUID) -> Result<RawDnsSettings> {
+    let path = format!(
+        r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{{{}}}",
+        guid_to_string(guid)
+    );
+    let key = match windows_registry::LOCAL_MACHINE.open(&path) {
+        Ok(key) => key,
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => {
+            return Ok(RawDnsSettings::default());
+        }
+        Err(error) => {
+            return Err(Error::platform(
+                BackendKind::WindowsIpHelper,
+                format_args!("cannot read IPv6 DNS configuration: {error}"),
+            ));
+        }
+    };
+    let read = |name: &str| -> Result<Option<String>> {
+        match key.get_string(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => Ok(None),
+            Err(error) => Err(Error::platform(
+                BackendKind::WindowsIpHelper,
+                format_args!("cannot read IPv6 {name}: {error}"),
+            )),
+        }
+    };
+    Ok(RawDnsSettings {
+        nameserver: read("NameServer")?,
+        searchlist: read("SearchList")?,
+    })
+}
+
 pub(crate) fn set_dns_settings(
     guid: &GUID,
     ipv6_stack: bool,

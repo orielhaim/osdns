@@ -31,7 +31,13 @@ fn pinned_manager(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn up_interface(manager: &osdns::DnsManager) -> Option<osdns::InterfaceInfo> {
-    manager.interfaces().unwrap().into_iter().find(|i| i.is_up)
+    let name = std::env::var_os("OSDNS_TEST_INTERFACE")
+        .expect("mutation tests require OSDNS_TEST_INTERFACE naming a disposable adapter");
+    manager
+        .interfaces()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.is_up && i.name == name)
 }
 
 #[test]
@@ -51,9 +57,7 @@ fn matrix_systemd_resolved_lifecycle() {
         manager.capabilities().unwrap().backend,
         BackendKind::SystemdResolved
     );
-    let Some(target) = up_interface(&manager) else {
-        return;
-    };
+    let target = up_interface(&manager).expect("the disposable interface must be up");
     let scope = DnsScope::Interface(InterfaceSelector::Name(target.name.clone()));
     let config = DnsConfig::builder(scope.clone())
         .nameserver(ip("127.0.0.1"))
@@ -123,16 +127,16 @@ fn matrix_resolvconf_lifecycle() {
         .nameserver(ip("127.0.0.1"))
         .build()
         .unwrap();
-    let lease = match manager.apply(&config) {
-        Ok(lease) => lease,
-        Err(Error::RequiresPrivilege(_)) => return,
-        Err(error) => panic!("unexpected apply error: {error}"),
-    };
+    let before = manager.snapshot(&scope).unwrap();
+    let lease = manager
+        .apply(&config)
+        .expect("openresolv apply must succeed when opted in");
     assert_eq!(
         manager.snapshot(&scope).unwrap().nameservers(),
         &[ip("127.0.0.1")]
     );
     lease.restore().unwrap();
+    assert_eq!(manager.snapshot(&scope).unwrap(), before);
 }
 
 #[test]

@@ -65,6 +65,15 @@ fn resolved_backend_roundtrip_when_available() {
             target.name.clone(),
         )))
         .unwrap();
+    // Reading a real adapter is safe without opting into DNS mutations.
+    if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
+        return;
+    }
+    assert_eq!(
+        Some(target.name.clone()),
+        std::env::var_os("OSDNS_TEST_INTERFACE"),
+        "mutations require an explicitly selected disposable adapter"
+    );
     let lease = manager.apply(&config).unwrap();
     assert_eq!(
         manager

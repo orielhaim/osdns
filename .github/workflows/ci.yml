@@ -41,9 +41,16 @@ jobs:
       - run: cargo +1.98.0 test
       - run: cargo +1.98.0 test --features test-util
       - run: cargo +1.98.0 test --features tracing
+      - name: Test systemd-resolved on a disposable interface
+        if: runner.os == 'Linux'
+        run: |
+          sudo ip link add osdns-ci type dummy
+          trap 'sudo ip link delete osdns-ci' EXIT
+          sudo ip link set osdns-ci up
+          sudo env PATH="$PATH" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 OSDNS_TEST_INTERFACE=osdns-ci cargo +1.98.0 test --features test-util --test backend_matrix matrix_systemd_resolved_lifecycle -- --exact --nocapture
       - run: ./.github/scripts/windows-integration.ps1
         if: runner.os == 'Windows'
-      - run: sudo env PATH="$PATH" OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo +1.98.0 test --features test-util --test backend_matrix --test macos -- --test-threads=1
+      - run: sudo env PATH="$PATH" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo +1.98.0 test --features test-util --test backend_matrix --test macos -- --test-threads=1
         if: runner.os == 'macOS'
 
   openresolv:

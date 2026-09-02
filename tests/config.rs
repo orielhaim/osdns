@@ -166,13 +166,16 @@ fn update_after_defunct_lease_conflicts() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn default_backend_is_unavailable_before_phase_4() {
-    let err = DnsManager::builder()
+fn default_backend_is_macos_system_configuration() {
+    let manager = DnsManager::builder()
         .owner("io.osdns.test")
         .state_dir(temp_dir("default-backend"))
         .build()
-        .unwrap_err();
-    assert!(matches!(err, Error::BackendUnavailable(_)));
+        .unwrap();
+    assert_eq!(
+        manager.capabilities().unwrap().backend,
+        BackendKind::MacosSystemConfiguration
+    );
 }
 
 #[test]
