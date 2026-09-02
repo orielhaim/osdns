@@ -188,16 +188,21 @@ pub(crate) fn get_dns_settings(guid: &GUID) -> Result<RawDnsSettings> {
             "GetInterfaceDnsSettings",
         ));
     }
-    let raw = unsafe {
-        RawDnsSettings {
-            nameserver: (settings.Flags & u64::from(DNS_SETTING_NAMESERVER) != 0)
-                .then(|| pwstr_to_string(settings.NameServer)),
-            searchlist: (settings.Flags & u64::from(DNS_SETTING_SEARCHLIST) != 0)
-                .then(|| pwstr_to_string(settings.SearchList)),
-        }
-    };
+    // Get populates the fields but does not set the Set operation's mask.
+    // SAFETY: these strings belong to settings until FreeInterfaceDnsSettings.
+    let raw = unsafe { read_returned_settings(&settings) };
     unsafe { FreeInterfaceDnsSettings(&mut settings) };
     Ok(raw)
+}
+
+unsafe fn read_returned_settings(settings: &DNS_INTERFACE_SETTINGS) -> RawDnsSettings {
+    RawDnsSettings {
+        // SAFETY: caller guarantees valid API-owned NUL-terminated strings.
+        nameserver: (!settings.NameServer.is_null())
+            .then(|| unsafe { pwstr_to_string(settings.NameServer) }),
+        searchlist: (!settings.SearchList.is_null())
+            .then(|| unsafe { pwstr_to_string(settings.SearchList) }),
+    }
 }
 
 pub(crate) fn set_dns_settings(
@@ -357,6 +362,28 @@ pub(crate) fn adapter_list() -> Result<Vec<InterfaceInfo>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn returned_settings_do_not_use_the_write_mask() {
+        let servers = windows::core::HSTRING::from("192.0.2.53,2001:db8::53");
+        let search = windows::core::HSTRING::from("osdns.test");
+        let settings = DNS_INTERFACE_SETTINGS {
+            Version: DNS_INTERFACE_SETTINGS_VERSION1,
+            Flags: 0,
+            NameServer: PWSTR::from_raw(servers.as_ptr().cast_mut()),
+            SearchList: PWSTR::from_raw(search.as_ptr().cast_mut()),
+            ..Default::default()
+        };
+        // SAFETY: the HSTRING values outlive the read.
+        let raw = unsafe { read_returned_settings(&settings) };
+        assert_eq!(raw.nameserver.as_deref(), Some("192.0.2.53,2001:db8::53"));
+        assert_eq!(raw.searchlist.as_deref(), Some("osdns.test"));
+        // SAFETY: all string pointers are null.
+        assert_eq!(
+            unsafe { read_returned_settings(&DNS_INTERFACE_SETTINGS::default()) },
+            RawDnsSettings::default()
+        );
+    }
 
     #[test]
     fn guid_string_roundtrip() {

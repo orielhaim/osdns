@@ -84,7 +84,7 @@ pub enum FakeOp {
 struct FakeInner {
     interfaces: Vec<InterfaceInfo>,
     states: BTreeMap<ResourceId, FakeState>,
-    failures: Vec<(FakeOp, u32, String)>,
+    failures: Vec<(FakeOp, u32, u32, String)>,
     readback_lie: Option<FakeState>,
 }
 
@@ -215,7 +215,20 @@ impl FakeBackend {
     }
 
     pub(crate) fn inject_failure(&self, op: FakeOp, times: u32, message: impl Into<String>) {
-        self.lock_inner().failures.push((op, times, message.into()));
+        self.inject_failure_after(op, 0, times, message);
+    }
+
+    pub(crate) fn inject_failure_after(
+        &self,
+        op: FakeOp,
+        skip: u32,
+        times: u32,
+        message: impl Into<String>,
+    ) {
+        assert!(times > 0);
+        self.lock_inner()
+            .failures
+            .push((op, skip, times, message.into()));
     }
 
     pub(crate) fn lie_once_on_readback(&self, state: FakeState) {
@@ -237,8 +250,12 @@ impl FakeBackend {
 
     fn check_failure(&self, op: FakeOp) -> Result<()> {
         let mut inner = self.lock_inner();
-        if let Some(pos) = inner.failures.iter().position(|(o, _, _)| *o == op) {
-            let (_, times, message) = &mut inner.failures[pos];
+        if let Some(pos) = inner.failures.iter().position(|(o, _, _, _)| *o == op) {
+            let (_, skip, times, message) = &mut inner.failures[pos];
+            if *skip > 0 {
+                *skip -= 1;
+                return Ok(());
+            }
             *times -= 1;
             let message = message.clone();
             let spent = *times == 0;

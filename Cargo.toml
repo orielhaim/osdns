@@ -47,7 +47,7 @@ notify = { version = "8.2.0", default-features = false, features = ["macos_fseve
 system-configuration = "0.8.0"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["stable"] }
+criterion = "0.8.2"
 osdns = { path = ".", features = ["test-util"] }
 rstest = "0.26.1"
 serde = { version = "1", features = ["derive"] }

@@ -435,19 +435,10 @@ impl Inner {
                 ReconcileOutcome::Rebased
             }
             Err(_) => {
-                // mutate_and_verify already rolled back toward the external
-                // base. Confirm; when the rollback did not land, restore the
-                // previous journal claim so recovery never mistakes the
-                // external state for ours.
-                let rolled_back = self
-                    .backend
-                    .readback(resource)
-                    .map(|current| self.backend.equivalent(&current, external_base))
-                    .unwrap_or(false);
-                if !rolled_back {
-                    *record = old;
-                    let _ = self.journal.write(record);
-                }
+                // Prepared is already durable. Keep the external base even
+                // if rollback fails or its readback is unavailable. The OS
+                // may still contain our overlay; restoring the old journal
+                // would let recovery erase the newly adopted external base.
                 ReconcileOutcome::Deferred
             }
         }

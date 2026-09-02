@@ -104,16 +104,7 @@ fn mutation_requires_explicit_opt_in() {
     let Some(manager) = real_manager("win-mutate") else {
         return;
     };
-    let interfaces = manager.interfaces().unwrap();
-    let loopback = interfaces
-        .iter()
-        .find(|i| {
-            i.name
-                .to_string_lossy()
-                .to_ascii_lowercase()
-                .contains("loopback")
-        })
-        .expect("loopback adapter present");
+    let loopback = windows_test_interface(&manager);
     let scope = DnsScope::Interface(InterfaceSelector::Name(loopback.name.clone()));
     let config = DnsConfig::builder(scope.clone())
         .nameserver(ip("127.0.0.1"))
@@ -131,7 +122,6 @@ fn mutation_requires_explicit_opt_in() {
             );
             lease.restore().unwrap();
         }
-        Err(osdns::Error::RequiresPrivilege(_)) => {}
         Err(error) => panic!("unexpected apply error: {error}"),
     }
 }

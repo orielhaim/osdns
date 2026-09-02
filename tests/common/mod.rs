@@ -41,6 +41,18 @@ pub fn ip(addr: &str) -> IpAddr {
     addr.parse().unwrap()
 }
 
+#[cfg(target_os = "windows")]
+pub fn windows_test_interface(manager: &DnsManager) -> osdns::InterfaceInfo {
+    let name = std::env::var_os("OSDNS_TEST_INTERFACE")
+        .expect("mutation tests require OSDNS_TEST_INTERFACE naming a disposable adapter");
+    manager
+        .interfaces()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.name == name)
+        .expect("the disposable test adapter must exist")
+}
+
 pub const GLOBAL: &str = "fake:global";
 pub const IFACE1: &str = "fake:interface:1";
 pub const IFACE2: &str = "fake:interface:2";
