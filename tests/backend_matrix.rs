@@ -11,8 +11,10 @@
 mod common;
 
 use common::*;
+#[cfg(not(target_os = "windows"))]
+use osdns::Error;
 use osdns::testing::manager_for_backend;
-use osdns::{BackendKind, DnsConfig, DnsScope, Error, InterfaceSelector};
+use osdns::{BackendKind, DnsConfig, DnsScope, InterfaceSelector};
 use std::time::Duration;
 
 fn mutation_gate_open() -> bool {
@@ -27,8 +29,15 @@ fn pinned_manager(
     manager_for_backend("io.osdns.matrix", &dir, kind, Duration::from_secs(30))
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn up_interface(manager: &osdns::DnsManager) -> Option<osdns::InterfaceInfo> {
-    manager.interfaces().unwrap().into_iter().find(|i| i.is_up)
+    let name = std::env::var_os("OSDNS_TEST_INTERFACE")
+        .expect("mutation tests require OSDNS_TEST_INTERFACE naming a disposable adapter");
+    manager
+        .interfaces()
+        .unwrap()
+        .into_iter()
+        .find(|i| i.is_up && i.name == name)
 }
 
 #[test]
@@ -48,25 +57,27 @@ fn matrix_systemd_resolved_lifecycle() {
         manager.capabilities().unwrap().backend,
         BackendKind::SystemdResolved
     );
-    let Some(target) = up_interface(&manager) else {
-        return;
-    };
+    let target = up_interface(&manager).expect("the disposable interface must be up");
     let scope = DnsScope::Interface(InterfaceSelector::Name(target.name.clone()));
+    let before = manager.snapshot(&scope).unwrap();
     let config = DnsConfig::builder(scope.clone())
         .nameserver(ip("127.0.0.1"))
+        .nameserver(ip("::1"))
+        .search_domain("search.test")
+        .routing_domain("route.test")
+        .routing_domain(".")
         .build()
         .unwrap();
 
-    let lease = match manager.apply(&config) {
-        Ok(lease) => lease,
-        Err(Error::RequiresPrivilege(_)) => return,
-        Err(error) => panic!("unexpected apply error: {error}"),
-    };
-    assert_eq!(
-        manager.snapshot(&scope).unwrap().nameservers(),
-        &[ip("127.0.0.1")]
-    );
+    let lease = manager
+        .apply(&config)
+        .expect("systemd-resolved apply must succeed when opted in");
+    let actual = manager.snapshot(&scope).unwrap();
+    assert_eq!(actual.nameservers(), config.nameservers());
+    assert_eq!(actual.search_domains(), config.search_domains());
+    assert_eq!(actual.routing_domains(), config.routing_domains());
     lease.restore().unwrap();
+    assert_eq!(manager.snapshot(&scope).unwrap(), before);
 }
 
 #[test]
@@ -122,16 +133,16 @@ fn matrix_resolvconf_lifecycle() {
         .nameserver(ip("127.0.0.1"))
         .build()
         .unwrap();
-    let lease = match manager.apply(&config) {
-        Ok(lease) => lease,
-        Err(Error::RequiresPrivilege(_)) => return,
-        Err(error) => panic!("unexpected apply error: {error}"),
-    };
+    let before = manager.snapshot(&scope).unwrap();
+    let lease = manager
+        .apply(&config)
+        .expect("openresolv apply must succeed when opted in");
     assert_eq!(
         manager.snapshot(&scope).unwrap().nameservers(),
         &[ip("127.0.0.1")]
     );
     lease.restore().unwrap();
+    assert_eq!(manager.snapshot(&scope).unwrap(), before);
 }
 
 #[test]
@@ -180,9 +191,12 @@ fn matrix_direct_resolv_conf_lifecycle() {
     assert_eq!(std::fs::read("/etc/resolv.conf").unwrap(), original);
 }
 
-#[test]
 #[cfg(target_os = "windows")]
-fn matrix_windows_ip_helper_and_nrpt_lifecycle() {
+#[rstest::rstest]
+#[case(&["127.0.0.1"])]
+#[case(&["::1"])]
+#[case(&["127.0.0.1", "::1"])]
+fn matrix_windows_ip_helper_and_nrpt_lifecycle(#[case] servers: &[&str]) {
     if !mutation_gate_open() {
         return;
     }
@@ -190,24 +204,18 @@ fn matrix_windows_ip_helper_and_nrpt_lifecycle() {
         Ok(manager) => manager,
         Err(error) => panic!("unexpected error: {error}"),
     };
-    let Some(target) = up_interface(&manager) else {
-        return;
-    };
-    let loopback = target
-        .name
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .contains("loopback");
+    let target = windows_test_interface(&manager);
     let scope = DnsScope::Interface(InterfaceSelector::Name(target.name.clone()));
+    let before = manager.snapshot(&scope).unwrap();
     let config = DnsConfig::builder(scope.clone())
-        .nameserver(ip("127.0.0.1"))
+        .nameservers(servers.iter().map(|server| ip(server)))
+        .search_domain("matrix.test")
         .routing_domain("matrix.test")
         .build()
         .unwrap();
 
     let lease = match manager.apply(&config) {
         Ok(lease) => lease,
-        Err(Error::RequiresPrivilege(_)) => return,
         Err(error) => panic!("unexpected apply error: {error}"),
     };
     // One interface resource plus one NRPT rule resource.
@@ -218,14 +226,10 @@ fn matrix_windows_ip_helper_and_nrpt_lifecycle() {
         lease.resources()
     );
     let snapshot = manager.snapshot(&scope).unwrap();
-    assert_eq!(snapshot.nameservers(), &[ip("127.0.0.1")]);
+    assert_eq!(snapshot.nameservers(), config.nameservers());
+    assert_eq!(snapshot.search_domains(), config.search_domains());
     lease.restore().unwrap();
-    if loopback {
-        assert_eq!(
-            manager.snapshot(&scope).unwrap().nameservers(),
-            &[] as &[std::net::IpAddr]
-        );
-    }
+    assert_eq!(manager.snapshot(&scope).unwrap(), before);
 }
 
 #[test]

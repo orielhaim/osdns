@@ -39,7 +39,8 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::windows::interface::{
-    adapter_for_selector, adapter_list, get_dns_settings, parse_address_list, set_dns_settings,
+    adapter_for_selector, adapter_list, get_dns_settings, get_ipv6_dns_settings,
+    parse_address_list, set_dns_settings,
 };
 use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
 use crate::watch::{WatchCallback, WatchHandle};
@@ -119,17 +120,16 @@ impl WindowsBackend {
 
     fn read_interface_state(&self, guid: &GUID) -> Result<InterfaceState> {
         let raw = get_dns_settings(guid)?;
+        let raw6 = get_ipv6_dns_settings(guid)?;
         let nameservers = raw.nameserver.map(|s| parse_address_list(&s));
         let searchlist = raw.searchlist.map(|s| parse_suffix_list(&s));
         Ok(InterfaceState {
             ipv4_nameservers: nameservers
                 .as_ref()
                 .map(|list| list.iter().filter(|ip| ip.is_ipv4()).cloned().collect()),
-            ipv6_nameservers: nameservers
-                .as_ref()
-                .map(|list| list.iter().filter(|ip| ip.is_ipv6()).cloned().collect()),
-            ipv4_search: searchlist.clone(),
-            ipv6_search: searchlist,
+            ipv6_nameservers: raw6.nameserver.map(|s| parse_address_list(&s)),
+            ipv4_search: searchlist,
+            ipv6_search: raw6.searchlist.map(|s| parse_suffix_list(&s)),
         })
     }
 

@@ -99,6 +99,18 @@ impl FakeDns {
         self.backend.inject_failure(op, times, message);
     }
 
+    /// Allows `skip` calls of `op`, then fails the next `times` calls.
+    /// Useful for reaching a mutation after successful stability reads.
+    pub fn inject_backend_failure_after(
+        &self,
+        op: FakeOp,
+        skip: u32,
+        times: u32,
+        message: impl Into<String>,
+    ) {
+        self.backend.inject_failure_after(op, skip, times, message);
+    }
+
     /// Makes the next read-back return `state` regardless of the real state,
     /// simulating an OS whose read-back disagrees with what was applied.
     pub fn lie_once_on_readback(&self, state: FakeState) {

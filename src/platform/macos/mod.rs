@@ -67,7 +67,14 @@ impl MacosBackend {
 
     fn parse_resource(resource: &ResourceId) -> Result<ResourceKind> {
         if let Some(id) = resource.as_str().strip_prefix("macos:service:") {
-            return Ok(ResourceKind::Service(id.to_string()));
+            // SystemConfiguration uses uppercase CFUUID strings in its
+            // case-sensitive store keys; resource/lock ids are lowercase.
+            let id = uuid::Uuid::parse_str(id).map_err(|error| {
+                Error::invalid_config(format_args!("invalid macOS service UUID: {error}"))
+            })?;
+            return Ok(ResourceKind::Service(
+                id.hyphenated().to_string().to_ascii_uppercase(),
+            ));
         }
         if let Some(domain) = resource.as_str().strip_prefix("macos:resolver:") {
             return Ok(ResourceKind::Resolver(domain.to_string()));
@@ -81,8 +88,11 @@ impl MacosBackend {
         ResourceId::new(format!("macos:resolver:{domain}")).expect("valid resolver resource")
     }
 
-    fn service_resource(id: &str) -> ResourceId {
-        ResourceId::new(format!("macos:service:{id}")).expect("valid service resource")
+    fn service_resource(id: &str) -> Result<ResourceId> {
+        let id = uuid::Uuid::parse_str(id).map_err(|error| {
+            Error::invalid_config(format_args!("invalid macOS service UUID: {error}"))
+        })?;
+        ResourceId::new(format!("macos:service:{}", id.hyphenated()))
     }
 
     fn resolver_content(&self, plan: &NormalizedConfig) -> Vec<u8> {
@@ -182,7 +192,7 @@ impl Backend for MacosBackend {
                 ));
             }
         };
-        let mut resources = vec![Self::service_resource(&service)];
+        let mut resources = vec![Self::service_resource(&service)?];
         for domain in &plan.routing_domains {
             resources.push(Self::resolver_resource(domain.as_str()));
         }
@@ -338,5 +348,29 @@ impl Backend for MacosBackend {
                 cancel();
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_uuid_roundtrips_between_resource_and_store_keys() {
+        let native = "6F903813-67A3-45A2-B708-3211308208BC";
+        let resource = MacosBackend::service_resource(native).unwrap();
+        assert_eq!(
+            resource.as_str(),
+            "macos:service:6f903813-67a3-45a2-b708-3211308208bc"
+        );
+        assert_eq!(
+            resource,
+            MacosBackend::service_resource(&native.to_ascii_lowercase()).unwrap()
+        );
+        let ResourceKind::Service(restored) = MacosBackend::parse_resource(&resource).unwrap()
+        else {
+            panic!("expected service resource");
+        };
+        assert_eq!(restored, native);
     }
 }

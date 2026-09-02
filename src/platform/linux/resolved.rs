@@ -34,6 +34,7 @@ const RESOLVED_PATH: &str = "/org/freedesktop/resolve1";
 trait Resolve1Manager {
     fn get_link(&self, ifindex: i32) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
+    #[zbus(name = "SetLinkDNS")]
     fn set_link_dns(&self, ifindex: i32, addresses: Vec<(i32, Vec<u8>)>) -> zbus::Result<()>;
 
     fn set_link_domains(&self, ifindex: i32, domains: Vec<(String, bool)>) -> zbus::Result<()>;
@@ -51,7 +52,7 @@ trait Resolve1Manager {
     default_service = "org.freedesktop.resolve1"
 )]
 trait Resolve1Link {
-    #[zbus(property)]
+    #[zbus(property, name = "DNS")]
     fn dns(&self) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
 
     #[zbus(property)]

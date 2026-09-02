@@ -15,8 +15,16 @@ use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_
 use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
 use crate::watch::{WatchCallback, WatchHandle};
 
-const STATE_DIR_CANDIDATES: [&str; 2] =
-    ["/run/resolvconf/interface", "/var/run/resolvconf/interface"];
+// openresolv uses interfaces (3.x) or keys (4.x); Debian resolvconf
+// uses interface. These are native state directories, not /etc/resolv.conf.
+const STATE_DIR_CANDIDATES: [&str; 6] = [
+    "/run/resolvconf/keys",
+    "/run/resolvconf/interfaces",
+    "/run/resolvconf/interface",
+    "/var/run/resolvconf/keys",
+    "/var/run/resolvconf/interfaces",
+    "/var/run/resolvconf/interface",
+];
 const SEARCH_PATH: [&str; 5] = ["/sbin", "/usr/sbin", "/usr/local/sbin", "/bin", "/usr/bin"];
 
 pub(crate) struct Probe {

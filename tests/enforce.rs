@@ -221,6 +221,68 @@ fn rebase_journal_write_failure_defers_and_preserves_external_state() {
     );
 }
 
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
+    use osdns::testing::FakeOp;
+    let fixture = enforce_manager("enforce-rollback-fail");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    // Allow both stability reads, then fail verification after apply.
+    fixture
+        .fake
+        .inject_backend_failure_after(FakeOp::Readback, 2, 1, "verification read failed");
+    fixture
+        .fake
+        .inject_backend_failure(FakeOp::Restore, 1, "rollback failed");
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Prepared");
+    assert_eq!(
+        record["before"]["data"]["Configured"]["nameservers"][0],
+        "9.9.9.9"
+    );
+
+    if finalize_live {
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::StillOurs
+        );
+        lease.restore().unwrap();
+    } else {
+        drop(lease);
+        drop(fixture.manager);
+        let recovered = manager_for_testing(
+            "io.osdns.test",
+            &fixture.dir,
+            &fixture.fake,
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let outcomes = recovered.recover_stale().unwrap();
+        assert!(
+            matches!(&outcomes[..], [RecoveryOutcome::Restored { .. }]),
+            "{outcomes:?}"
+        );
+    }
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
 #[test]
 fn events_during_defer_windows_are_pending_never_dropped() {
     let fixture = enforce_manager("enforce-defer");

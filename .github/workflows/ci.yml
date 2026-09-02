@@ -38,17 +38,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.98.0 --profile minimal
-      # openresolv makes the resolvconf/openresolv backend exercisable on the
-      # Ubuntu runner instead of silently skipping.
-      - run: sudo apt-get update && sudo apt-get install -y openresolv
+      - run: cargo +1.98.0 test --features test-util --test backend_matrix --test macos --no-run
+        if: runner.os != 'Windows'
+      - name: Test systemd-resolved on a disposable interface
         if: runner.os == 'Linux'
+        run: |
+          sudo ip link add osdns-ci type dummy
+          trap 'sudo ip link delete osdns-ci' EXIT
+          sudo ip link set osdns-ci up
+          sudo env PATH="$PATH" RUSTFLAGS="$RUSTFLAGS" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 OSDNS_TEST_INTERFACE=osdns-ci cargo +1.98.0 test --features test-util --test backend_matrix matrix_systemd_resolved_lifecycle -- --exact --nocapture
+      - run: ./.github/scripts/windows-integration.ps1
+        if: runner.os == 'Windows'
+      - run: sudo env PATH="$PATH" RUSTFLAGS="$RUSTFLAGS" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo +1.98.0 test --features test-util --test backend_matrix --test macos -- --test-threads=1
+        if: runner.os == 'macOS'
       - run: cargo +1.98.0 test
       - run: cargo +1.98.0 test --features test-util
       - run: cargo +1.98.0 test --features tracing
-      # Windows and macOS runners provide the privileges needed for the
-      # destructive mutation suites; opt in explicitly.
-      - run: cargo +1.98.0 test --features test-util
-        if: runner.os == 'Windows' || runner.os == 'macOS'
+
+  openresolv:
+    runs-on: ubuntu-latest
+    container: debian:bookworm
+    steps:
+      - run: apt-get update && apt-get install -y ca-certificates curl build-essential git openresolv
+      - uses: actions/checkout@v4
+      - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
+      # Docker bind-mounts /etc/resolv.conf. Keep openresolv's generated file
+      # inside this container and initialize its native state directory.
+      - run: |
+          echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
+          resolvconf -u
+      - run: $HOME/.cargo/bin/cargo +1.98.0 test --features test-util --test backend_matrix matrix_resolvconf_lifecycle -- --exact --nocapture
         env:
           OSDNS_ALLOW_SYSTEM_MUTATION: '1'
 
@@ -83,10 +102,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add ${{ matrix.target }}
-      # --tests rather than --all-targets: benches pull criterion, whose
-      # alloca dependency needs a working C toolchain for the target.
-      - run: cargo check --target ${{ matrix.target }} --tests
-      - run: cargo check --target ${{ matrix.target }} --tests --features test-util
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm
+        if: runner.os == 'Linux'
+      - run: '"C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
+        if: runner.os == 'Windows'
+      # Criterion's alloca C shim needs only compiler-provided headers.
+      - run: cargo check --target ${{ matrix.target }} --all-targets --all-features
+        env:
+          CC: clang
+          AR: llvm-ar
+          CFLAGS: -ffreestanding
 
   feature-powerset:
     runs-on: ubuntu-latest
