@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "osdns"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "atomic-write-file",
  "core-foundation",

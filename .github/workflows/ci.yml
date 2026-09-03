@@ -12,7 +12,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt
       - run: cargo +1.98.0 fmt --all --check
 
@@ -23,7 +23,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal --component clippy
       - run: cargo +1.98.0 clippy --all-targets -- -D warnings
       - run: cargo +1.98.0 clippy --all-targets --features test-util -- -D warnings
@@ -36,7 +36,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 test --features test-util --test backend_matrix --test macos --no-run
         if: runner.os != 'Windows'
@@ -60,7 +60,7 @@ jobs:
     container: debian:bookworm
     steps:
       - run: apt-get update && apt-get install -y ca-certificates curl build-essential git openresolv
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
       # Docker bind-mounts /etc/resolv.conf. Keep openresolv's generated file
       # inside this container and initialize its native state directory.
@@ -69,19 +69,19 @@ jobs:
           resolvconf -u
       - run: $HOME/.cargo/bin/cargo +1.98.0 test --features test-util --test backend_matrix matrix_resolvconf_lifecycle -- --exact --nocapture
         env:
-          OSDNS_ALLOW_SYSTEM_MUTATION: '1'
+          OSDNS_ALLOW_SYSTEM_MUTATION: "1"
 
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.89.0 --profile minimal
       - run: cargo +1.89.0 check --all-features --all-targets
 
   doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 doc --no-deps --all-features
         env:
@@ -91,7 +91,7 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 package --list
       - run: cargo +1.98.0 package
@@ -100,7 +100,7 @@ jobs:
   semver:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - run: cargo install cargo-semver-checks --locked
       - run: cargo +stable semver-checks check-release --manifest-path Cargo.toml
@@ -118,7 +118,7 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.host }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup target add ${{ matrix.target }}
       - run: sudo apt-get update && sudo apt-get install -y clang llvm
         if: runner.os == 'Linux'
@@ -134,7 +134,7 @@ jobs:
   feature-powerset:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo install cargo-hack --locked
       - run: cargo +1.98.0 hack check --each-feature --no-dev-deps
@@ -142,14 +142,14 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - uses: EmbarkStudios/cargo-deny-action@v2
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal
       - run: cargo install cargo-audit --locked
       - run: cargo +stable audit
@@ -157,6 +157,6 @@ jobs:
   bench-compile:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo +1.98.0 bench --features test-util --no-run

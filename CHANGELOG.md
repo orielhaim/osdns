@@ -1,11 +1,6 @@
 # Changelog
 
-## 0.1.2
-
-- Fix macOS build: move the `service_needed` minimal-ownership helper from
-  the `Backend` trait impl to the inherent `MacosBackend` impl.
-
-## 0.1.1
+## 0.1.3
 
 Correctness and API-contract hardening (breaking changes allowed at `0.1.x`):
 
@@ -28,10 +23,13 @@ Correctness and API-contract hardening (breaking changes allowed at `0.1.x`):
   `watch()` is purely observational; Enforce without watch support fails
   honestly with `Unsupported`.
 - macOS split-only configurations own only scoped `/etc/resolver/<domain>`
-  resources, leaving service DNS state untouched.
+  resources, leaving service DNS state untouched; fixed the macOS build
+  (`service_needed` lives on the inherent impl) and updated the macOS
+  mutation test for minimal ownership.
 - Documented the `nameservers` + `routing_domains` split-DNS model and the
   strengthened validation, `None`-preservation, Enforce, and update
   guarantees.
+- CI: updated `actions/checkout` to v7.
 
 ## 0.1.0
 
