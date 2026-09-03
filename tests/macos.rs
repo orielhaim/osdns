@@ -35,8 +35,8 @@ fn default_backend_is_system_configuration() {
     assert!(caps.read);
     assert!(caps.per_interface_dns);
     assert!(caps.split_dns);
+    assert!(caps.default_route);
     assert!(caps.watch);
-    assert!(!caps.global_dns || true);
 }
 
 #[test]
@@ -91,12 +91,34 @@ fn mutation_requires_explicit_opt_in() {
         .routing_domain("osdns.test")
         .build()
         .unwrap();
+    let service_before = manager.snapshot(&scope).unwrap();
 
     match manager.apply(&config) {
         Ok(lease) => {
-            assert_eq!(lease.resources().len(), 2, "service plus one resolver file");
+            // Split-only configurations own just the scoped resolver
+            // resource; the service DNS state is left untouched (minimal
+            // ownership), so the service snapshot must not carry our
+            // nameserver.
+            assert_eq!(lease.resources().len(), 1, "one resolver file only");
+            assert!(
+                lease.resources()[0]
+                    .as_str()
+                    .starts_with("macos:resolver:osdns.test"),
+                "{:?}",
+                lease.resources()
+            );
+            let content = std::fs::read("/etc/resolver/osdns.test").unwrap();
+            let text = String::from_utf8_lossy(&content);
+            assert!(
+                text.contains("nameserver 127.0.0.1"),
+                "scoped resolver file: {text}"
+            );
             let snapshot = manager.snapshot(&scope).unwrap();
-            assert_eq!(snapshot.nameservers(), &[ip("127.0.0.1")]);
+            assert_eq!(
+                snapshot.nameservers(),
+                service_before.nameservers(),
+                "the untouched service must keep its pre-lease nameservers"
+            );
             lease.restore().unwrap();
             assert!(
                 !std::path::Path::new("/etc/resolver/osdns.test").exists(),

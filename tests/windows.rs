@@ -35,6 +35,7 @@ fn default_backend_is_windows_ip_helper() {
     assert!(caps.read);
     assert!(caps.per_interface_dns);
     assert!(caps.split_dns);
+    assert!(caps.default_route);
     assert!(caps.watch);
     assert!(caps.cache_flush);
     assert!(!caps.global_dns);
