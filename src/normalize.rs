@@ -7,15 +7,28 @@ use crate::error::{Error, Result};
 
 /// A validated, canonical DNS domain suffix.
 ///
-/// Values are normalized once at the API boundary: IDNA (UTS #46) processing,
-/// ASCII canonical form, lowercase, no trailing dot, RFC 1035 label/length
-/// rules. The root domain is the empty name and renders as `.`; it is the
-/// canonical representation of a default routing domain.
+/// Values are normalized once at the API boundary: IDNA (UTS #46) to ASCII,
+/// lowercase, no trailing dot, RFC 1035 label and length rules. The root
+/// domain is the empty name and renders as `.`; it selects the default route
+/// on backends that support it (systemd-resolved, Windows NRPT). macOS
+/// scoped resolvers cannot represent the root — use
+/// [`DnsConfigBuilder::default_route`](crate::DnsConfigBuilder::default_route)
+/// there instead.
+///
+/// Parses with [`DnsSuffix::parse`] or `"<name>".parse::<DnsSuffix>()`;
+/// invalid names fail with [`Error::InvalidConfig`](crate::Error).
+///
+/// ```
+/// # use osdns::DnsSuffix;
+/// assert!(DnsSuffix::parse("Corp.EXAMPLE.").unwrap().as_str() == "corp.example");
+/// assert!(DnsSuffix::root().is_root());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DnsSuffix(String);
 
 impl DnsSuffix {
-    /// The root domain (`.`), i.e. the default routing domain.
+    /// The root domain (`.`), i.e. the default routing domain on backends
+    /// that represent it (systemd-resolved, Windows NRPT).
     pub fn root() -> Self {
         Self(String::new())
     }
@@ -23,7 +36,10 @@ impl DnsSuffix {
     /// Parses and normalizes a domain suffix.
     ///
     /// Accepts Unicode (IDNA UTS #46), uppercase, and an optional trailing
-    /// dot. `""` and `"."` both yield the root domain.
+    /// dot. `""` and `"."` both yield the root domain. Fails with
+    /// [`Error::InvalidConfig`](crate::Error) on empty labels, overlong
+    /// labels, illegal characters, leading/trailing hyphens, or names over
+    /// 253 characters.
     pub fn parse(input: &str) -> Result<Self> {
         normalize_domain(input).map(Self)
     }

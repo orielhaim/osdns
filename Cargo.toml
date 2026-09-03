@@ -5,12 +5,18 @@ edition = "2024"
 rust-version = "1.89"
 description = "Transactional, ownership-safe management of host operating-system DNS configuration"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/orielhaim/osdns"
+homepage = "https://github.com/orielhaim/osdns"
+documentation = "https://docs.rs/osdns"
+readme = "README.md"
 keywords = ["dns", "network", "system", "configuration"]
 categories = ["network-programming", "os"]
 
 [features]
 default = []
+# Emit `tracing` events for transactions, recovery, and reconciliation.
 tracing = ["dep:tracing"]
+# In-memory backend and fault-injection utilities for testing. Not for production builds.
 test-util = []
 
 [dependencies]
@@ -64,3 +70,7 @@ all = { level = "warn", priority = -1 }
 name = "engine"
 harness = false
 required-features = ["test-util"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]

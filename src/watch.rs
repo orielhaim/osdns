@@ -12,8 +12,14 @@ use crate::ownership::ResourceId;
 
 /// An observed change to a DNS resource.
 ///
+/// Variants are `#[non_exhaustive]` so new event kinds can be added without a
+/// breaking change. Match with a wildcard arm.
+///
 /// Watch callbacks must only enqueue or coalesce events; expensive or
-/// mutating logic must never run inside a callback.
+/// mutating logic must never run inside a callback. Events caused by our own
+/// mutations are suppressed from the user callback path (under
+/// [`ConflictPolicy::Enforce`](crate::ConflictPolicy) the reconciler still
+/// observes them via read-back before suppression applies).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DnsEvent {
@@ -46,10 +52,33 @@ impl DnsEvent {
 }
 
 /// Callback invoked by a backend's event thread.
+///
+/// Must be `Send + Sync` because it runs on a native watcher thread. Keep it
+/// short: enqueue the event and return. Never call [`DnsManager::apply`](crate::DnsManager::apply),
+/// [`Lease::restore`](crate::Lease::restore), or other mutating APIs from
+/// inside the callback; doing so risks deadlock with the coalescer and
+/// reconciler threads.
 pub type WatchCallback = Arc<dyn Fn(&DnsEvent) + Send + Sync>;
 
-/// A live watch. Cancels the underlying notification when dropped or
+/// A live watch. Cancels the underlying native notification when dropped or
 /// explicitly stopped.
+///
+/// `stop` consumes the handle; dropping has the same effect. Stopping is
+/// idempotent and never fails. Under
+/// [`ConflictPolicy::Enforce`](crate::ConflictPolicy) dropping the last watch
+/// also stops reconciliation.
+///
+/// ```no_run
+/// # use osdns::DnsManager;
+/// # use std::sync::Arc;
+/// # fn main() -> osdns::Result<()> {
+/// # let manager = DnsManager::builder().owner("io.example.agent").build()?;
+/// let watch = manager.watch(Arc::new(|event| println!("{event:?}")))?;
+/// // ... observe events ...
+/// watch.stop();
+/// # Ok(())
+/// # }
+/// ```
 pub struct WatchHandle {
     flag: Arc<AtomicBool>,
     cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -68,7 +97,10 @@ impl WatchHandle {
         !self.flag.load(Ordering::Acquire)
     }
 
-    /// Stops the watch and releases the underlying notification.
+    /// Stops the watch and releases the underlying native notification.
+    ///
+    /// Consumes the handle; equivalent to dropping it. After `stop` no
+    /// further callbacks will be delivered for this watch.
     pub fn stop(mut self) {
         self.deactivate();
     }

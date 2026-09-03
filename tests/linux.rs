@@ -2,8 +2,7 @@
 //!
 //! These run only on Linux and skip gracefully when the corresponding system
 //! components (D-Bus, systemd-resolved, NetworkManager, resolvconf) are
-//! absent, so they are safe on minimal CI runners. Phase 5 replaces the skips
-//! with real VM-matrix assertions.
+//! absent, so they are safe on minimal CI runners.
 
 #![cfg(target_os = "linux")]
 #![cfg(feature = "test-util")]

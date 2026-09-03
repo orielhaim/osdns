@@ -6,6 +6,16 @@ use crate::error::{Error, Result};
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 
 /// Selects the target of a DNS configuration operation.
+///
+/// - [`DnsScope::Global`] addresses system-wide DNS state. Only backends with
+///   [`Capabilities::global_dns`](crate::Capabilities) support it (Linux
+///   resolvconf/direct and macOS); Windows rejects it with
+///   [`Error::Unsupported`](crate::Error).
+/// - [`DnsScope::Interface`] addresses one interface's DNS state. Requires
+///   [`Capabilities::per_interface_dns`](crate::Capabilities).
+///
+/// The scope also determines which [`ResourceId`](crate::ResourceId)s a
+/// [`DnsManager::apply`](crate::DnsManager::apply) call locks and journals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DnsScope {
@@ -16,6 +26,14 @@ pub enum DnsScope {
 }
 
 /// Selects an interface within [`DnsScope::Interface`].
+///
+/// Names and indexes are convenience selectors resolved by the backend at
+/// apply time; the lease owns the backend's stable native identifier (GUID on
+/// Windows, ifindex on Linux, service UUID on macOS), so renames do not
+/// silently retarget a lease. `Default` resolves to the backend's notion of
+/// the primary interface (default route on Linux, primary service on macOS).
+/// macOS rejects [`InterfaceSelector::Index`] with
+/// [`Error::InvalidConfig`](crate::Error); use `Default` or `Name` there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InterfaceSelector {
@@ -29,11 +47,31 @@ pub enum InterfaceSelector {
 
 /// A validated DNS configuration request or observed state.
 ///
-/// Construct via [`DnsConfig::builder`]; invalid configurations cannot be
-/// built. Backends may additionally reject configurations they cannot
-/// represent (see [`crate::Capabilities`]) — this is checked by
-/// [`DnsManager::validate`](crate::DnsManager::validate) and again inside
-/// [`DnsManager::apply`](crate::DnsManager::apply) before any mutation.
+/// Construct via [`DnsConfig::builder`]; [`DnsConfigBuilder::build`] rejects
+/// unspecified nameservers, malformed domains, routing domains on a global
+/// scope, and `default_route` on a global scope with
+/// [`Error::InvalidConfig`](crate::Error). Backends may additionally reject
+/// configurations they cannot represent (see [`crate::Capabilities`]) — this
+/// is checked by [`DnsManager::validate`](crate::DnsManager::validate) and
+/// again inside [`DnsManager::apply`](crate::DnsManager::apply) before any
+/// mutation.
+///
+/// `DnsConfig` is a plain value: cloning is cheap, it borrows nothing, and it
+/// holds no OS resources. Passing it to `apply` copies the desired semantics
+/// into the journal; later mutating the value has no effect on live leases.
+/// Use [`DnsManager::snapshot`](crate::DnsManager::snapshot) to read current
+/// state back into this form.
+///
+/// # Example
+///
+/// ```
+/// # use osdns::{DnsConfig, DnsScope, InterfaceSelector};
+/// let config = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Default))
+///     .nameserver("127.0.0.1".parse().unwrap())
+///     .routing_domain("corp.example")
+///     .build()?;
+/// # Ok::<(), osdns::Error>(())
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DnsConfig {
     scope: DnsScope,
@@ -45,6 +83,9 @@ pub struct DnsConfig {
 
 impl DnsConfig {
     /// Starts building a configuration for `scope`.
+    ///
+    /// No validation happens here; errors surface at
+    /// [`DnsConfigBuilder::build`].
     pub fn builder(scope: DnsScope) -> DnsConfigBuilder {
         DnsConfigBuilder::new(scope)
     }
@@ -71,7 +112,7 @@ impl DnsConfig {
         &self.scope
     }
 
-    /// Nameservers, in preference order.
+    /// Nameservers, in preference order. Empty means "no nameservers".
     pub fn nameservers(&self) -> &[IpAddr] {
         &self.nameservers
     }
@@ -81,13 +122,18 @@ impl DnsConfig {
         &self.search_domains
     }
 
-    /// Routing domains (split DNS). Only valid with an interface scope.
+    /// Routing domains (split DNS). Only valid with an interface scope and
+    /// only on backends with [`Capabilities::split_dns`](crate::Capabilities);
+    /// otherwise [`DnsManager::apply`](crate::DnsManager::apply) returns
+    /// [`Error::Unsupported`](crate::Error). The root domain (`.`) selects
+    /// the default route on backends that support it; macOS rejects it —
+    /// use [`DnsConfigBuilder::default_route`] there.
     pub fn routing_domains(&self) -> &[DnsSuffix] {
         &self.routing_domains
     }
 
     /// Whether this interface should be the default route for DNS.
-    /// Only valid with an interface scope.
+    /// Only valid with an interface scope; `None` means "leave unset".
     pub fn default_route(&self) -> Option<bool> {
         self.default_route
     }
@@ -95,8 +141,21 @@ impl DnsConfig {
 
 /// Builder for [`DnsConfig`].
 ///
-/// Domains are validated when [`DnsConfigBuilder::build`] is called; a
-/// builder can therefore never produce an invalid configuration.
+/// Domains are parsed as [`DnsSuffix`] (IDNA, lowercase,
+/// length-checked) when [`DnsConfigBuilder::build`] is called. Nameserver
+/// order is preserved with duplicates removed. The builder itself performs no
+/// I/O and needs no privileges.
+///
+/// # Example
+///
+/// ```
+/// # use osdns::{DnsConfig, DnsScope, InterfaceSelector};
+/// let config = DnsConfig::builder(DnsScope::Global)
+///     .nameserver("1.1.1.1".parse().unwrap())
+///     .search_domain("example.com")
+///     .build()?;
+/// # Ok::<(), osdns::Error>(())
+/// ```
 #[derive(Debug, Clone)]
 pub struct DnsConfigBuilder {
     scope: DnsScope,
@@ -117,7 +176,8 @@ impl DnsConfigBuilder {
         }
     }
 
-    /// Adds a nameserver. Duplicates are removed, order is preserved.
+    /// Adds a nameserver. Duplicates are removed at build time, order is preserved.
+    /// Unspecified addresses (`0.0.0.0`, `::`) are rejected at build time.
     pub fn nameserver(mut self, ip: IpAddr) -> Self {
         self.nameservers.push(ip);
         self
@@ -147,6 +207,9 @@ impl DnsConfigBuilder {
     }
 
     /// Adds a routing domain (split DNS; validated on build).
+    ///
+    /// Each entry is parsed as [`DnsSuffix`]; `"."` selects
+    /// the root (default-route) domain where the backend supports it.
     pub fn routing_domain(mut self, domain: impl AsRef<str>) -> Self {
         self.routing_domains.push(domain.as_ref().to_string());
         self
@@ -164,12 +227,20 @@ impl DnsConfigBuilder {
     }
 
     /// Sets the default-route flag for an interface scope.
+    ///
+    /// Rejected at build time on a global scope.
     pub fn default_route(mut self, enabled: bool) -> Self {
         self.default_route = Some(enabled);
         self
     }
 
     /// Validates and builds the configuration.
+    ///
+    /// Returns [`Error::InvalidConfig`] for unspecified nameservers,
+    /// unparsable domains, routing domains or `default_route` on a global
+    /// scope. Backend capability checks happen later in
+    /// [`DnsManager::validate`](crate::DnsManager::validate) and
+    /// [`DnsManager::apply`](crate::DnsManager::apply).
     pub fn build(self) -> Result<DnsConfig> {
         let mut nameservers = Vec::new();
         for ip in self.nameservers {

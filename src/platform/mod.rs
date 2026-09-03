@@ -156,8 +156,8 @@ pub(crate) fn construct_backend(
     }
 }
 
-/// Selects the platform backend. Real backends are introduced phase by
-/// phase; until then only explicitly-provided test backends work.
+/// Selects the platform backend based on which component actually owns DNS
+/// state on this host (Linux) or the single native backend (Windows, macOS).
 pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn Backend>> {
     #[cfg(target_os = "linux")]
     {

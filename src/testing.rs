@@ -1,10 +1,15 @@
 //! Testing utilities for applications and tests built on `osdns`.
 //!
-//! Requires the `test-util` feature. Provides an in-memory backend
-//! ([`FakeDns`]) that participates fully in the transaction engine, fault
-//! injection ([`FaultInjector`], [`FakeOp`]) at backend and transaction
+//! Requires the `test-util` feature; never enable it in production builds.
+//! Provides an in-memory backend ([`FakeDns`]) that participates fully in the
+//! transaction engine (locks, journals, read-back verification, recovery),
+//! fault injection ([`FaultInjector`], [`FakeOp`]) at backend and transaction
 //! checkpoints ([`TxPoint`]), and [`catch_crash`] for simulating abrupt
 //! process death mid-transaction.
+//!
+//! Managers built with [`manager_for_testing`] use an isolated temporary
+//! state directory supplied by the caller, so parallel tests never share
+//! journal or lock state.
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
@@ -26,6 +31,12 @@ pub use crate::fault::TxPoint;
 pub use crate::platform::fake::{FakeOp, FakeState};
 
 /// Handle for driving the in-memory fake backend from tests.
+///
+/// Cheap to clone: clones share the same backend state. Create with
+/// [`FakeDns::new`] (all capabilities on) or [`FakeDns::with_capabilities`]
+/// to simulate a restricted backend, pair with [`manager_for_testing`], and
+/// drive external actors with [`FakeDns::external_change`].
+/// Never use in production; requires the `test-util` feature.
 #[derive(Clone)]
 pub struct FakeDns {
     backend: Arc<FakeBackend>,
@@ -126,6 +137,10 @@ impl Default for FakeDns {
 
 /// Builds a [`DnsManager`] around an explicit fake backend and a temporary
 /// state directory.
+///
+/// The caller owns `state_dir` (use a fresh temp dir per test); locks and
+/// journals live under it. Uses [`ConflictPolicy::Cooperative`]; see
+/// [`manager_for_testing_with_policy`] for Enforce tests.
 pub fn manager_for_testing(
     owner: &str,
     state_dir: &Path,
@@ -171,8 +186,12 @@ pub fn manager_for_testing_with_policy(
 }
 
 /// Builds a [`DnsManager`] pinned to a specific real backend, bypassing
-/// detection. Used by the real-backend integration matrix; unavailable
-/// backends fail with [`Error::BackendUnavailable`].
+/// detection.
+///
+/// Used by the real-backend integration matrix; unavailable backends fail
+/// with [`Error::BackendUnavailable`] and nothing is mutated. Requires the
+/// `test-util` feature. Real mutations need elevated privileges and the
+/// `OSDNS_ALLOW_SYSTEM_MUTATION` opt-in used by the test suite.
 pub fn manager_for_backend(
     owner: &str,
     state_dir: &Path,
@@ -224,6 +243,10 @@ enum FaultSpec {
 ///
 /// Install on a manager with
 /// [`DnsManager::install_fault_injector`](crate::DnsManager::install_fault_injector).
+/// `crash_at` simulates abrupt death: journal state persists, locks release,
+/// and [`catch_crash`] converts the panic into [`CrashOutcome::Crashed`];
+/// `fail_at` makes the transaction return an injected platform error.
+/// Requires the `test-util` feature.
 #[derive(Debug, Default)]
 pub struct FaultInjector {
     actions: Mutex<HashMap<TxPoint, FaultSpec>>,

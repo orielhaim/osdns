@@ -17,8 +17,11 @@ use crate::fsutil::ensure_private_dir;
 ///
 /// Examples: `linux:resolved:ifindex:7`, `windows:interface:<guid>`,
 /// `macos:resolver:<domain>`. Resource ids are the unit of ownership: every
-/// mutation holds an exclusive lock on its resource id, and journals are
-/// keyed by it. Ids survive reboots.
+/// mutation holds an exclusive inter-process lock on its resource id, journals
+/// are keyed by it, and restore/conflict decisions are made per id. Ids are
+/// lowercase `:`-separated segments (max 128 characters) and survive reboots.
+/// Obtain them from [`Lease::resources`](crate::Lease::resources) or [`RecoveryOutcome`](crate::RecoveryOutcome);
+/// parse with `"<id>".parse::<ResourceId>()`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceId(String);
 
@@ -30,6 +33,8 @@ impl ResourceId {
     }
 
     /// The canonical string form, e.g. `linux:resolved:ifindex:7`.
+    ///
+    /// Stable across reboots; suitable as a map key or for logging.
     pub fn as_str(&self) -> &str {
         &self.0
     }

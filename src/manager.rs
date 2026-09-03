@@ -25,19 +25,36 @@ use crate::watch::{WatchCallback, WatchHandle};
 ///
 /// - [`ConflictPolicy::Cooperative`] (default): never overwrite; surface
 ///   conflicts to the lease owner.
-/// - [`ConflictPolicy::Enforce`]: intended for active VPN/mesh/tunnel agents;
-///   legitimate external base changes are rebased and the desired overlay is
-///   reapplied. Enforcement is introduced with the platform backends.
+/// - [`ConflictPolicy::Enforce`]: for active VPN/mesh/tunnel agents; while
+///   watching is active, legitimate external base changes are rebased and the
+///   desired overlay is reapplied. See [`DnsManager::watch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictPolicy {
     /// Never overwrite externally changed state automatically.
+    ///
+    /// Applies, updates, restores, and recovery report
+    /// [`Error::ExternalModification`](crate::Error) and mutate nothing when
+    /// current state is no longer ours. This is the default and the right
+    /// choice unless the application is an always-on network agent.
     #[default]
     Cooperative,
     /// Rebase on legitimate external changes and reapply the overlay.
+    ///
+    /// Only acts while [`DnsManager::watch`] is active: the reconciliation
+    /// worker waits for stable authoritative state, adopts the new external
+    /// base in the journal, and reapplies the lease's desired overlay
+    /// transactionally. Restoring a rebased lease returns to the new external
+    /// base. Without an active watch this behaves like [`ConflictPolicy::Cooperative`].
     Enforce,
 }
 
 /// The result of inspecting one journal record during stale recovery.
+///
+/// Returned per record by [`DnsManager::recover_stale`]. `Restored` and
+/// `JournalCleared` both removed the record; `ExternalConflict` kept it (call
+/// [`DnsManager::abandon_journal`] to drop the claim without mutating);
+/// `Busy` skipped a locked resource. The enum is `#[non_exhaustive]` so new
+/// outcomes can be added without breakage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryOutcome {
@@ -512,22 +529,34 @@ impl Inner {
 /// Entry point for reading, applying, watching, reconciling, and safely
 /// restoring host OS DNS configuration.
 ///
-/// The central invariant: **we never destroy DNS state that we do not own.**
-/// Every mutation belongs to an explicit owner and lease, is journaled before
-/// it happens, is verified by read-back, and can be undone — unless an
-/// external actor changed the state in the meantime, in which case
-/// [`Error::ExternalModification`] is returned and nothing is touched.
+/// The central invariant is: **never overwrite DNS state that is not
+/// demonstrably ours.** Every mutation belongs to an explicit owner and
+/// [`Lease`], is journaled before it happens, is verified by read-back, and
+/// can be undone — unless an external actor changed the state in the
+/// meantime, in which case [`Error::ExternalModification`] is returned and
+/// nothing is touched.
+///
+/// A manager is cheap to clone: clones share the same owner, backend, locks,
+/// journal, and active-lease registry. It is `Send + Sync` and may be shared
+/// across threads. Individual [`Lease`]s own their resources exclusively.
+///
+/// Mutations generally require elevated privileges (see [`Error::RequiresPrivilege`]);
+/// `osdns` never escalates privileges on its own. Operations are synchronous
+/// control-plane calls with no async runtime dependency.
+///
+/// After a process crash, journals left behind are recovered with
+/// [`DnsManager::recover_stale`]; corrupt or unknown journal state fails
+/// closed.
 ///
 /// ```
-/// use osdns::{DnsConfig, DnsManager, DnsScope};
+/// use osdns::{DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 ///
 /// # fn main() -> osdns::Result<()> {
 /// let manager = DnsManager::builder()
-///     .owner("io.tunnet.agent")
-///     // Selects a real platform backend (Linux, Windows, and macOS are
-///     // supported).
-///     .build();
-/// # let _ = manager;
+///     .owner("io.example.agent")
+///     .build()?;
+/// let caps = manager.capabilities()?;
+/// let current = manager.snapshot(&DnsScope::Interface(InterfaceSelector::Default))?;
 /// # Ok(())
 /// # }
 /// ```
@@ -542,6 +571,9 @@ impl DnsManager {
     }
 
     /// Returns a builder for constructing a manager.
+    ///
+    /// See [`DnsManagerBuilder`] for the required `owner` identifier and the
+    /// optional state directory, lock timeout, and conflict policy.
     pub fn builder() -> DnsManagerBuilder {
         DnsManagerBuilder::new()
     }
@@ -557,20 +589,34 @@ impl DnsManager {
     }
 
     /// What the active backend can actually guarantee.
+    ///
+    /// Never assumes uniformity across platforms: check fields such as
+    /// `split_dns`, `per_interface_dns`, or `watch` before using the
+    /// corresponding facility. Returns [`Error::BackendUnavailable`] only
+    /// when no backend exists on this host.
     pub fn capabilities(&self) -> Result<Capabilities> {
         Ok(self.inner.backend.capabilities())
     }
 
     /// Lists network interfaces known to the backend.
+    ///
+    /// Read-only; requires no privileges beyond what the platform needs for
+    /// enumeration. Names and indexes are selectors only — backends identify
+    /// interfaces by stable native identifiers internally.
     pub fn interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         self.inner.backend.list_interfaces()
     }
 
     /// Reads the current DNS configuration of `scope` from the system.
     ///
-    /// For multi-resource scopes this reports the primary resource (for
-    /// example the network service backing the interface), not the per-domain
-    /// scoped resolvers.
+    /// Read-only and side-effect free. For multi-resource scopes this reports
+    /// the primary resource (for example the network service backing the
+    /// interface), not per-domain scoped state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::BackendUnavailable`] when the scope cannot be resolved
+    /// on this backend and [`Error::Platform`] when the OS read fails.
     pub fn snapshot(&self, scope: &DnsScope) -> Result<DnsConfig> {
         let resources = self
             .inner
@@ -585,6 +631,12 @@ impl DnsManager {
 
     /// Validates a configuration against backend capabilities without
     /// touching the system.
+    ///
+    /// No locks are taken, no journal is written, and no OS state is read.
+    /// Returns [`Error::InvalidConfig`] for malformed input and
+    /// [`Error::Unsupported`] when the active backend cannot represent the
+    /// request. [`DnsManager::apply`] performs the same check again before
+    /// any mutation.
     pub fn validate(&self, config: &DnsConfig) -> Result<()> {
         let caps = self.inner.backend.capabilities();
         validate_against(config, &caps).map(|_| ())
@@ -593,12 +645,34 @@ impl DnsManager {
     /// Applies `config` transactionally and returns a [`Lease`] owning the
     /// mutated resources.
     ///
-    /// The exact sequence: resolve resources, acquire exclusive resource
-    /// locks (in sorted order, so multi-resource leases can never deadlock),
-    /// inspect and recover any stale journals, capture current state, detect
-    /// semantic no-ops, persist `Prepared` records, mutate and verify each
-    /// resource by read-back, persist `Applied` records, and return the lease
-    /// holding the locks.
+    /// The sequence is: resolve resources, acquire exclusive inter-process
+    /// locks in sorted order (so multi-resource leases cannot deadlock),
+    /// recover stale journals for those resources, capture current state,
+    /// return a no-op [`Lease`] when the desired state is already in effect,
+    /// otherwise persist `Prepared` records, mutate and verify each resource
+    /// by read-back (attempting rollback on failure), persist `Applied`
+    /// records, and return the lease holding the locks.
+    ///
+    /// The operation is atomic per resource, not across resources: when a
+    /// later resource fails, earlier resources are rolled back best-effort
+    /// and their journals retained for [`DnsManager::recover_stale`].
+    /// Requires elevated privileges on most platforms; see
+    /// [`Error::RequiresPrivilege`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use osdns::{DnsConfig, DnsManager, DnsScope, InterfaceSelector};
+    /// # fn main() -> osdns::Result<()> {
+    /// # let manager = DnsManager::builder().owner("io.example.agent").build()?;
+    /// let config = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Default))
+    ///     .nameserver("127.0.0.1".parse().unwrap())
+    ///     .build()?;
+    /// let lease = manager.apply(&config)?;
+    /// lease.restore()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn apply(&self, config: &DnsConfig) -> Result<Lease> {
         let caps = self.inner.backend.capabilities();
         let plan = validate_against(config, &caps)?;
@@ -645,16 +719,6 @@ impl DnsManager {
     /// Registers a callback for native DNS change notifications.
     ///
     /// Events are coalesced per resource within a small window, and events
-    /// caused by this manager's own mutations are suppressed so they are
-    /// never reported as external changes. Callbacks must still only enqueue
-    /// or coalesce; never perform expensive or mutating work inside them.
-    ///
-    /// Under [`ConflictPolicy::Enforce`] this also starts the reconciliation
-    /// worker, which rebases onto externally modified base state and reapplies
-    /// the desired overlay of every active lease.
-    /// Registers a callback for native DNS change notifications.
-    ///
-    /// Events are coalesced per resource within a small window, and events
     /// caused by this manager's own mutations are suppressed for the
     /// user-callback path.
     ///
@@ -664,6 +728,11 @@ impl DnsManager {
     /// no-ops (state-aware suppression), and rebases/reapplies on genuine
     /// external changes. Events deferred by the worker's scheduler are
     /// pending, never dropped.
+    ///
+    /// The callback must only enqueue or coalesce events; it must never
+    /// perform expensive or mutating work. The returned [`WatchHandle`]
+    /// cancels the underlying native notification when stopped or dropped.
+    /// Reconciliation only runs while the watch is active.
     pub fn watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let feed = if self.inner.conflict_policy == ConflictPolicy::Enforce {
             Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?)
@@ -686,7 +755,9 @@ impl DnsManager {
     }
     /// Flushes the OS DNS cache, when the backend supports it.
     ///
-    /// Best-effort only; correctness never depends on cache state.
+    /// Best-effort only; correctness never depends on cache state. Returns
+    /// [`Error::Unsupported`] on backends without a flush facility. Check
+    /// [`Capabilities::cache_flush`](crate::Capabilities) first.
     pub fn flush_cache(&self) -> Result<()> {
         self.inner.backend.flush_cache()
     }
@@ -694,10 +765,14 @@ impl DnsManager {
     /// Scans the journal for records left behind by crashed or exited
     /// processes and recovers them where it is safe to do so.
     ///
-    /// Resources whose lock is still held by an active lease (here or in
-    /// another process) are reported as [`RecoveryOutcome::Busy`] and left
-    /// untouched. On any parse failure the call fails closed with
-    /// [`Error::JournalCorrupt`].
+    /// Resources locked by an active lease (in this or another process) are
+    /// reported as [`RecoveryOutcome::Busy`] and left untouched. Records whose
+    /// current state matches the applied overlay are restored to the original
+    /// state; records already at the original state are simply cleared; records
+    /// matching neither are reported as
+    /// [`RecoveryOutcome::ExternalConflict`] and kept. On any parse failure
+    /// or unknown schema version the call fails closed with
+    /// [`Error::JournalCorrupt`] and mutates nothing.
     pub fn recover_stale(&self) -> Result<Vec<RecoveryOutcome>> {
         self.inner.recover_stale()
     }
@@ -705,9 +780,12 @@ impl DnsManager {
     /// Explicitly discards our ownership claim over `resource` without
     /// touching the system.
     ///
-    /// Use this after an [`Error::ExternalModification`] conflict when the
-    /// external state should win and the journal record should stop being
-    /// reported.
+    /// Removes this manager's journal records for `resource` while holding
+    /// the resource lock. Use this after an [`Error::ExternalModification`]
+    /// conflict when the external state should win and the record should stop
+    /// being reported by [`DnsManager::recover_stale`]. Same primitive as
+    /// [`Lease::abandon`](crate::Lease::abandon), but usable without holding
+    /// the lease.
     pub fn abandon_journal(&self, resource: &ResourceId) -> Result<()> {
         self.inner.abandon_journal(resource)
     }
@@ -764,6 +842,22 @@ impl std::fmt::Debug for DnsManager {
 }
 
 /// Builder for [`DnsManager`].
+///
+/// The `owner` identifier is required and names every lease, journal record,
+/// and ownership marker this manager creates. Optional settings have stable
+/// defaults: a platform-appropriate state directory, a 30-second lock
+/// timeout, and [`ConflictPolicy::Cooperative`].
+///
+/// ```no_run
+/// # use osdns::DnsManager;
+/// # fn main() -> osdns::Result<()> {
+/// let manager = DnsManager::builder()
+///     .owner("io.example.agent")
+///     .conflict_policy(osdns::ConflictPolicy::Cooperative)
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct DnsManagerBuilder {
     owner: Option<String>,
     state_dir: Option<PathBuf>,
@@ -781,10 +875,13 @@ impl DnsManagerBuilder {
         }
     }
 
-    /// Sets the owner identifier (e.g. `io.tunnet.agent`). Required.
+    /// Sets the owner identifier (e.g. `io.example.agent`). Required.
     ///
-    /// Owners are reverse-DNS style identifiers: 1-255 characters of ASCII
-    /// letters, digits, dots, dashes, and underscores.
+    /// Owners are reverse-DNS style identifiers: 1–255 characters of ASCII
+    /// letters, digits, dots, dashes, and underscores. The owner tags every
+    /// journal record and platform ownership marker, so two applications never
+    /// mistake each other's state for their own. Invalid identifiers fail at
+    /// [`DnsManagerBuilder::build`] with [`Error::InvalidConfig`].
     pub fn owner(mut self, owner: impl Into<String>) -> Self {
         self.owner = Some(owner.into());
         self
@@ -792,15 +889,21 @@ impl DnsManagerBuilder {
 
     /// Overrides the directory used for journals and resource locks.
     ///
-    /// Defaults to a platform-appropriate system location. The directory is
-    /// created and secured against unprivileged modification.
+    /// Defaults to a platform-appropriate system location (`/var/lib/osdns`
+    /// on Linux, `PROGRAMDATA\osdns` on Windows, `/Library/Application
+    /// Support/osdns` on macOS). The directory is created on
+    /// [`DnsManagerBuilder::build`] and secured against unprivileged
+    /// modification; failure surfaces as [`Error::RequiresPrivilege`] or
+    /// [`Error::Io`]. All managers sharing one directory share lock and
+    /// journal state, including across processes.
     pub fn state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
         self
     }
 
     /// Sets how long acquiring a contended resource lock may block.
-    /// Defaults to 30 seconds.
+    /// Defaults to 30 seconds. Must be non-zero. When the deadline expires,
+    /// lock acquisition fails with [`Error::Timeout`] and nothing is mutated.
     pub fn lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = timeout;
         self
@@ -808,6 +911,10 @@ impl DnsManagerBuilder {
 
     /// Sets the conflict policy. Defaults to
     /// [`ConflictPolicy::Cooperative`].
+    ///
+    /// [`ConflictPolicy::Enforce`] only reconciles while
+    /// [`DnsManager::watch`] is active; without a watch it behaves like
+    /// cooperative mode.
     pub fn conflict_policy(mut self, policy: ConflictPolicy) -> Self {
         self.conflict_policy = policy;
         self
@@ -817,7 +924,7 @@ impl DnsManagerBuilder {
     ///
     /// Fails with [`Error::RequiresPrivilege`] when the state directory
     /// cannot be created or secured, and with [`Error::BackendUnavailable`]
-    /// until a platform backend exists (phases 2-4).
+    /// when no platform backend is available on this host.
     pub fn build(self) -> Result<DnsManager> {
         let owner = self
             .owner

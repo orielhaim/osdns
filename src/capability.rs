@@ -3,7 +3,16 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// Identifies the DNS configuration backend in use.
+///
+/// The backend is selected by [`DnsManager`](crate::DnsManager) construction
+/// from the component that actually owns DNS state on the host. See
+/// [`Capabilities`] for what the active backend guarantees.
+///
+/// [`BackendKind`] is [`#[non_exhaustive]`](https://doc.rust-lang.org/reference/attributes/type_system.html)
+/// so new backends can be added without a breaking change; match with a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 #[serde(rename_all = "kebab-case")]
 pub enum BackendKind {
     /// `systemd-resolved` via `org.freedesktop.resolve1`.
@@ -18,7 +27,10 @@ pub enum BackendKind {
     WindowsIpHelper,
     /// Apple SystemConfiguration.
     MacosSystemConfiguration,
-    /// In-memory backend used for tests.
+    /// In-memory backend used by the `test-util` feature for tests.
+    ///
+    /// Never selected for real managers; construct it explicitly through
+    /// [`FakeDns`](crate::testing::FakeDns) in tests.
     Fake,
 }
 
@@ -47,9 +59,23 @@ impl fmt::Display for BackendKind {
 
 /// Describes what the active backend can actually guarantee.
 ///
-/// Configuration is rejected before any mutation when the selected backend
-/// cannot represent it. Never assume two backends behave identically: these
-/// fields exist precisely because they do not.
+/// Returned by [`DnsManager::capabilities`](crate::DnsManager::capabilities).
+/// Configuration is rejected with [`Error::Unsupported`](crate::Error) before
+/// any mutation when the backend cannot represent it. Never assume two
+/// backends behave identically: these fields exist precisely because they do
+/// not.
+///
+/// Linux backends: systemd-resolved supports per-interface DNS, search
+/// domains, split DNS, watch, and cache flush; NetworkManager supports
+/// per-interface DNS with backend-dependent split DNS; resolvconf/openresolv
+/// is global-only with limited split DNS; direct `/etc/resolv.conf` is
+/// global-only without split DNS. Windows supports per-interface DNS, search
+/// domains, split DNS (NRPT), watch, and cache flush, but no global scope.
+/// macOS supports global and per-interface DNS, search domains, split DNS
+/// (scoped `/etc/resolver` files), and watch, but no cache flush.
+///
+/// The struct is `#[non_exhaustive]`: construct with [`Capabilities::new`]
+/// plus `with_*` builders, never with a literal.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub struct Capabilities {
