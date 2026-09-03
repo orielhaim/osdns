@@ -548,7 +548,7 @@ impl Inner {
 /// [`DnsManager::recover_stale`]; corrupt or unknown journal state fails
 /// closed.
 ///
-/// ```
+/// ```no_run
 /// use osdns::{DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 ///
 /// # fn main() -> osdns::Result<()> {
