@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- Fix macOS build: move the `service_needed` minimal-ownership helper from
+  the `Backend` trait impl to the inherent `MacosBackend` impl.
+
 ## 0.1.1
 
 Correctness and API-contract hardening (breaking changes allowed at `0.1.x`):
