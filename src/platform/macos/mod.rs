@@ -96,6 +96,23 @@ impl MacosBackend {
         ResourceId::new(format!("macos:service:{}", id.hyphenated()))
     }
 
+    /// Whether the network-service resource is needed for `plan`.
+    ///
+    /// Minimal-ownership principle: a split-only configuration (routing
+    /// domains without an explicit default route) owns only the scoped
+    /// `/etc/resolver/<domain>` resources and leaves the general service DNS
+    /// state untouched. The service is owned when there is no split routing
+    /// to express, when `default_route` explicitly requests the default
+    /// route, or for global scopes (which have no scoped form).
+    fn service_needed(scope: &DnsScope, plan: &NormalizedConfig) -> bool {
+        match scope {
+            DnsScope::Global => true,
+            DnsScope::Interface(_) => {
+                plan.routing_domains.is_empty() || plan.default_route == Some(true)
+            }
+        }
+    }
+
     fn resolver_content(&self, plan: &NormalizedConfig) -> Vec<u8> {
         let mut content = resolver_files::marker_for(&self.owner).into_bytes();
         for ip in &plan.nameservers {
@@ -166,23 +183,6 @@ impl Backend for MacosBackend {
 
     fn capabilities(&self) -> Capabilities {
         self.caps.clone()
-    }
-
-    /// Whether the network-service resource is needed for `plan`.
-    ///
-    /// Minimal-ownership principle: a split-only configuration (routing
-    /// domains without an explicit default route) owns only the scoped
-    /// `/etc/resolver/<domain>` resources and leaves the general service DNS
-    /// state untouched. The service is owned when there is no split routing
-    /// to express, when `default_route` explicitly requests the default
-    /// route, or for global scopes (which have no scoped form).
-    fn service_needed(scope: &DnsScope, plan: &NormalizedConfig) -> bool {
-        match scope {
-            DnsScope::Global => true,
-            DnsScope::Interface(_) => {
-                plan.routing_domains.is_empty() || plan.default_route == Some(true)
-            }
-        }
     }
 
     fn resolve_resources(
