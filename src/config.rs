@@ -128,12 +128,23 @@ impl DnsConfig {
     /// [`Error::Unsupported`](crate::Error). The root domain (`.`) selects
     /// the default route on backends that support it; macOS rejects it -
     /// use [`DnsConfigBuilder::default_route`] there.
+    ///
+    /// Semantics: `nameservers` are the resolver endpoints owned by this
+    /// configuration and `routing_domains` are the names routed to them.
+    /// With non-empty routing domains and `default_route != Some(true)`,
+    /// unrelated DNS stays outside the overlay on backends with true split
+    /// DNS; backends own only the scoped resources needed (minimal
+    /// ownership).
     pub fn routing_domains(&self) -> &[DnsSuffix] {
         &self.routing_domains
     }
 
     /// Whether this interface should be the default route for DNS.
-    /// Only valid with an interface scope; `None` means "leave unset".
+    /// Only valid with an interface scope; `None` means preserve / leave
+    /// unspecified and never implicitly `false`. Requires
+    /// [`Capabilities::default_route`](crate::Capabilities); otherwise
+    /// validation fails with [`Error::Unsupported`](crate::Error) before
+    /// any mutation.
     pub fn default_route(&self) -> Option<bool> {
         self.default_route
     }
@@ -326,6 +337,12 @@ pub(crate) fn validate_against(
         return Err(Error::unsupported(
             caps.backend,
             "this backend cannot configure search domains",
+        ));
+    }
+    if config.default_route().is_some() && !caps.default_route {
+        return Err(Error::unsupported(
+            caps.backend,
+            "this backend cannot represent explicit default-route semantics",
         ));
     }
     Ok(NormalizedConfig {

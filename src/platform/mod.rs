@@ -96,6 +96,15 @@ pub(crate) trait Backend: Send + Sync {
     /// Whether `snapshot` already expresses the semantics of `plan`.
     fn matches_desired(&self, snapshot: &PlatformSnapshot, plan: &NormalizedConfig) -> bool;
 
+    /// Backend-specific semantic validation: reject plans the backend cannot
+    /// faithfully represent, even when the generic capability checks pass.
+    ///
+    /// Runs after [`crate::config::validate_against`] and before any lock,
+    /// journal write, or OS mutation. The default is to accept everything.
+    fn validate_plan(&self, _scope: &DnsScope, _plan: &NormalizedConfig) -> Result<()> {
+        Ok(())
+    }
+
     /// Interprets a snapshot as a platform-neutral [`DnsConfig`].
     fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig>;
 

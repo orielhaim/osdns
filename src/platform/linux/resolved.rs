@@ -74,7 +74,22 @@ impl ResolvedSnapshot {
         Self {
             dns: resolved_dns_from_plan(plan),
             domains: resolved_domains_from_plan(plan),
+            // Used for verification when `default_route` is explicit.
+            // The apply path never manufactures `false` from `None`; see
+            // `merged_from_plan`.
             default_route: plan.default_route.unwrap_or(false),
+        }
+    }
+
+    /// Merges a plan onto the currently captured state.
+    ///
+    /// Invariant: `None` means preserve / leave unspecified, never implicitly
+    /// `false`. Only `Some(_)` may change the link default-route flag.
+    fn merged_from_plan(current: &Self, plan: &NormalizedConfig) -> Self {
+        Self {
+            dns: resolved_dns_from_plan(plan),
+            domains: resolved_domains_from_plan(plan),
+            default_route: plan.default_route.unwrap_or(current.default_route),
         }
     }
 }
@@ -173,6 +188,7 @@ fn capabilities() -> Capabilities {
         .with_per_interface_dns(true)
         .with_search_domains(true)
         .with_split_dns(true)
+        .with_default_route(true)
         .with_watch(true)
         .with_cache_flush(true)
 }
@@ -215,7 +231,11 @@ impl Backend for SystemdResolved {
 
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
         let ifindex = Self::ifindex_of(resource)?;
-        self.apply_snapshot(ifindex, &ResolvedSnapshot::from_plan(plan))?;
+        // Preserve the current default-route flag when the plan leaves it
+        // unspecified (`None`); only an explicit `Some(_)` may change it.
+        let current = self.snapshot_of(ifindex)?;
+        let merged = ResolvedSnapshot::merged_from_plan(&current, plan);
+        self.apply_snapshot(ifindex, &merged)?;
         Ok(ApplyReceipt {
             resource: resource.clone(),
         })
@@ -345,4 +365,62 @@ fn from_platform_snapshot(snapshot: &PlatformSnapshot) -> Result<ResolvedSnapsho
             format_args!("snapshot data cannot be interpreted: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::normalize::DnsSuffix;
+
+    fn plan_with(default_route: Option<bool>) -> NormalizedConfig {
+        NormalizedConfig {
+            nameservers: vec!["1.1.1.1".parse().unwrap()],
+            search_domains: vec![],
+            routing_domains: vec![DnsSuffix::parse("corp.example").unwrap()],
+            default_route,
+        }
+    }
+
+    fn current_with(default_route: bool) -> ResolvedSnapshot {
+        ResolvedSnapshot {
+            dns: vec![(2, vec![1, 1, 1, 1])],
+            domains: vec![("corp.example".to_string(), true)],
+            default_route,
+        }
+    }
+
+    #[test]
+    fn unspecified_default_route_preserves_true() {
+        let merged = ResolvedSnapshot::merged_from_plan(&current_with(true), &plan_with(None));
+        assert!(merged.default_route);
+    }
+
+    #[test]
+    fn unspecified_default_route_preserves_false() {
+        let merged = ResolvedSnapshot::merged_from_plan(&current_with(false), &plan_with(None));
+        assert!(!merged.default_route);
+    }
+
+    #[test]
+    fn explicit_default_route_overrides() {
+        assert!(
+            ResolvedSnapshot::merged_from_plan(&current_with(false), &plan_with(Some(true)))
+                .default_route
+        );
+        assert!(
+            !ResolvedSnapshot::merged_from_plan(&current_with(true), &plan_with(Some(false)))
+                .default_route
+        );
+    }
+
+    #[test]
+    fn merged_plan_keeps_dns_and_domains_from_plan() {
+        for current in [true, false] {
+            let merged =
+                ResolvedSnapshot::merged_from_plan(&current_with(current), &plan_with(None));
+            let expected = ResolvedSnapshot::from_plan(&plan_with(None));
+            assert_eq!(merged.dns, expected.dns);
+            assert_eq!(merged.domains, expected.domains);
+        }
+    }
 }

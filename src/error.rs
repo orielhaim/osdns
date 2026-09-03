@@ -35,6 +35,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///   place. Journal state is retained for recovery.
 /// - [`Error::InvalidConfig`]: nothing was mutated. The request failed
 ///   validation before any lock, journal write, or OS call; fix the input.
+/// - [`Error::UpdateRequiresRebind`]: nothing was mutated. The requested
+///   config is valid but resolves to a different resource set than the lease
+///   owns. Drop this lease (restore or abandon) and apply fresh.
 /// - [`Error::VerificationFailed`]: the mutation was applied but read-back did
 ///   not match. A rollback to the captured state was attempted (best-effort)
 ///   and the journal record was kept, so [`DnsManager::recover_stale`](crate::DnsManager::recover_stale)
@@ -113,6 +116,21 @@ pub enum Error {
     /// calls. Fix the input and retry.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
+    /// The requested update is valid but cannot be applied to this lease
+    /// because it resolves to a different set of OS resources than the lease
+    /// owns.
+    ///
+    /// Nothing was mutated. A lease can never silently change what OS
+    /// resources it owns: restore or abandon this lease and apply the new
+    /// configuration fresh. This is distinct from [`Error::InvalidConfig`],
+    /// which means the configuration itself is malformed or unrepresentable.
+    #[error("update requires a fresh lease: owned {owned:?} vs requested {requested:?}")]
+    UpdateRequiresRebind {
+        /// Resources currently owned by the lease.
+        owned: Vec<ResourceId>,
+        /// Resources the requested configuration would require.
+        requested: Vec<ResourceId>,
+    },
     /// A mutation was applied but the read-back from the system did not match
     /// the desired semantics.
     ///

@@ -134,6 +134,16 @@ fn capability_gaps_fail_before_mutation() {
     let err = manager.apply(&with_search).unwrap_err();
     assert!(matches!(err, Error::Unsupported { .. }));
 
+    let with_default_route = DnsConfig::builder(iface_scope(1))
+        .nameserver(ip("1.1.1.1"))
+        .default_route(true)
+        .build()
+        .unwrap();
+    let err = manager.validate(&with_default_route).unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }));
+    let err = manager.apply(&with_default_route).unwrap_err();
+    assert!(matches!(err, Error::Unsupported { .. }));
+
     assert_eq!(
         fake.current_state(IFACE1).unwrap(),
         Some(osdns::testing::FakeState::Empty),

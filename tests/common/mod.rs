@@ -110,6 +110,7 @@ pub fn new_multi_fixture(tag: &str) -> Fixture {
         .with_per_interface_dns(true)
         .with_search_domains(true)
         .with_split_dns(true)
+        .with_default_route(true)
         .with_watch(true)
         .with_cache_flush(true);
     let fake = FakeDns::with_multi_resource(caps);

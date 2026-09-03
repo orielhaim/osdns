@@ -91,26 +91,66 @@
 //! [`RecoveryOutcome::ExternalConflict`] and left untouched. Unknown or
 //! corrupt journal formats fail closed with [`Error::JournalCorrupt`].
 //!
+//! # Validation guarantee
+//!
+//! [`DnsManager::validate`] success means the backend can faithfully
+//! represent every explicitly requested semantic. A backend never silently
+//! ignores a requested field: unsupported semantics fail with
+//! [`Error::Unsupported`] before any lock, journal write, or OS mutation.
+//! The pipeline is structural validation, then generic capability checks,
+//! then backend-specific semantic validation.
+//!
+//! # Optional fields
+//!
+//! `None` means preserve / leave unspecified, never implicitly `false` or
+//! empty. In particular, `default_route = None` preserves the current
+//! default-route value on every backend; only `Some(true)` / `Some(false)`
+//! may change it.
+//!
 //! # Cooperative vs Enforce
 //!
 //! [`ConflictPolicy::Cooperative`] (the default) never overwrites externally
 //! changed state automatically; conflicts are surfaced to the lease owner.
 //!
-//! [`ConflictPolicy::Enforce`] is for active VPN, mesh, and tunnel agents.
-//! While [`DnsManager::watch`] is active, external changes to resources owned
-//! by a live lease are reconciled: the reconciler waits for stable
-//! authoritative state, rebases the lease onto the new external base, and
-//! reapplies the desired overlay transactionally. Restoring a rebased lease
-//! returns to the new external base, not the pre-lease state.
-//! Reconciliation only runs while watching is active.
+//! [`ConflictPolicy::Enforce`] is for active VPN, mesh, and tunnel agents
+//! and actually guarantees active reconciliation without requiring a public
+//! [`DnsManager::watch`] subscription. The first active lease starts the
+//! internal native watch and reconciler; the last lease ending stops them.
+//! External changes to resources owned by a live lease are reconciled: the
+//! reconciler waits for stable authoritative state, rebases the lease onto
+//! the new external base, and reapplies the desired overlay
+//! transactionally. Restoring a rebased lease returns to the new external
+//! base, not the pre-lease state. Backends without watch support fail
+//! Enforce lease creation with [`Error::Unsupported`] instead of silently
+//! behaving cooperatively. [`DnsManager::watch`] remains a pure
+//! observability subscription.
+//!
+//! # Update transactions
+//!
+//! [`Lease::update`] moves every owned resource as one logical transaction:
+//! either all resources reach the new configuration or all are rolled back
+//! to their immediately previous applied state with journals restored. A
+//! valid configuration that resolves to a different resource set than the
+//! lease owns fails with [`Error::UpdateRequiresRebind`]; restore or abandon
+//! the lease and apply fresh.
 //!
 //! # Split DNS
+//!
+//! `nameservers` are the resolver endpoints owned by the configuration;
+//! `routing_domains` are the names that should route to those endpoints.
+//! When routing domains are non-empty and `default_route != Some(true)`,
+//! unrelated DNS remains outside the overlay wherever the backend supports
+//! true split DNS. Backends follow ownership minimization: a split-only
+//! configuration owns only the scoped resources needed to express it (on
+//! macOS, only `/etc/resolver/<domain>` files, leaving the service DNS
+//! state untouched).
 //!
 //! Routing domains are part of the platform-neutral configuration model
 //! (see [`DnsConfigBuilder::routing_domain`](crate::DnsConfigBuilder::routing_domain)).
 //! The mechanism depends on the active backend: systemd-resolved routing
-//! domains on Linux, NetworkManager DNS routing where supported, NRPT rules
-//! on Windows, and scoped `/etc/resolver/<domain>` files on macOS.
+//! domains on Linux, NetworkManager DNS routing where supported (the root
+//! wildcard is the canonical `~.`), NRPT rules on Windows, and scoped
+//! `/etc/resolver/<domain>` files on macOS.
 //! Configurations a backend cannot represent are rejected with
 //! [`Error::Unsupported`] before any mutation. Use
 //! [`DnsManager::capabilities`] to probe support at runtime.
@@ -145,8 +185,9 @@
 //!
 //! `osdns` has no async runtime dependency and does not require Tokio or
 //! async-std. Configuration changes are synchronous control-plane operations
-//! using native blocking APIs. Native watcher threads are started only when
-//! [`DnsManager::watch`] is called.
+//! using native blocking APIs. Native watcher threads are started for
+//! [`ConflictPolicy::Enforce`] leases (first active lease to last lease end)
+//! and for each [`DnsManager::watch`] subscription.
 //!
 //! # Safety and security limitations
 //!

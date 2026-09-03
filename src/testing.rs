@@ -171,6 +171,12 @@ pub fn manager_for_testing_with_policy(
     locks.ensure_dir()?;
     let journal = JournalStore::open(state_dir.join("journal"))?;
     let backend: Arc<dyn Backend> = fake.backend.clone();
+    if conflict_policy == ConflictPolicy::Enforce && !backend.capabilities().watch {
+        return Err(Error::unsupported(
+            backend.capabilities().backend,
+            "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
+        ));
+    }
     Ok(DnsManager::from_inner(Arc::new(Inner {
         owner: owner.to_string(),
         backend,
@@ -182,6 +188,7 @@ pub fn manager_for_testing_with_policy(
         active: Mutex::new(HashMap::new()),
         lease_tokens: Mutex::new(HashMap::new()),
         reconciler: crate::reconciliation::Reconciler::default(),
+        enforce: Mutex::new(crate::manager::EnforceState::default()),
     })))
 }
 
@@ -215,6 +222,7 @@ pub fn manager_for_backend(
         active: Mutex::new(HashMap::new()),
         lease_tokens: Mutex::new(HashMap::new()),
         reconciler: crate::reconciliation::Reconciler::default(),
+        enforce: Mutex::new(crate::manager::EnforceState::default()),
     })))
 }
 

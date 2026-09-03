@@ -111,18 +111,92 @@ fn reconciled_lease_update_and_still_ours_are_stable() {
 }
 
 #[test]
-fn reconciler_survives_without_watch() {
+fn enforce_works_without_user_watch() {
     let fixture = enforce_manager("enforce-nowatch");
-    let _lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    assert!(!fixture.manager.debug_enforce_watching());
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    // Enforce starts its own internal observation: no public watch needed.
+    assert!(fixture.manager.debug_enforce_watching());
+    assert_eq!(fixture.manager.debug_enforce_refs(), 1);
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(300));
+    wait_until(|| fixture.fake.current_state(IFACE1).unwrap() == Some(state_with("1.1.1.1")));
+    lease.restore().unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9")),
-        "without a watch there is no background worker and no reconciliation"
+        "restore must return to the rebased external base"
+    );
+    // Last lease ended: internal observation stops cleanly.
+    assert!(!fixture.manager.debug_enforce_watching());
+    assert_eq!(fixture.manager.debug_enforce_refs(), 0);
+}
+
+#[test]
+fn public_watch_is_optional_and_does_not_own_enforce() {
+    use std::sync::{Arc, Mutex};
+    let fixture = enforce_manager("enforce-watch-optional");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    assert!(fixture.manager.debug_enforce_watching());
+    let seen: Arc<Mutex<Vec<osdns::DnsEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_clone = Arc::clone(&seen);
+    let watch = fixture
+        .manager
+        .watch(Arc::new(move |event| {
+            seen_clone.lock().unwrap().push(event.clone());
+        }))
+        .unwrap();
+    // Let our own apply's suppression window expire so the genuine external
+    // change below reaches the user callback path.
+    std::thread::sleep(Duration::from_millis(600));
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    wait_until(|| fixture.fake.current_state(IFACE1).unwrap() == Some(state_with("1.1.1.1")));
+    // Public watch still receives user-facing events for genuine changes.
+    wait_until(|| !seen.lock().unwrap().is_empty());
+    // Dropping the public watcher must not disable Enforce.
+    watch.stop();
+    assert!(
+        fixture.manager.debug_enforce_watching(),
+        "Enforce must survive public watcher teardown while a lease is active"
+    );
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("8.8.8.8"))
+        .unwrap();
+    wait_until(|| fixture.fake.current_state(IFACE1).unwrap() == Some(state_with("1.1.1.1")));
+    lease.restore().unwrap();
+    assert!(!fixture.manager.debug_enforce_watching());
+}
+
+#[test]
+fn enforce_fails_honestly_without_watch_capability() {
+    use osdns::{BackendKind, Capabilities};
+    let dir = temp_dir("enforce-no-watch-cap");
+    let caps = Capabilities::new(BackendKind::Fake)
+        .with_read(true)
+        .with_global_dns(true)
+        .with_per_interface_dns(true)
+        .with_search_domains(true)
+        .with_split_dns(true)
+        .with_default_route(true)
+        .with_watch(false)
+        .with_cache_flush(true);
+    let fake = FakeDns::with_capabilities(caps);
+    let result = manager_for_testing_with_policy(
+        "io.osdns.test",
+        &dir,
+        &fake,
+        Duration::from_secs(30),
+        ConflictPolicy::Enforce,
+    );
+    assert!(
+        matches!(result, Err(osdns::Error::Unsupported { .. })),
+        "Enforce construction without watch support must fail, not silently downgrade"
     );
 }
 
@@ -130,6 +204,9 @@ fn reconciler_survives_without_watch() {
 fn rebase_is_transactional_across_crash() {
     let fixture = enforce_manager("enforce-crash");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    // Deterministic: drive reconciliation synchronously without racing the
+    // background worker.
+    fixture.manager.suspend_enforce_background();
 
     let injector = FaultInjector::new();
     injector.crash_at(TxPoint::AfterApply);
@@ -178,6 +255,7 @@ fn rebase_is_transactional_across_crash() {
 fn rebase_journal_write_failure_defers_and_preserves_external_state() {
     let fixture = enforce_manager("enforce-journal-fail");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
 
     fixture
         .fake
@@ -228,6 +306,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
     use osdns::testing::FakeOp;
     let fixture = enforce_manager("enforce-rollback-fail");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
@@ -287,6 +366,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
 fn events_during_defer_windows_are_pending_never_dropped() {
     let fixture = enforce_manager("enforce-defer");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
 
     // Transitional churn: the interface disappears, then returns with an
     // external configuration. The first reconcile cannot read the resource

@@ -14,7 +14,7 @@ use crate::capability::{BackendKind, Capabilities};
 use crate::config::{DnsConfig, DnsScope};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
-use crate::normalize::{DnsSuffix, NormalizedConfig};
+use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{NmDnsFields, parse_nm_dns_fields};
@@ -265,6 +265,7 @@ fn capabilities(dns_mode: &str) -> Capabilities {
         .with_per_interface_dns(true)
         .with_search_domains(true)
         .with_split_dns(matches!(dns_mode, "dnsmasq" | "systemd-resolved"))
+        .with_default_route(false)
         .with_watch(true)
         .with_cache_flush(false)
 }
@@ -375,6 +376,16 @@ impl Backend for NetworkManager {
         Ok(())
     }
 
+    fn validate_plan(&self, _scope: &DnsScope, plan: &NormalizedConfig) -> Result<()> {
+        if plan.default_route.is_some() {
+            return Err(Error::unsupported(
+                BackendKind::NetworkManager,
+                "NetworkManager has no explicit default-route flag; use the root routing domain instead",
+            ));
+        }
+        Ok(())
+    }
+
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         match (Self::fields_from_snapshot(a), Self::fields_from_snapshot(b)) {
             (Ok(x), Ok(y)) => x == y,
@@ -401,21 +412,7 @@ impl Backend for NetworkManager {
             }
         }
         let entries = &fields.ipv4_dns_search;
-        let mut search = Vec::new();
-        let mut routing = Vec::new();
-        for entry in entries {
-            let name = entry.trim_start_matches('~');
-            let Ok(suffix) = DnsSuffix::parse(name) else {
-                continue;
-            };
-            if entry.starts_with('~') {
-                if !routing.contains(&suffix) {
-                    routing.push(suffix);
-                }
-            } else if !search.contains(&suffix) {
-                search.push(suffix);
-            }
-        }
+        let (search, routing) = crate::platform::text_config::parse_nm_search_entries(entries);
         Ok(DnsConfig::from_parts(
             scope.clone(),
             nameservers,

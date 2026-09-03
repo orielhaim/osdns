@@ -38,6 +38,65 @@ pub enum FakeState {
     },
 }
 
+/// Merges a plan onto existing state, preserving `default_route` when the
+/// plan leaves it unspecified (`None`).
+fn merge_state(current: &FakeState, plan: &NormalizedConfig) -> FakeState {
+    let default_route = match plan.default_route {
+        Some(value) => Some(value),
+        None => match current {
+            FakeState::Configured { default_route, .. } => *default_route,
+            FakeState::Empty => None,
+        },
+    };
+    let merged = NormalizedConfig {
+        nameservers: plan.nameservers.clone(),
+        search_domains: plan.search_domains.clone(),
+        routing_domains: plan.routing_domains.clone(),
+        default_route,
+    };
+    if merged.nameservers.is_empty()
+        && merged.search_domains.is_empty()
+        && merged.routing_domains.is_empty()
+        && merged.default_route.is_none()
+    {
+        FakeState::Empty
+    } else {
+        FakeState::Configured {
+            nameservers: merged.nameservers,
+            search_domains: merged.search_domains,
+            routing_domains: merged.routing_domains,
+            default_route: merged.default_route,
+        }
+    }
+}
+
+/// Whether a stored state already expresses a plan, ignoring `default_route`
+/// when the plan leaves it unspecified.
+fn state_matches(state: &FakeState, plan: &NormalizedConfig) -> bool {
+    match state {
+        FakeState::Empty => {
+            plan.nameservers.is_empty()
+                && plan.search_domains.is_empty()
+                && plan.routing_domains.is_empty()
+                && plan.default_route.is_none()
+        }
+        FakeState::Configured {
+            nameservers,
+            search_domains,
+            routing_domains,
+            default_route,
+        } => {
+            *nameservers == plan.nameservers
+                && *search_domains == plan.search_domains
+                && *routing_domains == plan.routing_domains
+                && match plan.default_route {
+                    Some(wanted) => *default_route == Some(wanted),
+                    None => true,
+                }
+        }
+    }
+}
+
 impl From<&NormalizedConfig> for FakeState {
     fn from(plan: &NormalizedConfig) -> Self {
         if plan.nameservers.is_empty()
@@ -111,6 +170,7 @@ impl FakeBackend {
                 .with_per_interface_dns(true)
                 .with_search_domains(true)
                 .with_split_dns(true)
+                .with_default_route(true)
                 .with_watch(true)
                 .with_cache_flush(true),
         )
@@ -399,12 +459,16 @@ impl Backend for FakeBackend {
         self.check_failure(FakeOp::Apply)?;
         {
             let mut inner = self.lock_inner();
-            if !inner.states.contains_key(resource) {
-                return Err(Error::BackendUnavailable(format!(
+            let current = inner.states.get(resource).cloned().ok_or_else(|| {
+                Error::BackendUnavailable(format!(
                     "resource {resource} is not present on this system"
-                )));
-            }
-            inner.states.insert(resource.clone(), FakeState::from(plan));
+                ))
+            })?;
+            // `None` preserves the current default-route value; only
+            // `Some(_)` may change it.
+            inner
+                .states
+                .insert(resource.clone(), merge_state(&current, plan));
         }
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
@@ -471,7 +535,7 @@ impl Backend for FakeBackend {
 
     fn matches_desired(&self, snapshot: &PlatformSnapshot, plan: &NormalizedConfig) -> bool {
         match self.interpret(snapshot) {
-            Ok(state) => state == FakeState::from(plan),
+            Ok(state) => state_matches(&state, plan),
             Err(_) => false,
         }
     }

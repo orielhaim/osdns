@@ -144,14 +144,10 @@ impl NmDnsFields {
         let mut routing: Vec<String> = Vec::new();
         if split_dns {
             for domain in &plan.routing_domains {
-                let name = if domain.is_root() {
-                    String::new()
-                } else {
-                    domain.as_str().to_string()
-                };
-                if !search.iter().any(|s| s.trim_start_matches('~') == name)
-                    && !routing.contains(&name)
-                {
+                // The root domain is the NetworkManager wildcard `~.`;
+                // never the accidental empty-string form `~`.
+                let name = domain.to_string();
+                if !search.contains(&name) && !routing.contains(&name) {
                     routing.push(name);
                 }
             }
@@ -167,6 +163,37 @@ impl NmDnsFields {
         fields.ipv6_ignore_auto_dns = true;
         fields
     }
+}
+
+/// Splits NetworkManager `dns-search` entries into `(search, routing)`.
+///
+/// Entries starting with `~` are routing domains; the wildcard default route
+/// is the canonical `~.` (a bare legacy `~` is also accepted as the root).
+/// Anything else is a plain search domain.
+pub(crate) fn parse_nm_search_entries(entries: &[String]) -> (Vec<DnsSuffix>, Vec<DnsSuffix>) {
+    let mut search = Vec::new();
+    let mut routing = Vec::new();
+    for entry in entries {
+        if let Some(rest) = entry.strip_prefix('~') {
+            // `~.` is the canonical wildcard; accept a bare `~` as the same
+            // root for backward compatibility with older state.
+            let name = if rest.is_empty() { "." } else { rest };
+            let Ok(suffix) = DnsSuffix::parse(name) else {
+                continue;
+            };
+            if !routing.contains(&suffix) {
+                routing.push(suffix);
+            }
+        } else {
+            let Ok(suffix) = DnsSuffix::parse(entry) else {
+                continue;
+            };
+            if !search.contains(&suffix) {
+                search.push(suffix);
+            }
+        }
+    }
+    (search, routing)
 }
 
 pub(crate) fn parse_nm_dns_fields(
@@ -398,8 +425,8 @@ mod tests {
     fn nm_fields_root_routing_domain() {
         let p = plan(&[], &[], &["."], None);
         let fields = NmDnsFields::from_plan(&p, true);
-        assert_eq!(fields.ipv4_dns_search, vec!["~".to_string()]);
-        assert_eq!(fields.ipv6_dns_search, vec!["~".to_string()]);
+        assert_eq!(fields.ipv4_dns_search, vec!["~.".to_string()]);
+        assert_eq!(fields.ipv6_dns_search, vec!["~.".to_string()]);
     }
 
     #[test]
@@ -407,6 +434,61 @@ mod tests {
         let p = plan(&["1.1.1.1"], &["corp.example"], &["internal.example"], None);
         let fields = NmDnsFields::from_plan(&p, false);
         assert_eq!(fields.ipv4_dns_search, vec!["corp.example".to_string()]);
+    }
+
+    #[test]
+    fn nm_root_routing_domain_serialization_is_canonical_wildcard() {
+        let p = plan(&[], &[], &["."], None);
+        let fields = NmDnsFields::from_plan(&p, true);
+        assert_eq!(fields.ipv4_dns_search, vec!["~.".to_string()]);
+        assert_eq!(fields.ipv6_dns_search, vec!["~.".to_string()]);
+    }
+
+    #[test]
+    fn nm_root_routing_domain_parsing_roundtrip() {
+        // Canonical form.
+        let (search, routing) =
+            parse_nm_search_entries(&["~.".to_string(), "corp.example".to_string()]);
+        assert!(search == vec![DnsSuffix::parse("corp.example").unwrap()]);
+        assert_eq!(routing, vec![DnsSuffix::root()]);
+        // Legacy bare `~` is accepted as the same root.
+        let (_, routing) = parse_nm_search_entries(&["~".to_string()]);
+        assert_eq!(routing, vec![DnsSuffix::root()]);
+    }
+
+    #[test]
+    fn nm_routing_entries_roundtrip_through_plan() {
+        let p = plan(
+            &["1.1.1.1"],
+            &["corp.example"],
+            &[".", "internal.example"],
+            None,
+        );
+        let fields = NmDnsFields::from_plan(&p, true);
+        assert!(fields.ipv4_dns_search.contains(&"~.".to_string()));
+        assert!(
+            fields
+                .ipv4_dns_search
+                .contains(&"~internal.example".to_string())
+        );
+        let (search, routing) = parse_nm_search_entries(&fields.ipv4_dns_search);
+        assert_eq!(search, p.search_domains);
+        assert_eq!(routing.len(), 2);
+        assert!(routing.contains(&DnsSuffix::root()));
+        assert!(routing.contains(&DnsSuffix::parse("internal.example").unwrap()));
+    }
+
+    #[test]
+    fn nm_routing_matching_semantics_split_search_and_routing() {
+        let (search, routing) = parse_nm_search_entries(&[
+            "corp.example".to_string(),
+            "~internal.example".to_string(),
+            "~.".to_string(),
+        ]);
+        assert_eq!(search, vec![DnsSuffix::parse("corp.example").unwrap()]);
+        assert!(routing.contains(&DnsSuffix::root()));
+        assert!(routing.contains(&DnsSuffix::parse("internal.example").unwrap()));
+        assert!(!routing.contains(&DnsSuffix::parse("corp.example").unwrap()));
     }
 
     #[test]

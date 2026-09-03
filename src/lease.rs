@@ -50,11 +50,12 @@ pub(crate) enum LeaseState {
 /// Otherwise [`Error::ExternalModification`] is returned for that resource
 /// and nothing is mutated there.
 ///
-/// Under [`ConflictPolicy::Enforce`](crate::ConflictPolicy::Enforce) an
-/// active watch reconciles externally modified resources automatically by
-/// rebasing onto the external state and reapplying this lease's desired
-/// overlay; restore afterwards returns to that external base instead of the
-/// pre-lease state.
+/// Under [`ConflictPolicy::Enforce`](crate::ConflictPolicy::Enforce) the
+/// manager's internal observation reconciles externally modified resources
+/// automatically by rebasing onto the external state and reapplying this
+/// lease's desired overlay; restore afterwards returns to that external
+/// base instead of the pre-lease state. No public watch subscription is
+/// required.
 ///
 /// # Example
 ///
@@ -143,20 +144,23 @@ impl Lease {
 
     /// Transactionally moves this lease to a new desired configuration.
     ///
-    /// The original `before` snapshots are preserved, so a later
-    /// [`Lease::restore`] still returns the machine to the pre-lease state
-    /// (or to the rebased external base under
+    /// The update is one logical transaction across every owned resource:
+    /// either all resources move to the new configuration or all remain on
+    /// the old one (rolled back to their immediately previous applied state
+    /// with journals restored). The original `before` snapshots are
+    /// preserved, so a later [`Lease::restore`] still returns the machine to
+    /// the pre-lease state (or to the rebased external base under
     /// [`ConflictPolicy::Enforce`](crate::ConflictPolicy::Enforce)).
-    /// Each resource is checked against the state this lease applied; when
-    /// any resource was externally modified, [`Error::ExternalModification`]
-    /// is returned and that resource is left untouched. Resources updated
-    /// before the failure keep their new state, and every resource stays
-    /// individually journaled and recoverable. The target resource set must
-    /// be identical; changing scope or routing domains so that different
-    /// resources would be owned fails with [`Error::InvalidConfig`].
+    /// When any resource was externally modified,
+    /// [`Error::ExternalModification`] is returned and nothing is mutated.
+    /// The target resource set must be identical; a valid configuration that
+    /// resolves to different resources fails with
+    /// [`Error::UpdateRequiresRebind`]: restore or abandon this lease and
+    /// apply fresh.
     pub fn update(&self, config: &DnsConfig) -> Result<()> {
         let caps = self.inner.backend.capabilities();
         let plan = validate_against(config, &caps)?;
+        self.inner.backend.validate_plan(config.scope(), &plan)?;
         let mut guard = self
             .state
             .lock()
@@ -186,10 +190,10 @@ impl Lease {
                 owned_sorted.sort();
                 if wanted_sorted != owned_sorted {
                     *guard = Some(LeaseState::Noop { _locks });
-                    return Err(Error::invalid_config(format_args!(
-                        "update cannot change the target resources (lease owns {:?})",
-                        self.resources
-                    )));
+                    return Err(Error::UpdateRequiresRebind {
+                        owned: owned_sorted,
+                        requested: wanted_sorted,
+                    });
                 }
                 self.inner.fire(TxPoint::AfterUpdateResolve)?;
                 let mut befores = Vec::with_capacity(self.resources.len());
@@ -210,6 +214,12 @@ impl Lease {
                 match self.inner.transact_with_locks(resources, &plan, befores) {
                     Ok(records) => {
                         let shared = self.inner.share_records(records);
+                        // A no-op lease becoming owned starts Enforce
+                        // observation when required.
+                        if let Err(error) = self.inner.ensure_enforce_watch() {
+                            *guard = Some(LeaseState::Noop { _locks });
+                            return Err(error);
+                        }
                         *guard = Some(LeaseState::Owned {
                             live: shared,
                             _locks,
@@ -246,37 +256,33 @@ impl Lease {
                 owned_sorted.sort();
                 if wanted_sorted != owned_sorted {
                     *guard = Some(LeaseState::Owned { live, _locks });
-                    return Err(Error::invalid_config(format_args!(
-                        "update cannot change the target resources (lease owns {:?})",
-                        self.resources
-                    )));
+                    return Err(Error::UpdateRequiresRebind {
+                        owned: owned_sorted,
+                        requested: wanted_sorted,
+                    });
                 }
-                self.inner.fire(TxPoint::AfterUpdateResolve)?;
-                let mut first_error = None;
-                for record in &live {
-                    let resource = record
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .record
-                        .resource
-                        .clone();
-                    let token = self.inner.lease_token(&resource);
-                    let _token_guard = token
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let mut record = record
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(error) = self.inner.update_owned(&mut record.record, &plan) {
-                        first_error = Some(error);
-                        break;
-                    }
-                }
+                // Hold every per-resource token for the whole transaction in
+                // sorted order so reconciliation and concurrent updates
+                // cannot interleave with it.
+                let mut ordered: Vec<ResourceId> = owned_sorted.clone();
+                ordered.sort();
+                let tokens: Vec<std::sync::Arc<std::sync::Mutex<()>>> = ordered
+                    .iter()
+                    .map(|resource| self.inner.lease_token(resource))
+                    .collect();
+                let token_guards: Vec<_> = tokens
+                    .iter()
+                    .map(|token| {
+                        token
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    })
+                    .collect();
+                let result = self.inner.transact_update(&live, &plan);
+                drop(token_guards);
+                drop(tokens);
                 *guard = Some(LeaseState::Owned { live, _locks });
-                match first_error {
-                    Some(error) => Err(error),
-                    None => Ok(()),
-                }
+                result
             }
         }
     }
@@ -334,6 +340,7 @@ impl Lease {
         match state {
             LeaseState::Noop { _locks } => {
                 drop(_locks);
+                self.inner.release_enforce_watch();
                 Ok(())
             }
             LeaseState::Owned { live, _locks } => {
@@ -363,6 +370,7 @@ impl Lease {
                 match first_error {
                     None => {
                         drop(_locks);
+                        self.inner.release_enforce_watch();
                         Ok(())
                     }
                     Some(error) => {
@@ -419,10 +427,13 @@ impl Lease {
                     }
                     drop(_locks);
                     if let Some(error) = failure {
+                        self.inner.release_enforce_watch();
                         return Err(error);
                     }
                 }
             }
+            // Every live lease (no-op or owned) holds one Enforce reference.
+            self.inner.release_enforce_watch();
         }
         Ok(())
     }
@@ -503,6 +514,7 @@ impl Drop for Lease {
                     drop(_locks);
                 }
             }
+            self.inner.release_enforce_watch();
         }
     }
 }

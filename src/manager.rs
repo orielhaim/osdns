@@ -25,9 +25,10 @@ use crate::watch::{WatchCallback, WatchHandle};
 ///
 /// - [`ConflictPolicy::Cooperative`] (default): never overwrite; surface
 ///   conflicts to the lease owner.
-/// - [`ConflictPolicy::Enforce`]: for active VPN/mesh/tunnel agents; while
-///   watching is active, legitimate external base changes are rebased and the
-///   desired overlay is reapplied. See [`DnsManager::watch`].
+/// - [`ConflictPolicy::Enforce`]: for active VPN/mesh/tunnel agents; the
+///   manager keeps the native observation needed for reconciliation alive
+///   while at least one lease is active, without requiring a public
+///   [`DnsManager::watch`] subscription. See [`DnsManager::watch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictPolicy {
     /// Never overwrite externally changed state automatically.
@@ -40,11 +41,15 @@ pub enum ConflictPolicy {
     Cooperative,
     /// Rebase on legitimate external changes and reapply the overlay.
     ///
-    /// Only acts while [`DnsManager::watch`] is active: the reconciliation
-    /// worker waits for stable authoritative state, adopts the new external
-    /// base in the journal, and reapplies the lease's desired overlay
-    /// transactionally. Restoring a rebased lease returns to the new external
-    /// base. Without an active watch this behaves like [`ConflictPolicy::Cooperative`].
+    /// Enforce is self-contained: the first active lease starts the internal
+    /// native watch and reconciliation worker, and the last lease ending
+    /// stops them. The reconciliation worker waits for stable authoritative
+    /// state, adopts the new external base in the journal, and reapplies the
+    /// lease's desired overlay transactionally. Restoring a rebased lease
+    /// returns to the new external base. [`DnsManager::watch`] remains a
+    /// pure observability subscription and is never required for Enforce to
+    /// work. Backends without watch support fail lease creation with
+    /// [`Error::Unsupported`] rather than silently behaving cooperatively.
     Enforce,
 }
 
@@ -103,6 +108,28 @@ pub(crate) struct Inner {
     pub(crate) lease_tokens: Mutex<HashMap<ResourceId, Arc<Mutex<()>>>>,
     #[allow(dead_code)]
     pub(crate) reconciler: Reconciler,
+    pub(crate) enforce: Mutex<EnforceState>,
+}
+
+/// Internal observation state for [`ConflictPolicy::Enforce`].
+///
+/// Independent of public [`DnsManager::watch`] subscriptions: the first
+/// active lease starts one native watch feeding the shared reconciler, and
+/// the last active lease ending stops it. `refs` counts live leases.
+#[derive(Default)]
+pub(crate) struct EnforceState {
+    refs: usize,
+    handle: Option<WatchHandle>,
+    feed: Option<std::sync::mpsc::Sender<ResourceId>>,
+}
+
+impl std::fmt::Debug for EnforceState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnforceState")
+            .field("refs", &self.refs)
+            .field("watching", &self.handle.is_some())
+            .finish()
+    }
 }
 
 const COALESCE_WINDOW: Duration = Duration::from_millis(50);
@@ -116,6 +143,112 @@ impl Inner {
             live.push(shared);
         }
         live
+    }
+
+    /// Starts internal Enforce observation when the first lease becomes
+    /// active. Fails honestly with [`Error::Unsupported`] when the backend
+    /// cannot watch, instead of silently behaving cooperatively.
+    pub(crate) fn ensure_enforce_watch(self: &Arc<Self>) -> Result<()> {
+        if self.conflict_policy != ConflictPolicy::Enforce {
+            return Ok(());
+        }
+        if !self.backend.capabilities().watch {
+            return Err(Error::unsupported(
+                self.backend.kind(),
+                "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
+            ));
+        }
+        let mut enforce = self
+            .enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if enforce.refs == 0 {
+            debug_assert!(enforce.handle.is_none() && enforce.feed.is_none());
+            let feed = crate::reconciliation::spawn_reconciler(Arc::clone(self))?;
+            let feed_clone = feed.clone();
+            let callback: WatchCallback = Arc::new(move |event| {
+                let _ = feed_clone.send(event.resource().clone());
+            });
+            match self.backend.start_watch(callback) {
+                Ok(handle) => {
+                    enforce.handle = Some(handle);
+                    enforce.feed = Some(feed);
+                }
+                Err(error) => {
+                    drop(feed);
+                    return Err(error);
+                }
+            }
+        }
+        enforce.refs += 1;
+        Ok(())
+    }
+
+    /// Releases one Enforce lease reference, stopping internal observation
+    /// when the last active lease ends.
+    pub(crate) fn release_enforce_watch(&self) {
+        if self.conflict_policy != ConflictPolicy::Enforce {
+            return;
+        }
+        let mut enforce = self
+            .enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if enforce.refs == 0 {
+            return;
+        }
+        enforce.refs -= 1;
+        if enforce.refs == 0 {
+            enforce.handle = None;
+            enforce.feed = None;
+        }
+    }
+
+    /// Clones the internal Enforce feed when one is running, so public
+    /// watchers share the same reconciler instead of spawning duplicate
+    /// worker threads.
+    pub(crate) fn enforce_feed(&self) -> Option<std::sync::mpsc::Sender<ResourceId>> {
+        self.enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .feed
+            .clone()
+    }
+
+    /// Number of live leases holding Enforce observation (testing only).
+    #[cfg(feature = "test-util")]
+    #[allow(dead_code)]
+    pub(crate) fn enforce_refs(&self) -> usize {
+        self.enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .refs
+    }
+
+    /// Drops the internal Enforce watch/feed without touching the refcount,
+    /// so deterministic tests can drive reconciliation via `debug_reconcile`
+    /// without racing a background worker. The lease-drop balance is kept:
+    /// `release_enforce_watch` still runs once per lease.
+    #[cfg(feature = "test-util")]
+    #[allow(dead_code)]
+    pub(crate) fn suspend_enforce_watch(&self) {
+        let mut enforce = self
+            .enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        enforce.handle = None;
+        enforce.feed = None;
+    }
+
+    /// Whether the internal Enforce watcher is currently running.
+    #[cfg(feature = "test-util")]
+    #[allow(dead_code)]
+    pub(crate) fn enforce_watching(&self) -> bool {
+        self.enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle
+            .is_some()
     }
 }
 
@@ -330,47 +463,130 @@ impl Inner {
         }
     }
 
-    pub(crate) fn update_owned(
+    /// Transactionally moves every owned resource to `plan` as one logical
+    /// transaction: old complete configuration or new complete configuration,
+    /// never a silently mixed configuration.
+    ///
+    /// Sequence: verify all resources still match their applied state, write
+    /// all `Prepared` records, mutate+verify each resource, then write all
+    /// `Applied` records. On any failure, previously updated resources are
+    /// rolled back to their immediately previous applied state and every
+    /// journal record is restored to its pre-update form.
+    pub(crate) fn transact_update(
         &self,
-        record: &mut JournalRecord,
+        live: &[Arc<Mutex<LiveRecord>>],
         plan: &NormalizedConfig,
     ) -> Result<()> {
-        let resource = &record.resource;
         self.fire(TxPoint::AfterUpdateResolve)?;
-        let applied = record.applied.clone().ok_or_else(|| {
-            Error::platform(
-                self.backend.kind(),
-                format_args!("owned lease record for {resource} is missing its applied snapshot"),
-            )
-        })?;
-        let current = self.backend.readback(resource)?;
-        self.fire(TxPoint::AfterUpdateCapture)?;
-        if !self.backend.equivalent(&current, &applied) {
-            return Err(Error::ExternalModification {
-                resource: resource.clone(),
-                detail: "the current state no longer matches the state applied by this lease"
-                    .to_string(),
-            });
+        // Snapshot the pre-update records and verify ownership first; no
+        // mutation happens below until every resource is proven still ours.
+        let mut olds: Vec<JournalRecord> = Vec::with_capacity(live.len());
+        let mut applieds: Vec<PlatformSnapshot> = Vec::with_capacity(live.len());
+        for record in live {
+            let guard = record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let applied = guard.record.applied.clone().ok_or_else(|| {
+                Error::platform(
+                    self.backend.kind(),
+                    format_args!(
+                        "owned lease record for {} is missing its applied snapshot",
+                        guard.record.resource
+                    ),
+                )
+            })?;
+            olds.push(guard.record.clone());
+            applieds.push(applied);
         }
-        if self.backend.matches_desired(&current, plan) {
+        let mut currents = Vec::with_capacity(live.len());
+        for index in 0..live.len() {
+            let resource = olds[index].resource.clone();
+            let current = self.backend.readback(&resource)?;
+            self.fire(TxPoint::AfterUpdateCapture)?;
+            if !self.backend.equivalent(&current, &applieds[index]) {
+                return Err(Error::ExternalModification {
+                    resource,
+                    detail: "the current state no longer matches the state applied by this lease"
+                        .to_string(),
+                });
+            }
+            currents.push(current);
+        }
+        if currents
+            .iter()
+            .all(|current| self.backend.matches_desired(current, plan))
+        {
             self.fire(TxPoint::AfterUpdateNoopCheck)?;
             return Ok(());
         }
-        record.desired = plan.clone();
-        record.phase = Phase::Prepared;
-        record.applied = Some(applied.clone());
-        self.journal.write(record)?;
-        self.fire(TxPoint::AfterUpdatePrepared)?;
-        match self.mutate_and_verify(resource, plan, Some(&applied), UPDATE_POINTS) {
-            Ok(actual) => {
-                record.phase = Phase::Applied;
-                record.applied = Some(actual);
-                self.journal.write(record)?;
-                self.fire(TxPoint::AfterUpdateApplied)?;
-                Ok(())
+        // Persist the prepared intent for every resource before mutating any.
+        for record in live {
+            let mut guard = record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.record.desired = plan.clone();
+            guard.record.phase = Phase::Prepared;
+            // `applied` still carries the previous applied state until the
+            // mutation is verified; recovery therefore rolls back to it.
+            if let Err(error) = self.journal.write(&guard.record) {
+                // Restore any already-prepared journals to their old form so
+                // the lease is never left half-prepared on a write failure.
+                drop(guard);
+                for (old, live_record) in olds.iter().zip(live.iter()) {
+                    let mut guard = live_record
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.record = old.clone();
+                    let _ = self.journal.write(&guard.record);
+                }
+                return Err(error);
             }
-            Err(error) => Err(error),
         }
+        self.fire(TxPoint::AfterUpdatePrepared)?;
+        // Mutate each resource; on failure roll back the earlier ones to
+        // their immediately previous applied state and restore journals.
+        let mut actuals: Vec<Option<PlatformSnapshot>> = vec![None; live.len()];
+        for index in 0..live.len() {
+            let resource = olds[index].resource.clone();
+            match self.mutate_and_verify(&resource, plan, Some(&applieds[index]), UPDATE_POINTS) {
+                Ok(actual) => actuals[index] = Some(actual),
+                Err(error) => {
+                    for (rollback_index, old) in olds.iter().enumerate().take(index) {
+                        let resource = &old.resource;
+                        self.suppressions.suppress(resource);
+                        if self.backend.readback(resource).is_ok() {
+                            let _ = self.backend.restore(resource, &applieds[rollback_index]);
+                        }
+                    }
+                    self.fire(TxPoint::AfterUpdateVerify).ok();
+                    for (old, live_record) in olds.iter().zip(live.iter()) {
+                        let mut guard = live_record
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.record = old.clone();
+                        let _ = self.journal.write(&guard.record);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for (index, record) in live.iter().enumerate() {
+            let mut guard = record
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.record.phase = Phase::Applied;
+            guard.record.applied = actuals[index].clone();
+            if let Err(error) = self.journal.write(&guard.record) {
+                // The OS already holds the new configuration for this and
+                // earlier resources while later journals still say Prepared;
+                // keep the in-memory applied state and report the error so
+                // recovery can finalize. Remaining journals stay Prepared.
+                drop(guard);
+                return Err(error);
+            }
+        }
+        self.fire(TxPoint::AfterUpdateApplied)?;
+        Ok(())
     }
 
     pub(crate) fn restore_lease_state(&self, record: &JournalRecord) -> Result<()> {
@@ -639,7 +855,9 @@ impl DnsManager {
     /// any mutation.
     pub fn validate(&self, config: &DnsConfig) -> Result<()> {
         let caps = self.inner.backend.capabilities();
-        validate_against(config, &caps).map(|_| ())
+        let plan = validate_against(config, &caps)?;
+        self.inner.backend.validate_plan(config.scope(), &plan)?;
+        Ok(())
     }
 
     /// Applies `config` transactionally and returns a [`Lease`] owning the
@@ -676,6 +894,7 @@ impl DnsManager {
     pub fn apply(&self, config: &DnsConfig) -> Result<Lease> {
         let caps = self.inner.backend.capabilities();
         let plan = validate_against(config, &caps)?;
+        self.inner.backend.validate_plan(config.scope(), &plan)?;
         self.inner.fire(TxPoint::AfterValidate)?;
         let resources = self
             .inner
@@ -708,34 +927,54 @@ impl DnsManager {
             .all(|(_resource, before)| self.inner.backend.matches_desired(before, &plan))
         {
             self.inner.fire(TxPoint::AfterNoopDecision)?;
-            return Ok(Lease::new_noop(self.inner.clone(), resources, locks));
+            let lease = Lease::new_noop(self.inner.clone(), resources, locks);
+            self.inner.ensure_enforce_watch()?;
+            return Ok(lease);
         }
         match self.inner.transact_with_locks(resources, &plan, befores) {
-            Ok(records) => Ok(Lease::new_owned(self.inner.clone(), records, locks)),
+            Ok(records) => {
+                let lease = Lease::new_owned(self.inner.clone(), records, locks);
+                if let Err(error) = self.inner.ensure_enforce_watch() {
+                    // Enforce observation is required to claim the lease;
+                    // fail honestly instead of handing out an unenforced one.
+                    // Best-effort restore; the ensure error is what matters.
+                    let _ = lease.restore();
+                    return Err(error);
+                }
+                Ok(lease)
+            }
             Err(error) => Err(error),
         }
     }
 
     /// Registers a callback for native DNS change notifications.
     ///
-    /// Events are coalesced per resource within a small window, and events
-    /// caused by this manager's own mutations are suppressed for the
-    /// user-callback path.
+    /// This is a pure observability subscription: events are coalesced per
+    /// resource within a small window, and events caused by this manager's
+    /// own mutations are suppressed for the user-callback path. It is never
+    /// required for [`ConflictPolicy::Enforce`] to work; Enforce keeps its
+    /// own internal observation alive while leases are active.
     ///
-    /// Under [`ConflictPolicy::Enforce`] every event is also fed to the
-    /// reconciliation worker *before* suppression: the worker reads the
-    /// authoritative state, treats events matching our applied overlay as
-    /// no-ops (state-aware suppression), and rebases/reapplies on genuine
-    /// external changes. Events deferred by the worker's scheduler are
-    /// pending, never dropped.
+    /// Under [`ConflictPolicy::Enforce`] every event observed here is also
+    /// fed to the shared reconciliation worker *before* suppression: the
+    /// worker reads the authoritative state, treats events matching our
+    /// applied overlay as no-ops (state-aware suppression), and
+    /// rebases/reapplies on genuine external changes. Events deferred by the
+    /// worker's scheduler are pending, never dropped. When internal Enforce
+    /// observation is already running, this reuses its worker instead of
+    /// spawning a duplicate.
     ///
     /// The callback must only enqueue or coalesce events; it must never
     /// perform expensive or mutating work. The returned [`WatchHandle`]
-    /// cancels the underlying native notification when stopped or dropped.
-    /// Reconciliation only runs while the watch is active.
+    /// cancels this subscription's native notification when stopped or
+    /// dropped; dropping it never disables Enforce while an active lease
+    /// still requires it.
     pub fn watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let feed = if self.inner.conflict_policy == ConflictPolicy::Enforce {
-            Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?)
+            match self.inner.enforce_feed() {
+                Some(existing) => Some(existing),
+                None => Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?),
+            }
         } else {
             None
         };
@@ -806,6 +1045,28 @@ impl DnsManager {
     #[cfg(feature = "test-util")]
     pub fn set_journal_fail_writes(&self, fail: bool) {
         self.inner.journal.set_fail_writes(fail);
+    }
+
+    /// Number of live leases holding internal Enforce observation (testing
+    /// only). Cooperative managers always report zero.
+    #[cfg(feature = "test-util")]
+    pub fn debug_enforce_refs(&self) -> usize {
+        self.inner.enforce_refs()
+    }
+
+    /// Whether the internal Enforce watcher is currently running (testing
+    /// only).
+    #[cfg(feature = "test-util")]
+    pub fn debug_enforce_watching(&self) -> bool {
+        self.inner.enforce_watching()
+    }
+
+    /// Stops the background Enforce worker without releasing the lease
+    /// reference (testing only), so `debug_reconcile` drives reconciliation
+    /// deterministically.
+    #[cfg(feature = "test-util")]
+    pub fn suspend_enforce_background(&self) {
+        self.inner.suspend_enforce_watch();
     }
 
     /// Runs one synchronous reconciliation pass for `resource` (testing
@@ -912,9 +1173,9 @@ impl DnsManagerBuilder {
     /// Sets the conflict policy. Defaults to
     /// [`ConflictPolicy::Cooperative`].
     ///
-    /// [`ConflictPolicy::Enforce`] only reconciles while
-    /// [`DnsManager::watch`] is active; without a watch it behaves like
-    /// cooperative mode.
+    /// [`ConflictPolicy::Enforce`] is self-contained and fails at build
+    /// time when the backend cannot watch; no public
+    /// [`DnsManager::watch`] subscription is ever required for it to work.
     pub fn conflict_policy(mut self, policy: ConflictPolicy) -> Self {
         self.conflict_policy = policy;
         self
@@ -944,6 +1205,12 @@ impl DnsManagerBuilder {
         locks.ensure_dir()?;
         let journal = JournalStore::open(state_dir.join("journal"))?;
         let backend = select_default_backend(&owner)?;
+        if self.conflict_policy == ConflictPolicy::Enforce && !backend.capabilities().watch {
+            return Err(Error::unsupported(
+                backend.kind(),
+                "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
+            ));
+        }
         Ok(DnsManager::from_inner(Arc::new(Inner {
             owner,
             backend,
@@ -955,6 +1222,7 @@ impl DnsManagerBuilder {
             active: Mutex::new(HashMap::new()),
             lease_tokens: Mutex::new(HashMap::new()),
             reconciler: Reconciler::default(),
+            enforce: Mutex::new(EnforceState::default()),
         })))
     }
 }

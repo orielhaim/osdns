@@ -64,9 +64,9 @@ pub type WatchCallback = Arc<dyn Fn(&DnsEvent) + Send + Sync>;
 /// explicitly stopped.
 ///
 /// `stop` consumes the handle; dropping has the same effect. Stopping is
-/// idempotent and never fails. Under
-/// [`ConflictPolicy::Enforce`](crate::ConflictPolicy) dropping the last watch
-/// also stops reconciliation.
+/// idempotent and never fails. Stopping a public watch never disables
+/// [`ConflictPolicy::Enforce`](crate::ConflictPolicy): Enforce keeps its own
+/// internal observation alive while leases are active.
 ///
 /// ```no_run
 /// # use osdns::DnsManager;

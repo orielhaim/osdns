@@ -1,8 +1,10 @@
 //! Enforce-policy reconciliation: rebasing and reapplying an active lease's
 //! desired overlay when an external actor changes the base DNS state.
 //!
-//! Reconciliation never runs as a background worker unless a watch is active
-//! and the manager's conflict policy is [`Enforce`](crate::ConflictPolicy).
+//! Reconciliation runs as a background worker while at least one lease on an
+//! [`Enforce`](crate::ConflictPolicy)-policy manager is active, independent
+//! of any public [`DnsManager::watch`](crate::DnsManager::watch)
+//! subscription, which remains purely observational.
 //!
 //! # Event handling is state-aware and never drops a legitimate change
 //!
@@ -452,6 +454,7 @@ impl Inner {
 /// due; events that arrive during a defer window update the pending entry
 /// instead of being dropped.
 pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<ResourceId>, Error> {
+    let kind = inner.backend.kind();
     let (tx, rx) = mpsc::channel::<ResourceId>();
     thread::Builder::new()
         .name("osdns-reconciler".to_string())
@@ -496,7 +499,7 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<Resourc
             }
         })
         .map_err(|e| Error::Platform {
-            backend: crate::capability::BackendKind::Fake,
+            backend: kind,
             message: format!("cannot spawn reconciler thread: {e}"),
         })?;
     Ok(tx)

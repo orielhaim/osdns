@@ -118,7 +118,13 @@ fn update_rejects_scope_change() {
         .build()
         .unwrap();
     let err = lease.update(&other).unwrap_err();
-    assert!(matches!(err, Error::InvalidConfig(_)));
+    match err {
+        Error::UpdateRequiresRebind { owned, requested } => {
+            assert_eq!(owned, vec![resource_id(IFACE1)]);
+            assert_eq!(requested, vec![resource_id(IFACE2)]);
+        }
+        other => panic!("expected UpdateRequiresRebind, got {other:?}"),
+    }
     lease.restore().unwrap();
 }
 

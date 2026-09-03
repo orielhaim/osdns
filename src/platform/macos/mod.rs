@@ -60,6 +60,7 @@ impl MacosBackend {
                 .with_per_interface_dns(true)
                 .with_search_domains(true)
                 .with_split_dns(true)
+                .with_default_route(true)
                 .with_watch(true)
                 .with_cache_flush(false),
         }
@@ -167,6 +168,23 @@ impl Backend for MacosBackend {
         self.caps.clone()
     }
 
+    /// Whether the network-service resource is needed for `plan`.
+    ///
+    /// Minimal-ownership principle: a split-only configuration (routing
+    /// domains without an explicit default route) owns only the scoped
+    /// `/etc/resolver/<domain>` resources and leaves the general service DNS
+    /// state untouched. The service is owned when there is no split routing
+    /// to express, when `default_route` explicitly requests the default
+    /// route, or for global scopes (which have no scoped form).
+    fn service_needed(scope: &DnsScope, plan: &NormalizedConfig) -> bool {
+        match scope {
+            DnsScope::Global => true,
+            DnsScope::Interface(_) => {
+                plan.routing_domains.is_empty() || plan.default_route == Some(true)
+            }
+        }
+    }
+
     fn resolve_resources(
         &self,
         scope: &DnsScope,
@@ -192,9 +210,17 @@ impl Backend for MacosBackend {
                 ));
             }
         };
-        let mut resources = vec![Self::service_resource(&service)?];
+        let mut resources = Vec::new();
+        if Self::service_needed(scope, plan) {
+            resources.push(Self::service_resource(&service)?);
+        }
         for domain in &plan.routing_domains {
             resources.push(Self::resolver_resource(domain.as_str()));
+        }
+        if resources.is_empty() {
+            return Err(Error::invalid_config(
+                "the configuration resolves to no macOS resources",
+            ));
         }
         Ok(resources)
     }
@@ -284,6 +310,28 @@ impl Backend for MacosBackend {
         Ok(())
     }
 
+    fn validate_plan(&self, scope: &DnsScope, plan: &NormalizedConfig) -> Result<()> {
+        if plan.routing_domains.iter().any(|domain| domain.is_root()) {
+            return Err(Error::unsupported(
+                BackendKind::MacosSystemConfiguration,
+                "the root routing domain is not representable as a scoped resolver file; configure default_route instead",
+            ));
+        }
+        // Search domains live in the service DNS state, which implies the
+        // default route. A split-only lease (routing without the service)
+        // cannot faithfully carry them.
+        if !plan.routing_domains.is_empty()
+            && !plan.search_domains.is_empty()
+            && !Self::service_needed(scope, plan)
+        {
+            return Err(Error::unsupported(
+                BackendKind::MacosSystemConfiguration,
+                "search domains require the service DNS state; set default_route(true) or drop search domains for a split-only configuration",
+            ));
+        }
+        Ok(())
+    }
+
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         match (self.parse_snapshot(a), self.parse_snapshot(b)) {
             (Ok(x), Ok(y)) => x == y,
@@ -354,6 +402,56 @@ impl Backend for MacosBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::InterfaceSelector;
+
+    fn plan(routing: &[&str], default_route: Option<bool>, search: &[&str]) -> NormalizedConfig {
+        NormalizedConfig {
+            nameservers: vec!["100.64.0.53".parse().unwrap()],
+            search_domains: search
+                .iter()
+                .map(|s| DnsSuffix::parse(s).unwrap())
+                .collect(),
+            routing_domains: routing
+                .iter()
+                .map(|s| DnsSuffix::parse(s).unwrap())
+                .collect(),
+            default_route,
+        }
+    }
+
+    fn iface_scope() -> DnsScope {
+        DnsScope::Interface(InterfaceSelector::Default)
+    }
+
+    #[test]
+    fn split_only_config_needs_no_service_resource() {
+        // corp.example -> 100.64.0.53, everything else unchanged: only the
+        // scoped resolver is owned.
+        assert!(!MacosBackend::service_needed(
+            &iface_scope(),
+            &plan(&["corp.example"], None, &[])
+        ));
+        assert!(!MacosBackend::service_needed(
+            &iface_scope(),
+            &plan(&["corp.example"], Some(false), &[])
+        ));
+    }
+
+    #[test]
+    fn default_route_or_plain_config_needs_service() {
+        assert!(MacosBackend::service_needed(
+            &iface_scope(),
+            &plan(&[], None, &[])
+        ));
+        assert!(MacosBackend::service_needed(
+            &iface_scope(),
+            &plan(&["corp.example"], Some(true), &[])
+        ));
+        assert!(MacosBackend::service_needed(
+            &DnsScope::Global,
+            &plan(&[], None, &[])
+        ));
+    }
 
     #[test]
     fn service_uuid_roundtrips_between_resource_and_store_keys() {

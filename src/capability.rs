@@ -66,13 +66,17 @@ impl fmt::Display for BackendKind {
 /// not.
 ///
 /// Linux backends: systemd-resolved supports per-interface DNS, search
-/// domains, split DNS, watch, and cache flush; NetworkManager supports
-/// per-interface DNS with backend-dependent split DNS; resolvconf/openresolv
-/// is global-only with limited split DNS; direct `/etc/resolv.conf` is
-/// global-only without split DNS. Windows supports per-interface DNS, search
-/// domains, split DNS (NRPT), watch, and cache flush, but no global scope.
-/// macOS supports global and per-interface DNS, search domains, split DNS
-/// (scoped `/etc/resolver` files), and watch, but no cache flush.
+/// domains, split DNS, explicit default-route control, watch, and cache
+/// flush; NetworkManager supports per-interface DNS with backend-dependent
+/// split DNS but no explicit default-route control; resolvconf/openresolv
+/// is global-only with limited split DNS and no default-route control;
+/// direct `/etc/resolv.conf` is global-only without split DNS or
+/// default-route control. Windows supports per-interface DNS, search
+/// domains, split DNS (NRPT), explicit default-route control via NRPT root
+/// namespaces, watch, and cache flush, but no global scope. macOS supports
+/// global and per-interface DNS, search domains, split DNS (scoped
+/// `/etc/resolver` files), explicit default-route control, and watch, but no
+/// cache flush.
 ///
 /// The struct is `#[non_exhaustive]`: construct with [`Capabilities::new`]
 /// plus `with_*` builders, never with a literal.
@@ -91,6 +95,12 @@ pub struct Capabilities {
     pub search_domains: bool,
     /// Whether routing domains (split DNS) can be configured.
     pub split_dns: bool,
+    /// Whether explicit default-route semantics (`default_route`) can be
+    /// faithfully represented. When `false`, any config with
+    /// `default_route.is_some()` is rejected with
+    /// [`Error::Unsupported`](crate::Error::Unsupported)
+    /// before mutation; backends must never silently ignore it.
+    pub default_route: bool,
     /// Whether native change notifications are supported.
     pub watch: bool,
     /// Whether the OS DNS cache can be flushed (best-effort only).
@@ -107,6 +117,7 @@ impl Capabilities {
             per_interface_dns: false,
             search_domains: false,
             split_dns: false,
+            default_route: false,
             watch: false,
             cache_flush: false,
         }
@@ -139,6 +150,12 @@ impl Capabilities {
     /// Sets [`Capabilities::split_dns`].
     pub fn with_split_dns(mut self, enabled: bool) -> Self {
         self.split_dns = enabled;
+        self
+    }
+
+    /// Sets [`Capabilities::default_route`].
+    pub fn with_default_route(mut self, enabled: bool) -> Self {
+        self.default_route = enabled;
         self
     }
 

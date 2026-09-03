@@ -254,8 +254,10 @@ fn matrix_macos_system_configuration_and_resolver_files() {
         Err(Error::RequiresPrivilege(_)) => return,
         Err(error) => panic!("unexpected apply error: {error}"),
     };
-    assert_eq!(lease.resources().len(), 2);
-    let resolver_resource = &lease.resources()[1];
+    // Split-only configurations own only the scoped resolver resource and
+    // leave the service DNS state untouched (minimal ownership).
+    assert_eq!(lease.resources().len(), 1);
+    let resolver_resource = &lease.resources()[0];
     assert!(
         resolver_resource
             .as_str()
@@ -263,8 +265,6 @@ fn matrix_macos_system_configuration_and_resolver_files() {
         "{resolver_resource:?}"
     );
     assert!(std::path::Path::new("/etc/resolver/matrix.test").is_file());
-    let snapshot = manager.snapshot(&scope).unwrap();
-    assert_eq!(snapshot.nameservers(), &[ip("127.0.0.1")]);
     lease.restore().unwrap();
     assert!(!std::path::Path::new("/etc/resolver/matrix.test").exists());
 }
