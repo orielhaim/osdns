@@ -5,7 +5,7 @@
 //! `macos:service:<service-id>` for the network service backing the scope
 //! plus one `macos:resolver:<domain>` resource per routing domain. Scoped
 //! resolver files carry a first-line owner marker; a file that exists
-//! without our marker is never overwritten — the apply reports
+//! without our marker is never overwritten - the apply reports
 //! [`Error::Conflict`] with [`ConflictReason::ResourceOccupied`] instead.
 //! This makes multi-instance cleanup races impossible: a lease can only ever
 //! delete the exact files it created, never "everything that looks like

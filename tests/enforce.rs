@@ -49,7 +49,7 @@ fn enforce_rebases_and_reapplies_on_external_change() {
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     let _watch = fixture.manager.watch(std::sync::Arc::new(|_| {})).unwrap();
 
-    // Arrives immediately after our apply — inside any suppression window —
+    // Arrives immediately after our apply - inside any suppression window -
     // but state-aware reconciliation must still act on it.
     fixture
         .fake
@@ -161,7 +161,7 @@ fn rebase_is_transactional_across_crash() {
     );
 
     // Recovery (as a fresh process would do) must roll the uncommitted
-    // overlay back to the external base — never to the old base.
+    // overlay back to the external base - never to the old base.
     drop(lease);
     let outcomes = fixture.manager.recover_stale().unwrap();
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");

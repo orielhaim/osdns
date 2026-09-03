@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 /// lowercase, no trailing dot, RFC 1035 label and length rules. The root
 /// domain is the empty name and renders as `.`; it selects the default route
 /// on backends that support it (systemd-resolved, Windows NRPT). macOS
-/// scoped resolvers cannot represent the root — use
+/// scoped resolvers cannot represent the root - use
 /// [`DnsConfigBuilder::default_route`](crate::DnsConfigBuilder::default_route)
 /// there instead.
 ///

@@ -3,7 +3,7 @@
 //! One file per routing domain, named after the domain itself. Ownership is
 //! exact: a file carries a first-line `# osdns owner=<owner>` marker, and a
 //! file that exists without our marker (written by another osdns owner or by
-//! the user) is never overwritten — the apply reports a conflict instead.
+//! the user) is never overwritten - the apply reports a conflict instead.
 
 use std::path::{Path, PathBuf};
 

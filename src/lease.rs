@@ -378,7 +378,7 @@ impl Lease {
     /// released and the journal records removed.
     ///
     /// Consumes the lease and releases its locks. Use this when the current
-    /// (externally modified) state should win — typically after
+    /// (externally modified) state should win - typically after
     /// [`Error::ExternalModification`] from [`Lease::restore`]. Never fails
     /// due to external state; only journal I/O errors are reported.
     pub fn abandon(self) -> Result<()> {

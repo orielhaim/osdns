@@ -532,7 +532,7 @@ impl Inner {
 /// The central invariant is: **never overwrite DNS state that is not
 /// demonstrably ours.** Every mutation belongs to an explicit owner and
 /// [`Lease`], is journaled before it happens, is verified by read-back, and
-/// can be undone — unless an external actor changed the state in the
+/// can be undone - unless an external actor changed the state in the
 /// meantime, in which case [`Error::ExternalModification`] is returned and
 /// nothing is touched.
 ///
@@ -601,7 +601,7 @@ impl DnsManager {
     /// Lists network interfaces known to the backend.
     ///
     /// Read-only; requires no privileges beyond what the platform needs for
-    /// enumeration. Names and indexes are selectors only — backends identify
+    /// enumeration. Names and indexes are selectors only - backends identify
     /// interfaces by stable native identifiers internally.
     pub fn interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         self.inner.backend.list_interfaces()

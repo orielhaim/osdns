@@ -51,7 +51,7 @@ pub enum InterfaceSelector {
 /// unspecified nameservers, malformed domains, routing domains on a global
 /// scope, and `default_route` on a global scope with
 /// [`Error::InvalidConfig`](crate::Error). Backends may additionally reject
-/// configurations they cannot represent (see [`crate::Capabilities`]) — this
+/// configurations they cannot represent (see [`crate::Capabilities`]) - this
 /// is checked by [`DnsManager::validate`](crate::DnsManager::validate) and
 /// again inside [`DnsManager::apply`](crate::DnsManager::apply) before any
 /// mutation.
@@ -126,7 +126,7 @@ impl DnsConfig {
     /// only on backends with [`Capabilities::split_dns`](crate::Capabilities);
     /// otherwise [`DnsManager::apply`](crate::DnsManager::apply) returns
     /// [`Error::Unsupported`](crate::Error). The root domain (`.`) selects
-    /// the default route on backends that support it; macOS rejects it —
+    /// the default route on backends that support it; macOS rejects it -
     /// use [`DnsConfigBuilder::default_route`] there.
     pub fn routing_domains(&self) -> &[DnsSuffix] {
         &self.routing_domains

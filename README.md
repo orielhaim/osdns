@@ -1,5 +1,8 @@
 # osdns
 
+[![badge](https://shieldcn.dev/crates/osdns.svg)](https://crates.io/crates/osdns)
+[![badge](https://shieldcn.dev/badge/Read%20the%20Docs-abcde3.svg?variant=ghost&logo=readthedocs)](https://docs.rs/osdns)
+
 Transactional control of operating-system DNS configuration.
 
 `osdns` provides a Rust API for reading, applying, watching, reconciling, and restoring host DNS configuration on Linux, Windows, and macOS.

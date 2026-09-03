@@ -2,7 +2,7 @@
 //! DNS dictionaries.
 //!
 //! osdns only ever touches the `State:` (runtime) copy of a service's DNS
-//! settings — the `Setup:` (persisted) copy belongs to the user and to the
+//! settings - the `Setup:` (persisted) copy belongs to the user and to the
 //! system. The whole DNS dictionary is captured into a serializable value
 //! tree so that unrelated fields are preserved on apply and restored
 //! losslessly on restore.
