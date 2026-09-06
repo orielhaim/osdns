@@ -131,6 +131,7 @@ impl Reconciler {
             .remove(resource);
     }
 
+    #[cfg(feature = "test-util")]
     pub(crate) fn clear(&self) {
         self.pending
             .lock()
