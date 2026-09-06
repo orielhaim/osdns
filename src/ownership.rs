@@ -39,17 +39,21 @@ impl ResourceId {
         &self.0
     }
 
+    /// Filesystem escaping: `:` becomes `+`, which cannot appear in a
+    /// valid id, so distinct ids never share a slug. Callers append
+    /// [`ResourceId::stable_hash`] for uniqueness on case-insensitive
+    /// filesystems.
     pub(crate) fn slug(&self) -> String {
-        self.0
-            .chars()
-            .map(|c| {
-                if c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect()
+        self.0.replace(':', "+")
+    }
+
+    /// Stable content hash of this id. It covers the id only, never the
+    /// lock namespace, so every manager sharing a lock directory contends
+    /// on the same file.
+    pub(crate) fn stable_hash(&self) -> String {
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, self.0.as_bytes())
+            .simple()
+            .to_string()
     }
 }
 
@@ -113,11 +117,18 @@ impl<'de> Deserialize<'de> for ResourceId {
 
 const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// One lockable OS resource inside one ownership universe. The namespace
+/// identifies the mutated state (the global OS for real backends, one
+/// simulated instance per test fake); exclusion applies exactly when both
+/// match, independent of journal storage configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RegistryKey {
-    lock_dir: PathBuf,
+    namespace: String,
     resource: ResourceId,
 }
+
+/// Namespace for real operating-system resources: globally authoritative.
+pub(crate) const GLOBAL_LOCK_NAMESPACE: &str = "osdns:global-os";
 
 fn registry() -> MutexGuard<'static, Option<HashSet<RegistryKey>>> {
     static REGISTRY: Mutex<Option<HashSet<RegistryKey>>> = Mutex::new(None);
@@ -140,18 +151,30 @@ fn registry_remove(key: &RegistryKey) {
     }
 }
 
-/// Acquires and holds inter-process exclusive locks over DNS resources.
+/// Exclusive inter-process locks over DNS resources. The lock directory is
+/// independent of journal storage, so managers with different state
+/// directories still exclude each other on the same resource.
 #[derive(Debug)]
 pub(crate) struct ResourceLockManager {
     lock_dir: PathBuf,
     lock_timeout: Duration,
+    namespace: String,
 }
 
 impl ResourceLockManager {
     pub(crate) fn new(lock_dir: PathBuf, lock_timeout: Duration) -> Self {
+        Self::with_namespace(lock_dir, lock_timeout, GLOBAL_LOCK_NAMESPACE)
+    }
+
+    pub(crate) fn with_namespace(
+        lock_dir: PathBuf,
+        lock_timeout: Duration,
+        namespace: impl Into<String>,
+    ) -> Self {
         Self {
             lock_dir,
             lock_timeout,
+            namespace: namespace.into(),
         }
     }
 
@@ -160,8 +183,11 @@ impl ResourceLockManager {
     }
 
     pub(crate) fn acquire(&self, resource: &ResourceId) -> Result<ResourceLock> {
+        // Lazy so read-only manager use never requires lock-directory
+        // privileges; the first mutation creates it instead.
+        self.ensure_dir()?;
         let key = RegistryKey {
-            lock_dir: self.lock_dir.clone(),
+            namespace: self.namespace.clone(),
             resource: resource.clone(),
         };
         let file = self.open_lock_file(resource)?;
@@ -212,8 +238,9 @@ impl ResourceLockManager {
     }
 
     pub(crate) fn try_acquire(&self, resource: &ResourceId) -> Result<Option<ResourceLock>> {
+        self.ensure_dir()?;
         let key = RegistryKey {
-            lock_dir: self.lock_dir.clone(),
+            namespace: self.namespace.clone(),
             resource: resource.clone(),
         };
         if registry_contains(&key) {
@@ -231,7 +258,13 @@ impl ResourceLockManager {
     }
 
     fn open_lock_file(&self, resource: &ResourceId) -> Result<File> {
-        let path = self.lock_dir.join(format!("{}.lock", resource.slug()));
+        // The name excludes the ownership namespace so every manager
+        // sharing this directory contends on the same file.
+        let path = self.lock_dir.join(format!(
+            "{}-{}.lock",
+            resource.slug(),
+            resource.stable_hash()
+        ));
         match OpenOptions::new()
             .read(true)
             .write(true)
@@ -266,5 +299,31 @@ impl Drop for ResourceLock {
     fn drop(&mut self) {
         registry_remove(&self.key);
         let _ = self._file.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugs_and_hashes_are_collision_free() {
+        // Ids differing only in separator placement must never share a
+        // lock file.
+        let a = ResourceId::new("fake:a_b").unwrap();
+        let b = ResourceId::new("fake:a:b").unwrap();
+        assert_ne!(a.slug(), b.slug());
+        assert_ne!(a.stable_hash(), b.stable_hash());
+        assert_ne!(
+            format!("{}-{}.lock", a.slug(), a.stable_hash()),
+            format!("{}-{}.lock", b.slug(), b.stable_hash())
+        );
+    }
+
+    #[test]
+    fn windows_guid_resources_slug_without_collisions() {
+        let a = ResourceId::new("windows:interface:11111111-2222-3333-4444-555555555555").unwrap();
+        let b = ResourceId::new("windows:interface:11111111-2222-3333-4444-555555555556").unwrap();
+        assert_ne!(a.stable_hash(), b.stable_hash());
     }
 }

@@ -14,7 +14,7 @@ use crate::platform::PlatformSnapshot;
 
 /// Current journal schema. Records with any other version are rejected
 /// (fail-closed) rather than guessed at.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// The phase a journal record reached before its writer stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,7 +42,12 @@ pub(crate) struct JournalRecord {
 }
 
 fn record_file_name(lease_id: &Uuid, resource: &ResourceId) -> String {
-    format!("{}-{}.json", lease_id.simple(), resource.slug())
+    format!(
+        "{}-{}-{}.json",
+        lease_id.simple(),
+        resource.slug(),
+        resource.stable_hash()
+    )
 }
 
 fn record_path(dir: &Path, lease_id: &Uuid, resource: &ResourceId) -> PathBuf {

@@ -127,6 +127,12 @@ impl FakeDns {
     pub fn lie_once_on_readback(&self, state: FakeState) {
         self.backend.lie_once_on_readback(state);
     }
+
+    /// Arms the next `times` applies to mutate the resource and then fail,
+    /// modelling a backend that partially mutates before returning `Err`.
+    pub fn inject_partial_apply_failure(&self, times: u32) {
+        self.backend.inject_partial_apply_failure(times);
+    }
 }
 
 impl Default for FakeDns {
@@ -167,7 +173,12 @@ pub fn manager_for_testing_with_policy(
 ) -> Result<DnsManager> {
     use std::collections::HashMap;
     ensure_private_dir(state_dir)?;
-    let locks = ResourceLockManager::new(state_dir.join("locks"), lock_timeout);
+    // Namespaced by simulated OS instance, not by state dir.
+    let locks = ResourceLockManager::with_namespace(
+        state_dir.join("locks"),
+        lock_timeout,
+        fake.backend.lock_namespace().to_string(),
+    );
     locks.ensure_dir()?;
     let journal = JournalStore::open(state_dir.join("journal"))?;
     let backend: Arc<dyn Backend> = fake.backend.clone();

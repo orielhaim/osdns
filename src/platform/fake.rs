@@ -143,8 +143,22 @@ pub enum FakeOp {
 struct FakeInner {
     interfaces: Vec<InterfaceInfo>,
     states: BTreeMap<ResourceId, FakeState>,
+    /// Generation bumped on every mutation; snapshots carry the generation
+    /// they were captured at for atomic guarded operations.
+    generations: BTreeMap<ResourceId, u64>,
     failures: Vec<(FakeOp, u32, u32, String)>,
     readback_lie: Option<FakeState>,
+    /// Pending mutate-then-fail applies (see
+    /// [`FakeBackend::inject_partial_apply_failure`]).
+    partial_apply_failures: u32,
+}
+
+/// Wire format of a fake snapshot: the managed state plus the generation
+/// the snapshot was captured at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FakeSnapshotData {
+    state: FakeState,
+    generation: u64,
 }
 
 type WatchSlot = Option<(Arc<AtomicBool>, WatchCallback)>;
@@ -159,6 +173,9 @@ pub(crate) struct FakeBackend {
     caps: Capabilities,
     inner: Mutex<FakeInner>,
     watch_slot: Arc<Mutex<WatchSlot>>,
+    /// Ownership universe of this simulated OS instance, shared by every
+    /// manager built around the same [`crate::testing::FakeDns`].
+    namespace: String,
 }
 
 impl FakeBackend {
@@ -215,12 +232,19 @@ impl FakeBackend {
             inner: Mutex::new(FakeInner {
                 interfaces,
                 states,
+                generations: BTreeMap::new(),
                 failures: Vec::new(),
                 readback_lie: None,
+                partial_apply_failures: 0,
             }),
             watch_slot: Arc::new(Mutex::new(None)),
             multi_resource,
+            namespace: format!("osdns:fake:{}", uuid::Uuid::new_v4().simple()),
         }
+    }
+
+    pub(crate) fn lock_namespace(&self) -> &str {
+        &self.namespace
     }
 
     pub(crate) fn resolver_id(domain: &str) -> ResourceId {
@@ -242,10 +266,20 @@ impl FakeBackend {
     }
 
     pub(crate) fn external_change(&self, resource: &ResourceId, state: FakeState) {
-        self.lock_inner().states.insert(resource.clone(), state);
+        {
+            let mut inner = self.lock_inner();
+            inner.states.insert(resource.clone(), state);
+            *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+        }
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
         });
+    }
+
+    /// Makes the next `times` applies mutate the resource and then fail,
+    /// modelling a backend that partially mutates before returning `Err`.
+    pub(crate) fn inject_partial_apply_failure(&self, times: u32) {
+        self.lock_inner().partial_apply_failures += times;
     }
 
     pub(crate) fn external_remove(&self, resource: &ResourceId) -> bool {
@@ -332,17 +366,12 @@ impl FakeBackend {
     }
 
     fn snapshot_of(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let state = self
-            .lock_inner()
-            .states
-            .get(resource)
-            .cloned()
-            .ok_or_else(|| {
-                Error::BackendUnavailable(format!(
-                    "resource {resource} is not present on this system"
-                ))
-            })?;
-        let data = serde_json::to_value(&state).map_err(|e| {
+        let inner = self.lock_inner();
+        let state = inner.states.get(resource).cloned().ok_or_else(|| {
+            Error::BackendUnavailable(format!("resource {resource} is not present on this system"))
+        })?;
+        let generation = inner.generations.get(resource).copied().unwrap_or(0);
+        let data = serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
             Error::platform(
                 BackendKind::Fake,
                 format_args!("fake state serialization failed: {e}"),
@@ -356,6 +385,10 @@ impl FakeBackend {
     }
 
     fn interpret(&self, snapshot: &PlatformSnapshot) -> Result<FakeState> {
+        Ok(self.interpret_full(snapshot)?.state)
+    }
+
+    fn interpret_full(&self, snapshot: &PlatformSnapshot) -> Result<FakeSnapshotData> {
         if snapshot.backend != BackendKind::Fake {
             return Err(Error::platform(
                 BackendKind::Fake,
@@ -457,6 +490,15 @@ impl Backend for FakeBackend {
 
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
         self.check_failure(FakeOp::Apply)?;
+        let partial = {
+            let mut inner = self.lock_inner();
+            if inner.partial_apply_failures > 0 {
+                inner.partial_apply_failures -= 1;
+                true
+            } else {
+                false
+            }
+        };
         {
             let mut inner = self.lock_inner();
             let current = inner.states.get(resource).cloned().ok_or_else(|| {
@@ -469,10 +511,17 @@ impl Backend for FakeBackend {
             inner
                 .states
                 .insert(resource.clone(), merge_state(&current, plan));
+            *inner.generations.entry(resource.clone()).or_insert(0) += 1;
         }
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
         });
+        if partial {
+            return Err(Error::platform(
+                BackendKind::Fake,
+                format_args!("injected partial mutation before failure"),
+            ));
+        }
         Ok(ApplyReceipt {
             resource: resource.clone(),
         })
@@ -483,12 +532,19 @@ impl Backend for FakeBackend {
         let lie = self.lock_inner().readback_lie.take();
         match lie {
             Some(state) => {
-                let data = serde_json::to_value(&state).map_err(|e| {
-                    Error::platform(
-                        BackendKind::Fake,
-                        format_args!("fake state serialization failed: {e}"),
-                    )
-                })?;
+                let generation = self
+                    .lock_inner()
+                    .generations
+                    .get(resource)
+                    .copied()
+                    .unwrap_or(0);
+                let data =
+                    serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
+                        Error::platform(
+                            BackendKind::Fake,
+                            format_args!("fake state serialization failed: {e}"),
+                        )
+                    })?;
                 Ok(PlatformSnapshot::new(
                     BackendKind::Fake,
                     resource.clone(),
@@ -519,6 +575,110 @@ impl Backend for FakeBackend {
                 )));
             }
             inner.states.insert(resource.clone(), state);
+            *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+        }
+        self.notify(DnsEvent::ResourceChanged {
+            resource: resource.clone(),
+        });
+        Ok(())
+    }
+
+    /// Check and mutation happen under one lock acquisition.
+    fn apply_guarded(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> Result<ApplyReceipt> {
+        self.check_failure(FakeOp::Apply)?;
+        let expected_full = self.interpret_full(expected)?;
+        let partial = {
+            let mut inner = self.lock_inner();
+            let live_state = inner.states.get(resource).cloned().ok_or_else(|| {
+                Error::BackendUnavailable(format!(
+                    "resource {resource} is not present on this system"
+                ))
+            })?;
+            let live_generation = inner.generations.get(resource).copied().unwrap_or(0);
+            if live_generation != expected_full.generation {
+                return Err(Error::ExternalModification {
+                    resource: resource.clone(),
+                    detail:
+                        "the current state changed since ownership was verified (generation mismatch)"
+                            .to_string(),
+                });
+            }
+            if live_state != expected_full.state {
+                return Err(Error::ExternalModification {
+                    resource: resource.clone(),
+                    detail: "the current state is no longer the verified state".to_string(),
+                });
+            }
+            inner
+                .states
+                .insert(resource.clone(), merge_state(&live_state, plan));
+            *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+            if inner.partial_apply_failures > 0 {
+                inner.partial_apply_failures -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        self.notify(DnsEvent::ResourceChanged {
+            resource: resource.clone(),
+        });
+        if partial {
+            return Err(Error::platform(
+                BackendKind::Fake,
+                format_args!("injected partial mutation before failure"),
+            ));
+        }
+        Ok(ApplyReceipt {
+            resource: resource.clone(),
+        })
+    }
+
+    fn restore_guarded(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> Result<()> {
+        self.check_failure(FakeOp::Restore)?;
+        if expected.resource != *resource || target.resource != *resource {
+            return Err(Error::platform(
+                BackendKind::Fake,
+                format_args!("snapshot resource mismatch for {resource}"),
+            ));
+        }
+        let expected_full = self.interpret_full(expected)?;
+        let target_state = self.interpret(target)?;
+        {
+            let mut inner = self.lock_inner();
+            if !inner.states.contains_key(resource) {
+                return Err(Error::BackendUnavailable(format!(
+                    "resource {resource} is not present on this system"
+                )));
+            }
+            let live_generation = inner.generations.get(resource).copied().unwrap_or(0);
+            if live_generation != expected_full.generation {
+                return Err(Error::ExternalModification {
+                    resource: resource.clone(),
+                    detail:
+                        "the current state changed since ownership was verified (generation mismatch)"
+                            .to_string(),
+                });
+            }
+            let live_state = inner.states.get(resource).cloned().unwrap_or_default();
+            if live_state != expected_full.state {
+                return Err(Error::ExternalModification {
+                    resource: resource.clone(),
+                    detail: "the current state is no longer the verified state".to_string(),
+                });
+            }
+            inner.states.insert(resource.clone(), target_state);
+            *inner.generations.entry(resource.clone()).or_insert(0) += 1;
         }
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),

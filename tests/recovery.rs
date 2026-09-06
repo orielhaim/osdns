@@ -1,4 +1,5 @@
-//! Crash recovery and compare-before-restore.
+//! Crash recovery and guarded restoration: only verified state is ever
+//! acted on, and ambiguous state is reported without being mutated.
 #![cfg(feature = "test-util")]
 
 mod common;
@@ -42,8 +43,13 @@ fn crash_before_mutation_recovers_by_clearing_journal() {
     );
 }
 
+/// A crash once the mutation may have run leaves ambiguous state: the
+/// `Prepared` record carries no verified snapshot, and `current ==
+/// desired` alone never proves we applied it (an external actor may have
+/// independently produced the same state). Recovery reports a conflict
+/// and mutates nothing instead of overwriting possibly-external state.
 #[test]
-fn crash_after_apply_restores_original() {
+fn crash_after_apply_is_ambiguous_and_never_overwritten() {
     let fixture = new_fixture("recovery-applied");
     crash_apply(&fixture, TxPoint::AfterApply, "1.1.1.1");
     assert_eq!(
@@ -54,12 +60,49 @@ fn crash_after_apply_restores_original() {
     assert_eq!(journal_files(&fixture.dir).len(), 1);
 
     let outcomes = fixture.manager.recover_stale().unwrap();
-    assert!(matches!(&outcomes[0], RecoveryOutcome::Restored { .. }));
-    assert!(journal_files(&fixture.dir).is_empty());
+    assert!(
+        matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(osdns::testing::FakeState::Empty)
+        Some(state_with("1.1.1.1")),
+        "ambiguous state must be left untouched"
     );
+
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn prepared_crash_with_matching_external_state_is_conflict() {
+    let fixture = new_fixture("recovery-prepared-external");
+    crash_apply(&fixture, TxPoint::AfterPrepared, "1.1.1.1");
+
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(
+        matches!(&outcomes[..], [RecoveryOutcome::ExternalConflict { .. }]),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1")),
+        "the external state must win"
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
 }
 
 #[test]
@@ -82,7 +125,9 @@ fn crash_after_journal_applied_restores_original() {
 #[test]
 fn crash_is_recovered_implicitly_by_next_apply() {
     let fixture = new_fixture("recovery-implicit");
-    crash_apply(&fixture, TxPoint::AfterApply, "1.1.1.1");
+    // A pre-mutation crash is unambiguous (nothing of ours is on the OS),
+    // so the next apply clears it implicitly.
+    crash_apply(&fixture, TxPoint::AfterPrepared, "1.1.1.1");
 
     let lease = fixture.manager.apply(&iface_config(1, "8.8.8.8")).unwrap();
     assert_eq!(
@@ -151,35 +196,12 @@ fn external_change_during_crash_window_is_never_overwritten() {
         .unwrap();
 }
 
+/// A crash after an update mutation ran but before it verified leaves the
+/// new state unverified: it matches `desired` but no verified snapshot, so
+/// recovery reports a conflict instead of rolling back to the original and
+/// possibly overwriting an external actor's identical state.
 #[test]
-fn crash_during_update_with_old_state_still_recorded() {
-    let fixture = new_fixture("recovery-update-prepared");
-    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
-
-    let injector = FaultInjector::new();
-    injector.crash_at(TxPoint::AfterUpdatePrepared);
-    fixture.manager.install_fault_injector(injector.clone());
-    let outcome = osdns::testing::catch_crash(|| lease.update(&iface_config(1, "8.8.8.8")));
-    injector.clear();
-    assert!(matches!(outcome, CrashOutcome::Crashed));
-
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("1.1.1.1")),
-        "the update mutation had not started"
-    );
-
-    let outcomes = fixture.manager.recover_stale().unwrap();
-    assert!(matches!(&outcomes[0], RecoveryOutcome::Restored { .. }));
-    assert!(journal_files(&fixture.dir).is_empty());
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(osdns::testing::FakeState::Empty)
-    );
-}
-
-#[test]
-fn crash_during_update_after_mutation_restores_original() {
+fn crash_during_update_after_mutation_is_ambiguous() {
     let fixture = new_fixture("recovery-update-apply");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
 
@@ -197,17 +219,28 @@ fn crash_during_update_after_mutation_restores_original() {
     );
 
     let outcomes = fixture.manager.recover_stale().unwrap();
-    assert!(matches!(&outcomes[0], RecoveryOutcome::Restored { .. }));
+    assert!(
+        matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(osdns::testing::FakeState::Empty)
+        Some(state_with("8.8.8.8")),
+        "ambiguous update state must be left untouched"
     );
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
 }
 
 #[test]
 fn recovery_is_serialized_per_resource() {
     let fixture = new_fixture("recovery-two-resources");
-    crash_apply(&fixture, TxPoint::AfterApply, "1.1.1.1");
+    // Pre-mutation crash: unambiguous, so the stale resource is cleared
+    // while the live lease on the other resource is skipped.
+    crash_apply(&fixture, TxPoint::AfterPrepared, "1.1.1.1");
     let lease2 = fixture.manager.apply(&iface_config(2, "8.8.8.8")).unwrap();
 
     let outcomes = fixture.manager.recover_stale().unwrap();
@@ -215,12 +248,12 @@ fn recovery_is_serialized_per_resource() {
     let has_busy = outcomes.iter().any(
         |o| matches!(o, RecoveryOutcome::Busy { resource, .. } if resource == &resource_id(IFACE2)),
     );
-    let has_restored = outcomes
+    let has_cleared = outcomes
         .iter()
-        .any(|o| matches!(o, RecoveryOutcome::Restored { resource, .. } if resource == &resource_id(IFACE1)));
+        .any(|o| matches!(o, RecoveryOutcome::JournalCleared { resource, .. } if resource == &resource_id(IFACE1)));
     assert!(has_busy, "leased resource must be skipped: {outcomes:?}");
     assert!(
-        has_restored,
+        has_cleared,
         "stale resource must be recovered: {outcomes:?}"
     );
 

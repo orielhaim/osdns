@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use crate::config::{DnsConfig, validate_against};
 use crate::error::{ConflictReason, Error, Result};
-use crate::fault::TxPoint;
 use crate::journal::JournalRecord;
 use crate::manager::Inner;
 use crate::ownership::{ResourceId, ResourceLock};
@@ -19,14 +18,12 @@ pub(crate) struct LiveRecord {
     pub(crate) record: JournalRecord,
 }
 
-pub(crate) enum LeaseState {
-    Noop {
-        _locks: Vec<ResourceLock>,
-    },
-    Owned {
-        live: Vec<Arc<Mutex<LiveRecord>>>,
-        _locks: Vec<ResourceLock>,
-    },
+/// The live state of a [`Lease`]: shared journal records plus the
+/// inter-process locks held until the lease ends. `None` (the `Mutex` in
+/// [`Lease`] holding nothing) means the lease already ended.
+pub(crate) struct LiveLease {
+    live: Vec<Arc<Mutex<LiveRecord>>>,
+    _locks: Vec<ResourceLock>,
 }
 
 /// Exclusive, transactional ownership over DNS state.
@@ -74,38 +71,26 @@ pub(crate) enum LeaseState {
 pub struct Lease {
     inner: Arc<Inner>,
     resources: Vec<ResourceId>,
-    lease_id: Option<Uuid>,
+    lease_id: Uuid,
     is_noop: bool,
-    state: Mutex<Option<LeaseState>>,
+    state: Mutex<Option<LiveLease>>,
 }
 
 impl Lease {
-    pub(crate) fn new_noop(
-        inner: Arc<Inner>,
-        resources: Vec<ResourceId>,
-        locks: Vec<ResourceLock>,
-    ) -> Self {
-        Self {
-            inner,
-            resources,
-            lease_id: None,
-            is_noop: true,
-            state: Mutex::new(Some(LeaseState::Noop { _locks: locks })),
-        }
-    }
-
+    /// Creates a lease owning `records` under `lease_id`. `was_noop`
+    /// records whether the apply was a semantic no-op (desired already in
+    /// effect, so `applied == before` and nothing was mutated); the lease
+    /// is enforceable either way.
     pub(crate) fn new_owned(
         inner: Arc<Inner>,
+        lease_id: Uuid,
         records: Vec<JournalRecord>,
         locks: Vec<ResourceLock>,
+        was_noop: bool,
     ) -> Self {
         let mut resources = Vec::with_capacity(records.len());
         let mut live = Vec::with_capacity(records.len());
-        let mut lease_id = None;
         for record in records {
-            if lease_id.is_none() {
-                lease_id = Some(record.lease_id);
-            }
             resources.push(record.resource.clone());
             let shared = Arc::new(Mutex::new(LiveRecord { record }));
             inner.register_active(Arc::clone(&shared));
@@ -115,8 +100,8 @@ impl Lease {
             inner,
             resources,
             lease_id,
-            is_noop: false,
-            state: Mutex::new(Some(LeaseState::Owned {
+            is_noop: was_noop,
+            state: Mutex::new(Some(LiveLease {
                 live,
                 _locks: locks,
             })),
@@ -129,15 +114,17 @@ impl Lease {
         &self.resources
     }
 
-    /// The journal lease id, or `None` for a no-op lease (the desired state
-    /// was already in effect at apply time, so no journal record exists).
-    pub fn lease_id(&self) -> Option<Uuid> {
+    /// The journal lease id shared by every record this lease owns.
+    pub fn lease_id(&self) -> Uuid {
         self.lease_id
     }
 
-    /// Whether this lease owns nothing (the desired state was already in
-    /// effect at apply time). Restore and update on a no-op lease never
-    /// touch the system unless `update` transitions it into an owned lease.
+    /// Whether the apply was a semantic no-op (the desired state was
+    /// already in effect at apply time). A no-op lease is still a fully
+    /// owned, enforceable lease: it holds locks, journal records, and
+    /// active reconciliation state. Restore on a no-op lease clears the
+    /// journal without touching the system unless external changes arrived
+    /// (rebased or conflicting) in the meantime.
     pub fn is_noop(&self) -> bool {
         self.is_noop
     }
@@ -175,116 +162,55 @@ impl Lease {
                 reason: ConflictReason::LeaseNotActive,
             });
         };
-        match state {
-            LeaseState::Noop { _locks } => {
-                let wanted = match self.inner.backend.resolve_resources(config.scope(), &plan) {
-                    Ok(wanted) => wanted,
-                    Err(error) => {
-                        *guard = Some(LeaseState::Noop { _locks });
-                        return Err(error);
-                    }
-                };
-                let mut wanted_sorted = wanted.clone();
-                wanted_sorted.sort();
-                let mut owned_sorted = self.resources.clone();
-                owned_sorted.sort();
-                if wanted_sorted != owned_sorted {
-                    *guard = Some(LeaseState::Noop { _locks });
-                    return Err(Error::UpdateRequiresRebind {
-                        owned: owned_sorted,
-                        requested: wanted_sorted,
-                    });
-                }
-                self.inner.fire(TxPoint::AfterUpdateResolve)?;
-                let mut befores = Vec::with_capacity(self.resources.len());
-                for resource in self.resources.iter() {
-                    befores.push(self.inner.backend.capture(resource)?);
-                    self.inner.fire(TxPoint::AfterUpdateCapture)?;
-                }
-                let resources = self.resources.clone();
-                if resources
-                    .iter()
-                    .zip(&befores)
-                    .all(|(_resource, before)| self.inner.backend.matches_desired(before, &plan))
-                {
-                    self.inner.fire(TxPoint::AfterUpdateNoopCheck)?;
-                    *guard = Some(LeaseState::Noop { _locks });
-                    return Ok(());
-                }
-                match self.inner.transact_with_locks(resources, &plan, befores) {
-                    Ok(records) => {
-                        let shared = self.inner.share_records(records);
-                        // A no-op lease becoming owned starts Enforce
-                        // observation when required.
-                        if let Err(error) = self.inner.ensure_enforce_watch() {
-                            *guard = Some(LeaseState::Noop { _locks });
-                            return Err(error);
-                        }
-                        *guard = Some(LeaseState::Owned {
-                            live: shared,
-                            _locks,
-                        });
-                        Ok(())
-                    }
-                    Err(error) => {
-                        *guard = Some(LeaseState::Noop { _locks });
-                        Err(error)
-                    }
-                }
+        let LiveLease { live, _locks } = state;
+        let repack = |live: Vec<Arc<Mutex<LiveRecord>>>| LiveLease { live, _locks };
+        let wanted = match self.inner.backend.resolve_resources(config.scope(), &plan) {
+            Ok(wanted) => wanted,
+            Err(error) => {
+                *guard = Some(repack(live));
+                return Err(error);
             }
-            LeaseState::Owned { live, _locks } => {
-                let wanted = match self.inner.backend.resolve_resources(config.scope(), &plan) {
-                    Ok(wanted) => wanted,
-                    Err(error) => {
-                        *guard = Some(LeaseState::Owned { live, _locks });
-                        return Err(error);
-                    }
-                };
-                let mut wanted_sorted = wanted;
-                wanted_sorted.sort();
-                let mut owned_sorted: Vec<ResourceId> = live
-                    .iter()
-                    .map(|record| {
-                        record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .record
-                            .resource
-                            .clone()
-                    })
-                    .collect();
-                owned_sorted.sort();
-                if wanted_sorted != owned_sorted {
-                    *guard = Some(LeaseState::Owned { live, _locks });
-                    return Err(Error::UpdateRequiresRebind {
-                        owned: owned_sorted,
-                        requested: wanted_sorted,
-                    });
-                }
-                // Hold every per-resource token for the whole transaction in
-                // sorted order so reconciliation and concurrent updates
-                // cannot interleave with it.
-                let mut ordered: Vec<ResourceId> = owned_sorted.clone();
-                ordered.sort();
-                let tokens: Vec<std::sync::Arc<std::sync::Mutex<()>>> = ordered
-                    .iter()
-                    .map(|resource| self.inner.lease_token(resource))
-                    .collect();
-                let token_guards: Vec<_> = tokens
-                    .iter()
-                    .map(|token| {
-                        token
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    })
-                    .collect();
-                let result = self.inner.transact_update(&live, &plan);
-                drop(token_guards);
-                drop(tokens);
-                *guard = Some(LeaseState::Owned { live, _locks });
-                result
-            }
+        };
+        let mut wanted_sorted = wanted;
+        wanted_sorted.sort();
+        let mut owned_sorted: Vec<ResourceId> = live
+            .iter()
+            .map(|record| {
+                record
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record
+                    .resource
+                    .clone()
+            })
+            .collect();
+        owned_sorted.sort();
+        if wanted_sorted != owned_sorted {
+            *guard = Some(repack(live));
+            return Err(Error::UpdateRequiresRebind {
+                owned: owned_sorted,
+                requested: wanted_sorted,
+            });
         }
+        // Hold every per-resource token for the whole transaction so
+        // reconciliation and concurrent updates cannot interleave with it.
+        let tokens: Vec<std::sync::Arc<std::sync::Mutex<()>>> = owned_sorted
+            .iter()
+            .map(|resource| self.inner.lease_token(resource))
+            .collect();
+        let token_guards: Vec<_> = tokens
+            .iter()
+            .map(|token| {
+                token
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect();
+        let result = self.inner.transact_update(&live, &plan);
+        drop(token_guards);
+        drop(tokens);
+        *guard = Some(repack(live));
+        result
     }
 
     /// Restores the pre-lease state and ends the lease.
@@ -295,7 +221,9 @@ impl Lease {
     /// journal record, and the first failure is reported through
     /// [`RestoreFailure`] together with the still-usable lease so it can be
     /// retried or explicitly given up with [`Lease::abandon`]. A no-op lease
-    /// restores trivially without touching the system.
+    /// (desired already in effect) restores trivially by clearing its
+    /// journal without touching the system, unless an external change
+    /// arrived meanwhile.
     ///
     /// ```no_run
     /// # use osdns::{DnsConfig, DnsManager, DnsScope, InterfaceSelector};
@@ -337,47 +265,29 @@ impl Lease {
                 reason: ConflictReason::LeaseNotActive,
             });
         };
-        match state {
-            LeaseState::Noop { _locks } => {
+        let LiveLease { live, _locks } = state;
+        let mut first_error = None;
+        for record in &live {
+            self.inner.with_live_record(record, |resource, journal| {
+                match self.inner.restore_lease_state(journal) {
+                    Ok(()) => self.inner.unregister_active(resource),
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            });
+        }
+        match first_error {
+            None => {
                 drop(_locks);
                 self.inner.release_enforce_watch();
                 Ok(())
             }
-            LeaseState::Owned { live, _locks } => {
-                let mut first_error = None;
-                for record in &live {
-                    let resource = record
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .record
-                        .resource
-                        .clone();
-                    let token = self.inner.lease_token(&resource);
-                    let _token_guard = token
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    let record = record
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if let Err(error) = self.inner.restore_lease_state(&record.record) {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    } else {
-                        self.inner.unregister_active(&resource);
-                    }
-                }
-                match first_error {
-                    None => {
-                        drop(_locks);
-                        self.inner.release_enforce_watch();
-                        Ok(())
-                    }
-                    Some(error) => {
-                        *guard = Some(LeaseState::Owned { live, _locks });
-                        Err(error)
-                    }
-                }
+            Some(error) => {
+                *guard = Some(LiveLease { live, _locks });
+                Err(error)
             }
         }
     }
@@ -394,46 +304,24 @@ impl Lease {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(state) = guard.take() {
-            match state {
-                LeaseState::Noop { _locks } => {
-                    drop(_locks);
-                }
-                LeaseState::Owned { live, _locks } => {
-                    let mut failure = None;
-                    for record in &live {
-                        let resource = record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .record
-                            .resource
-                            .clone();
-                        let token = self.inner.lease_token(&resource);
-                        let _token_guard = token
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let record = record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if failure.is_none()
-                            && let Err(error) = self
-                                .inner
-                                .journal
-                                .remove(&record.record.lease_id, &resource)
-                        {
-                            failure = Some(error);
-                        }
-                        self.inner.unregister_active(&resource);
+        if let Some(LiveLease { live, _locks }) = guard.take() {
+            let mut failure = None;
+            for record in &live {
+                self.inner.with_live_record(record, |resource, journal| {
+                    if failure.is_none()
+                        && let Err(error) = self.inner.journal.remove(&journal.lease_id, resource)
+                    {
+                        failure = Some(error);
                     }
-                    drop(_locks);
-                    if let Some(error) = failure {
-                        self.inner.release_enforce_watch();
-                        return Err(error);
-                    }
-                }
+                    self.inner.unregister_active(resource);
+                });
             }
-            // Every live lease (no-op or owned) holds one Enforce reference.
+            drop(_locks);
+            // Every live lease holds one Enforce reference.
             self.inner.release_enforce_watch();
+            if let Some(error) = failure {
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -483,37 +371,19 @@ impl fmt::Debug for Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(state) = self
+        if let Some(LiveLease { live, _locks }) = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take()
         {
-            match state {
-                LeaseState::Noop { _locks } => {
-                    drop(_locks);
-                }
-                LeaseState::Owned { live, _locks } => {
-                    for record in &live {
-                        let resource = record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .record
-                            .resource
-                            .clone();
-                        let token = self.inner.lease_token(&resource);
-                        let _token_guard = token
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let record = record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        self.inner.best_effort_restore(&record.record);
-                        self.inner.unregister_active(&resource);
-                    }
-                    drop(_locks);
-                }
+            for record in &live {
+                self.inner.with_live_record(record, |resource, journal| {
+                    self.inner.best_effort_restore(journal);
+                    self.inner.unregister_active(resource);
+                });
             }
+            drop(_locks);
             self.inner.release_enforce_watch();
         }
     }

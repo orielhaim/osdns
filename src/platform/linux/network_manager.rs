@@ -150,9 +150,9 @@ impl NetworkManager {
         Ok((device, name))
     }
 
-    fn applied(&self, device: &NmDeviceProxyBlocking) -> Result<OwnedSettings> {
-        let (settings, _version) = device.get_applied_connection(0).map_err(dbus_error)?;
-        Ok(settings)
+    fn applied(&self, device: &NmDeviceProxyBlocking) -> Result<(OwnedSettings, u64)> {
+        let (settings, version) = device.get_applied_connection(0).map_err(dbus_error)?;
+        Ok((settings, version))
     }
 
     fn with_dns_fields(settings: &mut Settings, fields: &NmDnsFields, set_priority: bool) {
@@ -202,11 +202,23 @@ impl NetworkManager {
     }
 
     fn reapply(&self, device: &NmDeviceProxyBlocking, settings: Settings) -> Result<()> {
+        self.reapply_versioned(device, settings, 0)
+    }
+
+    /// Reapplies with an expected `version_id` for compare-and-swap. A
+    /// non-zero version asks NetworkManager to reject the call when the
+    /// applied connection changed underneath us.
+    fn reapply_versioned(
+        &self,
+        device: &NmDeviceProxyBlocking,
+        settings: Settings,
+        version: u64,
+    ) -> Result<()> {
         let mut attempts = 0;
         loop {
-            match device.reapply(settings.clone(), 0, 0) {
+            match device.reapply(settings.clone(), version, 0) {
                 Ok(_result) => return Ok(()),
-                Err(error) if attempts + 1 < REAPPLY_ATTEMPTS => {
+                Err(error) if attempts + 1 < REAPPLY_ATTEMPTS && version == 0 => {
                     attempts += 1;
                     thread::sleep(REAPPLY_BACKOFF);
                     let _ = error;
@@ -219,9 +231,13 @@ impl NetworkManager {
     fn to_platform_snapshot(
         resource: &ResourceId,
         fields: &NmDnsFields,
+        version: u64,
     ) -> Result<PlatformSnapshot> {
-        let data = serde_json::to_value(fields)
-            .map_err(|e| Error::platform(BackendKind::NetworkManager, format_args!("{e}")))?;
+        let data = serde_json::to_value(&NmSnapshotData {
+            fields: fields.clone(),
+            version,
+        })
+        .map_err(|e| Error::platform(BackendKind::NetworkManager, format_args!("{e}")))?;
         Ok(PlatformSnapshot::new(
             BackendKind::NetworkManager,
             resource.clone(),
@@ -230,12 +246,76 @@ impl NetworkManager {
     }
 
     fn fields_from_snapshot(snapshot: &PlatformSnapshot) -> Result<NmDnsFields> {
+        Ok(Self::snapshot_data(snapshot)?.fields)
+    }
+
+    fn snapshot_data(snapshot: &PlatformSnapshot) -> Result<NmSnapshotData> {
         serde_json::from_value(snapshot.data.clone()).map_err(|e| {
             Error::platform(
                 BackendKind::NetworkManager,
                 format_args!("snapshot data cannot be interpreted: {e}"),
             )
         })
+    }
+
+    fn version_from_snapshot(snapshot: &PlatformSnapshot) -> u64 {
+        Self::snapshot_data(snapshot)
+            .map(|d| d.version)
+            .unwrap_or(0)
+    }
+
+    /// Reads the live applied connection and refuses when it no longer
+    /// matches the verified `expected` snapshot. Returns the live settings
+    /// and the expected version for the caller to reapply under.
+    fn guarded_baseline(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+    ) -> Result<(NmDeviceProxyBlocking<'_>, OwnedSettings, u64)> {
+        let expected_fields = Self::fields_from_snapshot(expected)?;
+        let expected_version = Self::version_from_snapshot(expected);
+        let (device, _name) = self.device_for_resource(resource)?;
+        let (live_settings, live_version) = self.applied(&device)?;
+        if parse_nm_dns_fields(&convert_settings(&live_settings)) != expected_fields {
+            return Err(Error::ExternalModification {
+                resource: resource.clone(),
+                detail: "the NetworkManager connection changed since ownership was verified"
+                    .to_string(),
+            });
+        }
+        if expected_version != 0 && live_version != expected_version {
+            return Err(Error::ExternalModification {
+                resource: resource.clone(),
+                detail: format!(
+                    "the NetworkManager applied connection changed (version {expected_version} -> {live_version}); refusing to overwrite it"
+                ),
+            });
+        }
+        Ok((device, live_settings, expected_version))
+    }
+
+    /// Maps a versioned reapply failure to a conflict when the connection
+    /// version moved underneath the call.
+    fn map_reapply_error(
+        &self,
+        resource: &ResourceId,
+        device: &NmDeviceProxyBlocking<'_>,
+        expected_version: u64,
+        operation: &str,
+        error: Error,
+    ) -> Error {
+        if expected_version != 0
+            && let Ok((_, now)) = self.applied(device)
+            && now != expected_version
+        {
+            return Error::ExternalModification {
+                resource: resource.clone(),
+                detail: format!(
+                    "the NetworkManager applied connection changed during {operation} (version {expected_version} -> {now}); refusing to overwrite it"
+                ),
+            };
+        }
+        error
     }
 
     fn ifname_of(resource: &ResourceId) -> Result<String> {
@@ -256,6 +336,15 @@ fn dbus_error(error: zbus::Error) -> Error {
         backend: BackendKind::NetworkManager,
         message: error.to_string(),
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct NmSnapshotData {
+    fields: crate::platform::text_config::NmDnsFields,
+    /// `version_id` from `GetAppliedConnection` at capture time. `0`
+    /// carries no compare-and-swap token, so guarded operations using it
+    /// fall back to field comparison.
+    version: u64,
 }
 
 fn capabilities(dns_mode: &str) -> Capabilities {
@@ -329,7 +418,7 @@ impl Backend for NetworkManager {
             )),
             DnsScope::Interface(_) => {
                 let (device, name) = self.device_for(scope)?;
-                let applied = self.applied(&device)?;
+                let (applied, _) = self.applied(&device)?;
                 if extract_uuid(&to_owned_static(&applied)).is_none() {
                     return Err(Error::BackendUnavailable(format!(
                         "interface {name} has no active connection"
@@ -346,13 +435,15 @@ impl Backend for NetworkManager {
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         let (device, _name) = self.device_for_resource(resource)?;
-        let fields = parse_nm_dns_fields(&convert_settings(&self.applied(&device)?));
-        Self::to_platform_snapshot(resource, &fields)
+        let (settings, version) = self.applied(&device)?;
+        let fields = parse_nm_dns_fields(&convert_settings(&settings));
+        Self::to_platform_snapshot(resource, &fields, version)
     }
 
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
         let (device, _name) = self.device_for_resource(resource)?;
-        let mut settings = to_owned_static(&self.applied(&device)?);
+        let (applied, _) = self.applied(&device)?;
+        let mut settings = to_owned_static(&applied);
         let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
         Self::with_dns_fields(&mut settings, &fields, false);
         self.reapply(&device, settings)?;
@@ -363,17 +454,59 @@ impl Backend for NetworkManager {
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         let (device, _name) = self.device_for_resource(resource)?;
-        let fields = parse_nm_dns_fields(&convert_settings(&self.applied(&device)?));
-        Self::to_platform_snapshot(resource, &fields)
+        let (settings, version) = self.applied(&device)?;
+        let fields = parse_nm_dns_fields(&convert_settings(&settings));
+        Self::to_platform_snapshot(resource, &fields, version)
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
         let before = Self::fields_from_snapshot(snapshot)?;
         let (device, _name) = self.device_for_resource(resource)?;
-        let mut settings = to_owned_static(&self.applied(&device)?);
+        let (applied, _) = self.applied(&device)?;
+        let mut settings = to_owned_static(&applied);
         Self::with_dns_fields(&mut settings, &before, true);
         self.reapply(&device, settings)?;
         Ok(())
+    }
+
+    fn apply_guarded(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> Result<ApplyReceipt> {
+        let (device, live_settings, expected_version) =
+            self.guarded_baseline(resource, expected)?;
+        let mut settings = to_owned_static(&live_settings);
+        let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
+        Self::with_dns_fields(&mut settings, &fields, false);
+        match self.reapply_versioned(&device, settings, expected_version) {
+            Ok(()) => Ok(ApplyReceipt {
+                resource: resource.clone(),
+            }),
+            Err(error) => {
+                Err(self.map_reapply_error(resource, &device, expected_version, "apply", error))
+            }
+        }
+    }
+
+    fn restore_guarded(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> Result<()> {
+        let before = Self::fields_from_snapshot(target)?;
+        let (device, live_settings, expected_version) =
+            self.guarded_baseline(resource, expected)?;
+        let mut settings = to_owned_static(&live_settings);
+        Self::with_dns_fields(&mut settings, &before, true);
+        match self.reapply_versioned(&device, settings, expected_version) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                Err(self.map_reapply_error(resource, &device, expected_version, "restore", error))
+            }
+        }
     }
 
     fn validate_plan(&self, _scope: &DnsScope, plan: &NormalizedConfig) -> Result<()> {

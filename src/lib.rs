@@ -53,8 +53,12 @@
 //! # Leases
 //!
 //! [`DnsManager::apply`] returns a [`Lease`]. The lease owns every OS resource
-//! modified by that operation and holds the corresponding inter-process locks
-//! for its lifetime.
+//! covered by that operation — including resources where the desired state
+//! was already in effect, which still get journal records, live state, and
+//! reconciliation — and holds the corresponding inter-process locks for its
+//! lifetime. Inter-process locks live in a global system location
+//! independent of journal storage, so custom state directories never create
+//! private ownership universes.
 //!
 //! [`Lease::restore`] is the canonical way to end a lease. Dropping a lease
 //! performs best-effort restoration, but correctness never depends on `Drop`:
@@ -67,12 +71,19 @@
 //!
 //! # Safe restoration
 //!
-//! Restoration is compare-before-restore per resource. The current state is
-//! only overwritten when it still matches the state the lease applied (or the
-//! original state, in which case nothing needs to happen). Otherwise
-//! [`Error::ExternalModification`] is returned, nothing is mutated, and the
-//! lease remains usable so the caller can retry or call
-//! [`Lease::abandon`] to leave the external state untouched.
+//! Restoration is guarded compare-and-restore per resource. The read-back
+//! used for the ownership decision is the expectation for the restore,
+//! so backends with native generation or
+//! version semantics (NetworkManager's applied-connection `version_id`,
+//! the test backend's generation counter) close the check/restore window
+//! atomically; other backends fail instead of overwriting on doubt. The
+//! current state is only overwritten when it still matches the verified
+//! applied snapshot (or the original state, in which case nothing needs to
+//! happen). A state that merely matches the desired configuration proves
+//! nothing by itself. Otherwise [`Error::ExternalModification`] is
+//! returned, nothing is mutated, and the lease remains usable so the caller
+//! can retry or call [`Lease::abandon`] to leave the external state
+//! untouched.
 //!
 //! # Crash recovery
 //!
@@ -86,10 +97,14 @@
 //! A process crash may release an OS lock without removing its journal.
 //! [`DnsManager::recover_stale`] inspects records left behind by crashed or
 //! exited processes and recovers them where it is safe to do so. Recovery
-//! never guesses ownership: when current state matches neither the recorded
-//! applied state nor the original state, the resource is reported as
-//! [`RecoveryOutcome::ExternalConflict`] and left untouched. Unknown or
-//! corrupt journal formats fail closed with [`Error::JournalCorrupt`].
+//! never guesses ownership: only a verified applied snapshot (or the
+//! original state) authorizes action. In particular, an unverified
+//! `Prepared` record whose current state merely matches the desired
+//! configuration proves nothing — the crash may predate the mutation while
+//! an external actor independently produced that state — so the resource is
+//! reported as [`RecoveryOutcome::ExternalConflict`] and left untouched.
+//! Unknown or corrupt journal formats fail closed with
+//! [`Error::JournalCorrupt`].
 //!
 //! # Validation guarantee
 //!

@@ -22,10 +22,10 @@
 //! An externally modified base is adopted with a full journal transaction:
 //! capture the stable external base → persist/fsync `Prepared` with the new
 //! base → apply the overlay → read back and verify → persist `Applied`. On
-//! mutation, read-back, or verification failure the pass rolls back safely to
-//! the new external base and defers; a crash between `Prepared` and `Applied`
-//! makes recovery roll the overlay back to the external base, which is
-//! exactly the never-overwrite-external-state invariant.
+//! failure the pass rolls back to the new external base and defers. A
+//! `Prepared` record without a verified snapshot never authorizes recovery
+//! on its own: the live reconciler may finalize it via read-back while the
+//! lease is held, but orphaned crash recovery reports a conflict.
 //!
 //! A feedback-loop circuit breaker bounds rebase attempts per resource; while
 //! it is open, reconciliation is deferred (not dropped) until the cooldown
@@ -195,6 +195,28 @@ impl Inner {
             .remove(resource);
     }
 
+    /// Runs `f` with one live record locked against reconciliation: the
+    /// per-resource token is held for the whole call so a reconcile pass
+    /// cannot interleave with lease teardown or updates.
+    pub(crate) fn with_live_record(
+        &self,
+        live: &Arc<Mutex<LiveRecord>>,
+        f: impl FnOnce(&ResourceId, &JournalRecord),
+    ) {
+        let resource = live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record
+            .resource
+            .clone();
+        let token = self.lease_token(&resource);
+        let _token_guard = token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&resource, &guard.record);
+    }
+
     pub(crate) fn reconcile_resource(
         &self,
         resource: &ResourceId,
@@ -320,7 +342,6 @@ impl Inner {
             }
         }
 
-        // Still ours: the event came from our own mutation.
         if let Some(applied) = &record.applied
             && self.backend.equivalent(&second, applied)
         {
@@ -333,7 +354,13 @@ impl Inner {
         // Overlay missing but base intact: a plain reapply, no rebase needed.
         if self.backend.equivalent(&second, &record.before) {
             self.suppressions.suppress(resource);
-            match self.mutate_and_verify(resource, &record.desired, Some(&second), INITIAL_POINTS) {
+            match self.mutate_and_verify(
+                resource,
+                &second,
+                &record.desired,
+                Some(&second),
+                INITIAL_POINTS,
+            ) {
                 Ok(actual) => {
                     record.applied = Some(actual);
                     record.phase = Phase::Applied;
@@ -373,9 +400,12 @@ impl Inner {
     /// 3. read back and verify;
     /// 4. persist `Applied` with the verified snapshot.
     ///
-    /// On any failure the pass rolls back to `external_base` and defers. A
-    /// crash between steps 1 and 4 leaves a `Prepared` record whose recovery
-    /// restores `external_base`, never the pre-rebase overlay.
+    /// On any failure the pass rolls back to `external_base` via a guarded
+    /// restore and defers, keeping the external base even when the rollback
+    /// itself fails. A crash between steps 1 and 4 leaves an unverified
+    /// `Prepared` record: the live pass finalizes it on its next read-back,
+    /// while orphaned crash recovery reports a conflict rather than
+    /// restoring on unproven ownership.
     #[allow(unused_variables)]
     fn rebase_transaction(
         &self,
@@ -405,8 +435,13 @@ impl Inner {
             return ReconcileOutcome::Deferred;
         }
 
+        // `external_base` is the fresh stability read adopted as the new
+        // base: it is both the rollback target and the expectation for the
+        // guarded forward apply.
+        let expected = external_base.clone();
         match self.mutate_and_verify(
             resource,
+            &expected,
             &record.desired,
             Some(external_base),
             INITIAL_POINTS,

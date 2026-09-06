@@ -135,16 +135,6 @@ impl std::fmt::Debug for EnforceState {
 const COALESCE_WINDOW: Duration = Duration::from_millis(50);
 
 impl Inner {
-    pub(crate) fn share_records(&self, records: Vec<JournalRecord>) -> Vec<Arc<Mutex<LiveRecord>>> {
-        let mut live = Vec::with_capacity(records.len());
-        for record in records {
-            let shared = Arc::new(Mutex::new(LiveRecord { record }));
-            self.register_active(Arc::clone(&shared));
-            live.push(shared);
-        }
-        live
-    }
-
     /// Starts internal Enforce observation when the first lease becomes
     /// active. Fails honestly with [`Error::Unsupported`] when the backend
     /// cannot watch, instead of silently behaving cooperatively.
@@ -297,21 +287,39 @@ impl Inner {
         Ok(())
     }
 
+    /// Applies `plan` and verifies by read-back.
+    ///
+    /// `expected_current` is the caller's fresh ownership read: the forward
+    /// mutation is issued as a guarded apply against it, so backends with
+    /// atomic compare-and-swap refuse to overwrite a concurrent external
+    /// change instead of silently winning the race.
+    ///
+    /// An `Err` from the apply means indeterminate state (the backend may
+    /// have partially mutated before failing), never proof that nothing
+    /// changed. Every failure path therefore reads back and attempts a
+    /// guarded rollback to `rollback_to` before returning; the journal
+    /// record is always kept by the caller for later recovery.
     pub(crate) fn mutate_and_verify(
         &self,
         resource: &ResourceId,
+        expected_current: &PlatformSnapshot,
         plan: &NormalizedConfig,
         rollback_to: Option<&PlatformSnapshot>,
         points: MutatePoints,
     ) -> Result<PlatformSnapshot> {
         self.suppressions.suppress(resource);
-        let _receipt = self.backend.apply(resource, plan)?;
+        if let Err(error) = self.backend.apply_guarded(resource, expected_current, plan) {
+            if let Some(target) = rollback_to {
+                self.attempt_rollback(resource, None, target);
+            }
+            return Err(error);
+        }
         self.fire(points.apply)?;
         let actual = match self.backend.readback(resource) {
             Ok(actual) => actual,
             Err(error) => {
                 if let Some(target) = rollback_to {
-                    self.attempt_rollback(resource, target);
+                    self.attempt_rollback(resource, None, target);
                 }
                 return Err(error);
             }
@@ -319,7 +327,7 @@ impl Inner {
         self.fire(points.readback)?;
         if !self.backend.matches_desired(&actual, plan) {
             if let Some(target) = rollback_to {
-                self.attempt_rollback(resource, target);
+                self.attempt_rollback(resource, Some(&actual), target);
             }
             return Err(Error::VerificationFailed {
                 resource: resource.clone(),
@@ -332,55 +340,113 @@ impl Inner {
         Ok(actual)
     }
 
+    /// Best-effort rollback to `target` after a failed mutation, using a
+    /// held read-back when the caller has one and a fresh read otherwise.
+    /// Never fails: journals are always retained for
+    /// [`DnsManager::recover_stale`].
     #[allow(unused_variables)]
-    fn attempt_rollback(&self, resource: &ResourceId, target: &PlatformSnapshot) {
-        let current = match self.backend.readback(resource) {
-            Ok(current) => current,
-            Err(error) => {
-                osdns_warn!(
-                    resource = %resource,
-                    error = %error,
-                    "rollback after failed verification could not read back the current state"
-                );
-                return;
-            }
+    fn attempt_rollback(
+        &self,
+        resource: &ResourceId,
+        current: Option<&PlatformSnapshot>,
+        target: &PlatformSnapshot,
+    ) {
+        let current = match current {
+            Some(current) => current.clone(),
+            None => match self.backend.readback(resource) {
+                Ok(current) => current,
+                Err(error) => {
+                    osdns_warn!(
+                        resource = %resource,
+                        error = %error,
+                        "rollback could not read back the current state; the journal record was kept for later recovery"
+                    );
+                    return;
+                }
+            },
         };
-        if self.backend.equivalent(&current, target) {
-            return;
+        if !self.rollback_guarded(resource, &current, target) {
+            osdns_warn!(
+                resource = %resource,
+                "rollback did not restore the previous state; the journal record was kept for later recovery"
+            );
         }
-        if let Err(error) = self.backend.restore(resource, target) {
+    }
+
+    /// Guarded rollback to `target`, expecting `current`. Returns whether
+    /// the resource reads back as `target` afterwards.
+    #[allow(unused_variables)]
+    fn rollback_guarded(
+        &self,
+        resource: &ResourceId,
+        current: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> bool {
+        if self.backend.equivalent(current, target) {
+            return true;
+        }
+        if let Err(error) = self.backend.restore_guarded(resource, current, target) {
             osdns_warn!(
                 resource = %resource,
                 error = %error,
-                "rollback after failed verification could not restore the previous state"
+                "rollback could not restore the previous state; the journal record was kept for later recovery"
             );
-            return;
+            return false;
         }
         match self.backend.readback(resource) {
-            Ok(now) if self.backend.equivalent(&now, target) => {}
-            Ok(_) => {
-                osdns_warn!(
-                    resource = %resource,
-                    "rollback after failed verification did not read back as the previous state"
-                );
-            }
+            Ok(now) => self.backend.equivalent(&now, target),
             Err(error) => {
                 osdns_warn!(
                     resource = %resource,
                     error = %error,
-                    "rollback after failed verification could not read back the restored state"
+                    "rollback could not read back the restored state; the journal record was kept for later recovery"
                 );
+                false
             }
         }
     }
 
+    /// Runs one apply transaction over already-locked resources.
+    ///
+    /// Returns the journal records plus whether the transaction was a
+    /// semantic no-op (every `before` already expressed the plan). No-ops
+    /// persist `Applied` records with `applied == before` and never touch
+    /// the OS, but the returned lease is otherwise a fully owned,
+    /// enforceable lease: it holds live records, active registration, and
+    /// a lease id.
     pub(crate) fn transact_with_locks(
         &self,
         resources: Vec<ResourceId>,
         plan: &NormalizedConfig,
         befores: Vec<PlatformSnapshot>,
-    ) -> Result<Vec<JournalRecord>> {
+    ) -> Result<(Uuid, Vec<JournalRecord>, bool)> {
         let lease_id = Uuid::new_v4();
+        let was_noop = resources
+            .iter()
+            .zip(&befores)
+            .all(|(_resource, before)| self.backend.matches_desired(before, plan));
+        if was_noop {
+            let records: Vec<JournalRecord> = resources
+                .into_iter()
+                .zip(befores)
+                .map(|(resource, before)| JournalRecord {
+                    schema_version: SCHEMA_VERSION,
+                    owner: self.owner.clone(),
+                    lease_id,
+                    resource,
+                    backend: self.backend.kind(),
+                    phase: Phase::Applied,
+                    before: before.clone(),
+                    desired: plan.clone(),
+                    applied: Some(before),
+                })
+                .collect();
+            for record in &records {
+                self.journal.write(record)?;
+            }
+            self.fire(TxPoint::AfterApplied)?;
+            return Ok((lease_id, records, true));
+        }
         let mut records: Vec<JournalRecord> = resources
             .into_iter()
             .zip(befores)
@@ -402,8 +468,10 @@ impl Inner {
         self.fire(TxPoint::AfterPrepared)?;
         let mut actuals: Vec<PlatformSnapshot> = Vec::new();
         for index in 0..records.len() {
+            let expected = records[index].before.clone();
             match self.mutate_and_verify(
                 &records[index].resource,
+                &expected,
                 plan,
                 Some(&records[index].before),
                 INITIAL_POINTS,
@@ -429,37 +497,28 @@ impl Inner {
             self.journal.write(record)?;
         }
         self.fire(TxPoint::AfterApplied)?;
-        Ok(records)
+        Ok((lease_id, records, false))
     }
 
+    /// Rolls one `Prepared` record back to its captured `before` state,
+    /// removing the journal on success and keeping it for recovery on
+    /// failure.
     #[allow(unused_variables)]
     fn revert_record(&self, record: &JournalRecord) {
         self.suppressions.suppress(&record.resource);
-        if let Err(error) = self.backend.restore(&record.resource, &record.before) {
-            osdns_warn!(
-                resource = %record.resource,
-                error = %error,
-                "transaction rollback could not restore the previous state; the journal record was kept for later recovery"
-            );
-            return;
-        }
-        match self.backend.readback(&record.resource) {
-            Ok(current) if self.backend.equivalent(&current, &record.before) => {
-                let _ = self.journal.remove(&record.lease_id, &record.resource);
-            }
-            Ok(_) => {
-                osdns_warn!(
-                    resource = %record.resource,
-                    "transaction rollback did not read back as the previous state; the journal record was kept for later recovery"
-                );
-            }
+        let current = match self.backend.readback(&record.resource) {
+            Ok(current) => current,
             Err(error) => {
                 osdns_warn!(
                     resource = %record.resource,
                     error = %error,
-                    "transaction rollback could not read back the restored state; the journal record was kept for later recovery"
+                    "transaction rollback could not read the current state; the journal record was kept for later recovery"
                 );
+                return;
             }
+        };
+        if self.rollback_guarded(&record.resource, &current, &record.before) {
+            let _ = self.journal.remove(&record.lease_id, &record.resource);
         }
     }
 
@@ -543,19 +602,41 @@ impl Inner {
             }
         }
         self.fire(TxPoint::AfterUpdatePrepared)?;
-        // Mutate each resource; on failure roll back the earlier ones to
-        // their immediately previous applied state and restore journals.
+        // On failure every touched resource (including the failed one)
+        // rolls back to its previous applied state; journals are then
+        // restored to their pre-update form.
         let mut actuals: Vec<Option<PlatformSnapshot>> = vec![None; live.len()];
         for index in 0..live.len() {
             let resource = olds[index].resource.clone();
-            match self.mutate_and_verify(&resource, plan, Some(&applieds[index]), UPDATE_POINTS) {
+            let expected = currents[index].clone();
+            match self.mutate_and_verify(
+                &resource,
+                &expected,
+                plan,
+                Some(&applieds[index]),
+                UPDATE_POINTS,
+            ) {
                 Ok(actual) => actuals[index] = Some(actual),
                 Err(error) => {
-                    for (rollback_index, old) in olds.iter().enumerate().take(index) {
+                    for rollback_index in 0..=index {
+                        let old = &olds[rollback_index];
                         let resource = &old.resource;
                         self.suppressions.suppress(resource);
-                        if self.backend.readback(resource).is_ok() {
-                            let _ = self.backend.restore(resource, &applieds[rollback_index]);
+                        let current = match self.backend.readback(resource) {
+                            Ok(current) => current,
+                            Err(_) => continue,
+                        };
+                        // Untouched resources already equal their previous
+                        // applied state; only moved ones need a rollback.
+                        let moved = actuals[rollback_index].is_some()
+                            || (rollback_index == index
+                                && !self.backend.equivalent(&current, &applieds[rollback_index]));
+                        if moved {
+                            self.attempt_rollback(
+                                resource,
+                                Some(&current),
+                                &applieds[rollback_index],
+                            );
                         }
                     }
                     self.fire(TxPoint::AfterUpdateVerify).ok();
@@ -589,6 +670,9 @@ impl Inner {
         Ok(())
     }
 
+    /// Restores one live-lease resource to its `before` snapshot, failing
+    /// with [`Error::ExternalModification`] when the current state is no
+    /// longer the verified applied state.
     pub(crate) fn restore_lease_state(&self, record: &JournalRecord) -> Result<()> {
         let resource = &record.resource;
         self.suppressions.suppress(resource);
@@ -599,18 +683,22 @@ impl Inner {
             self.fire(TxPoint::AfterRestoreJournal)?;
             return Ok(());
         }
-        let applied_ours = record
-            .applied
-            .as_ref()
-            .is_some_and(|applied| self.backend.equivalent(&current, applied));
-        if !applied_ours {
+        // Only a verified applied snapshot proves ownership; a state that
+        // merely matches the desired configuration does not.
+        let applied = record.applied.as_ref().ok_or_else(|| Error::ExternalModification {
+            resource: resource.clone(),
+            detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
+                .to_string(),
+        })?;
+        if !self.backend.equivalent(&current, applied) {
             return Err(Error::ExternalModification {
                 resource: resource.clone(),
                 detail: "the current state is neither the state applied by this lease nor the original state"
                     .to_string(),
             });
         }
-        self.backend.restore(resource, &record.before)?;
+        self.backend
+            .restore_guarded(resource, &current, &record.before)?;
         self.fire(TxPoint::AfterRestoreRestore)?;
         let now = self.backend.readback(resource)?;
         if !self.backend.equivalent(&now, &record.before) {
@@ -636,6 +724,11 @@ impl Inner {
         }
     }
 
+    /// Crash recovery for one journal record. Only verified state is acted
+    /// on: `current == before` clears the record, and `current == applied`
+    /// restores the original. Anything else (including an unverified
+    /// `Prepared` record whose state merely matches `desired`) reports
+    /// `ExternalConflict` without mutating.
     fn recover_record(&self, record: JournalRecord) -> Result<RecoveryOutcome> {
         let resource = record.resource.clone();
         let current = self.backend.capture(&resource)?;
@@ -648,13 +741,24 @@ impl Inner {
                 lease_id: record.lease_id,
             });
         }
-        let applied_ours = record
+        let verified = record
             .applied
             .as_ref()
             .is_some_and(|applied| self.backend.equivalent(&current, applied));
-        if applied_ours || self.backend.matches_desired(&current, &record.desired) {
+        if verified {
             self.suppressions.suppress(&resource);
-            self.backend.restore(&resource, &record.before)?;
+            if let Err(error) = self
+                .backend
+                .restore_guarded(&resource, &current, &record.before)
+            {
+                if error.is_external_modification() {
+                    return Ok(RecoveryOutcome::ExternalConflict {
+                        resource,
+                        lease_id: record.lease_id,
+                    });
+                }
+                return Err(error);
+            }
             self.fire(TxPoint::AfterRecoveryRestore)?;
             let now = self.backend.readback(&resource)?;
             if !self.backend.equivalent(&now, &record.before) {
@@ -861,14 +965,20 @@ impl DnsManager {
     }
 
     /// Applies `config` transactionally and returns a [`Lease`] owning the
-    /// mutated resources.
+    /// resources.
+    ///
+    /// Every lease owns journal records and live reconciliation state, even
+    /// when the desired state is already in effect: a no-op apply persists
+    /// `Applied` records with `applied == before` instead of mutating, so
+    /// an [`ConflictPolicy::Enforce`] lease over pre-existing desired state
+    /// is still an enforceable ownership state with active reconciliation.
     ///
     /// The sequence is: resolve resources, acquire exclusive inter-process
     /// locks in sorted order (so multi-resource leases cannot deadlock),
     /// recover stale journals for those resources, capture current state,
-    /// return a no-op [`Lease`] when the desired state is already in effect,
-    /// otherwise persist `Prepared` records, mutate and verify each resource
-    /// by read-back (attempting rollback on failure), persist `Applied`
+    /// persist `Prepared` records (or `Applied` directly for the no-op
+    /// fast path), mutate and verify each resource by read-back
+    /// (attempting guarded rollback on failure), persist `Applied`
     /// records, and return the lease holding the locks.
     ///
     /// The operation is atomic per resource, not across resources: when a
@@ -921,23 +1031,14 @@ impl DnsManager {
             befores.push(self.inner.backend.capture(resource)?);
             self.inner.fire(TxPoint::AfterCapture)?;
         }
-        if resources
-            .iter()
-            .zip(&befores)
-            .all(|(_resource, before)| self.inner.backend.matches_desired(before, &plan))
-        {
-            self.inner.fire(TxPoint::AfterNoopDecision)?;
-            let lease = Lease::new_noop(self.inner.clone(), resources, locks);
-            self.inner.ensure_enforce_watch()?;
-            return Ok(lease);
-        }
+        self.inner.fire(TxPoint::AfterNoopDecision)?;
         match self.inner.transact_with_locks(resources, &plan, befores) {
-            Ok(records) => {
-                let lease = Lease::new_owned(self.inner.clone(), records, locks);
+            Ok((lease_id, records, was_noop)) => {
+                let lease =
+                    Lease::new_owned(self.inner.clone(), lease_id, records, locks, was_noop);
                 if let Err(error) = self.inner.ensure_enforce_watch() {
-                    // Enforce observation is required to claim the lease;
-                    // fail honestly instead of handing out an unenforced one.
-                    // Best-effort restore; the ensure error is what matters.
+                    // Best-effort restore; dropping the lease on failure
+                    // still cleans up its registry, journals, and refcount.
                     let _ = lease.restore();
                     return Err(error);
                 }
@@ -1006,11 +1107,12 @@ impl DnsManager {
     ///
     /// Resources locked by an active lease (in this or another process) are
     /// reported as [`RecoveryOutcome::Busy`] and left untouched. Records whose
-    /// current state matches the applied overlay are restored to the original
-    /// state; records already at the original state are simply cleared; records
-    /// matching neither are reported as
-    /// [`RecoveryOutcome::ExternalConflict`] and kept. On any parse failure
-    /// or unknown schema version the call fails closed with
+    /// current state still matches their verified applied snapshot are
+    /// restored to the original state; records already at the original state
+    /// are simply cleared; anything else — including unverified `Prepared`
+    /// records whose state merely matches the desired configuration — is
+    /// reported as [`RecoveryOutcome::ExternalConflict`] and kept. On any
+    /// parse failure or unknown schema version the call fails closed with
     /// [`Error::JournalCorrupt`] and mutates nothing.
     pub fn recover_stale(&self) -> Result<Vec<RecoveryOutcome>> {
         self.inner.recover_stale()
@@ -1148,15 +1250,19 @@ impl DnsManagerBuilder {
         self
     }
 
-    /// Overrides the directory used for journals and resource locks.
+    /// Overrides the directory used for the durable journal.
     ///
     /// Defaults to a platform-appropriate system location (`/var/lib/osdns`
     /// on Linux, `PROGRAMDATA\osdns` on Windows, `/Library/Application
     /// Support/osdns` on macOS). The directory is created on
     /// [`DnsManagerBuilder::build`] and secured against unprivileged
     /// modification; failure surfaces as [`Error::RequiresPrivilege`] or
-    /// [`Error::Io`]. All managers sharing one directory share lock and
-    /// journal state, including across processes.
+    /// [`Error::Io`].
+    ///
+    /// Journal storage never defines the ownership universe: inter-process
+    /// resource locks live in a global system location independent of this
+    /// setting, so two managers with different state directories still
+    /// exclude each other on the same OS resource.
     pub fn state_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(dir.into());
         self
@@ -1201,8 +1307,13 @@ impl DnsManagerBuilder {
             None => default_state_dir()?,
         };
         ensure_private_dir(&state_dir)?;
-        let locks = ResourceLockManager::new(state_dir.join("locks"), self.lock_timeout);
-        locks.ensure_dir()?;
+        // Locks are globally authoritative per OS resource, independent of
+        // journal storage: a custom state_dir must never create a private
+        // ownership universe. The directory is created lazily on first
+        // lock acquisition so read-only flows never require its
+        // privileges.
+        let global_lock_dir = default_state_dir()?.join("locks");
+        let locks = ResourceLockManager::new(global_lock_dir, self.lock_timeout);
         let journal = JournalStore::open(state_dir.join("journal"))?;
         let backend = select_default_backend(&owner)?;
         if self.conflict_policy == ConflictPolicy::Enforce && !backend.capabilities().watch {

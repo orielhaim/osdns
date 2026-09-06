@@ -233,21 +233,34 @@ fn rebase_is_transactional_across_crash() {
     let record = journal_record_json(&fixture.dir);
     assert_eq!(record["phase"], "Prepared");
     assert_eq!(
-        record["before"]["data"]["Configured"]["nameservers"][0], "9.9.9.9",
+        record["before"]["data"]["state"]["Configured"]["nameservers"][0], "9.9.9.9",
         "the Prepared record must carry the external base, not the old one"
     );
 
-    // Recovery (as a fresh process would do) must roll the uncommitted
-    // overlay back to the external base - never to the old base.
+    // Recovery (as a fresh process would do) sees an unverified `Prepared`
+    // record whose state merely matches `desired`: that never proves we
+    // applied it (an external actor could have produced it), so recovery
+    // reports a conflict and mutates nothing instead of rolling back to
+    // the external base on unproven ownership. The live reconciler (which
+    // holds the lease) may still finalize the same state via read-back;
+    // orphaned crash state may not.
     drop(lease);
     let outcomes = fixture.manager.recover_stale().unwrap();
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-    assert!(matches!(&outcomes[0], RecoveryOutcome::Restored { .. }));
+    assert!(
+        matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }),
+        "{outcomes:?}"
+    );
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("9.9.9.9")),
-        "recovery must restore the external base, never overwrite it"
+        Some(state_with("1.1.1.1")),
+        "ambiguous rebase state must be left untouched"
     );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
@@ -276,7 +289,7 @@ fn rebase_journal_write_failure_defers_and_preserves_external_state() {
     let record = journal_record_json(&fixture.dir);
     assert_eq!(record["phase"], "Applied");
     assert_eq!(
-        record["applied"]["data"]["Configured"]["nameservers"][0],
+        record["applied"]["data"]["state"]["Configured"]["nameservers"][0],
         "1.1.1.1"
     );
 
@@ -289,7 +302,7 @@ fn rebase_journal_write_failure_defers_and_preserves_external_state() {
     );
     let record = journal_record_json(&fixture.dir);
     assert_eq!(
-        record["before"]["data"]["Configured"]["nameservers"][0],
+        record["before"]["data"]["state"]["Configured"]["nameservers"][0],
         "9.9.9.9"
     );
     lease.restore().unwrap();
@@ -329,7 +342,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
     let record = journal_record_json(&fixture.dir);
     assert_eq!(record["phase"], "Prepared");
     assert_eq!(
-        record["before"]["data"]["Configured"]["nameservers"][0],
+        record["before"]["data"]["state"]["Configured"]["nameservers"][0],
         "9.9.9.9"
     );
 
@@ -340,6 +353,9 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
         );
         lease.restore().unwrap();
     } else {
+        // Orphaned crash recovery (no live lease) must not roll an
+        // unverified overlay back on proof-less matching: conflict, keep
+        // the journal, leave the OS untouched.
         drop(lease);
         drop(fixture.manager);
         let recovered = manager_for_testing(
@@ -351,9 +367,16 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
         .unwrap();
         let outcomes = recovered.recover_stale().unwrap();
         assert!(
-            matches!(&outcomes[..], [RecoveryOutcome::Restored { .. }]),
+            matches!(&outcomes[..], [RecoveryOutcome::ExternalConflict { .. }]),
             "{outcomes:?}"
         );
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(state_with("1.1.1.1")),
+            "orphaned ambiguous state must be left untouched"
+        );
+        recovered.abandon_journal(&resource_id(IFACE1)).unwrap();
+        return;
     }
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -410,7 +433,7 @@ fn events_during_defer_windows_are_pending_never_dropped() {
     );
     let record = journal_record_json(&fixture.dir);
     assert_eq!(
-        record["before"]["data"]["Configured"]["nameservers"][0], "8.8.8.8",
+        record["before"]["data"]["state"]["Configured"]["nameservers"][0], "8.8.8.8",
         "the rebased journal base must track the latest external state"
     );
 
@@ -419,4 +442,66 @@ fn events_during_defer_windows_are_pending_never_dropped() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("8.8.8.8"))
     );
+}
+
+#[test]
+fn enforce_reconciles_initial_noop_lease() {
+    let fixture = enforce_manager("enforce-initial-noop");
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    assert!(lease.is_noop());
+    assert_eq!(
+        journal_record_json(&fixture.dir)["lease_id"]
+            .as_str()
+            .unwrap(),
+        lease.lease_id().to_string()
+    );
+    fixture.manager.suspend_enforce_background();
+
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Rebased
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
+fn enforce_observation_balances_noop_lifetime() {
+    let fixture = enforce_manager("enforce-noop-refs");
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    assert_eq!(fixture.manager.debug_enforce_refs(), 0);
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    assert!(lease.is_noop());
+    assert_eq!(fixture.manager.debug_enforce_refs(), 1);
+    assert!(fixture.manager.debug_enforce_watching());
+    lease.restore().unwrap();
+    assert_eq!(fixture.manager.debug_enforce_refs(), 0);
+    assert!(!fixture.manager.debug_enforce_watching());
+
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    assert_eq!(fixture.manager.debug_enforce_refs(), 1);
+    lease.abandon().unwrap();
+    assert_eq!(fixture.manager.debug_enforce_refs(), 0);
+    assert!(!fixture.manager.debug_enforce_watching());
+    assert!(journal_files(&fixture.dir).is_empty());
 }

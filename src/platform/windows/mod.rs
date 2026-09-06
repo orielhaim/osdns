@@ -134,6 +134,11 @@ impl WindowsBackend {
         })
     }
 
+    /// Applies both stacks in sequence. When the second call fails the
+    /// first stack may already be mutated: per the backend apply contract
+    /// the error means indeterminate state, and the transaction engine
+    /// always reads back and rolls back under guard rather than assuming
+    /// nothing changed.
     fn apply_interface(&self, guid: &GUID, state: &InterfaceState) -> Result<()> {
         for (ipv6_stack, nameservers, search) in [
             (false, &state.ipv4_nameservers, &state.ipv4_search),

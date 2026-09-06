@@ -21,7 +21,7 @@ fn prepared_record_persisted_before_mutation() {
     injector.clear();
 
     let record = journal_record_json(&fixture.dir);
-    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["schema_version"], 2);
     assert_eq!(record["owner"], "io.osdns.test");
     assert_eq!(record["resource"], IFACE1);
     assert_eq!(record["backend"], "fake");
@@ -37,7 +37,7 @@ fn applied_record_persisted_after_verification() {
     let record = journal_record_json(&fixture.dir);
     assert_eq!(record["phase"], "Applied");
     assert_eq!(
-        record["applied"]["data"]["Configured"]["nameservers"][0],
+        record["applied"]["data"]["state"]["Configured"]["nameservers"][0],
         "1.1.1.1"
     );
     lease.restore().unwrap();
@@ -104,7 +104,7 @@ fn unknown_schema_fails_closed() {
 fn unknown_phase_fails_closed() {
     let fixture = new_fixture("journal-phase");
     let record = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "owner": "someone.else",
         "lease_id": "11111111-2222-3333-4444-555555555555",
         "resource": IFACE1,

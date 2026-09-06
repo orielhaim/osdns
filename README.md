@@ -364,42 +364,6 @@ Exposes the in-memory backend and fault-injection utilities used to test applica
 
 It is intended for tests, not production builds.
 
-## Testing
-
-The transaction engine is tested independently of the OS through an in-memory backend with failure injection.
-
-The test suite covers, among other cases:
-
-* crashes between transaction phases;
-* journal write failures;
-* failed rollback;
-* external modification during a lease;
-* multi-process ownership;
-* stale lease recovery;
-* concurrent resource acquisition;
-* event storms;
-* DHCP-style file replacement;
-* reconciliation rebasing;
-* watcher suppression;
-* Windows NRPT ownership;
-* macOS scoped resolver lifecycle.
-
-Real backend integration tests run on Linux, Windows, and macOS.
-
-CI also checks:
-
-```text
-cargo test
-cargo clippy
-cargo fmt
-cargo doc
-cargo audit
-cargo deny
-cargo hack
-```
-
-The declared MSRV is tested separately.
-
 ## MSRV
 
 The minimum supported Rust version is:
@@ -407,8 +371,6 @@ The minimum supported Rust version is:
 ```text
 1.89
 ```
-
-The crate uses Rust edition 2024.
 
 ## Safety
 

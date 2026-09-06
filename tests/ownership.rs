@@ -41,6 +41,31 @@ fn different_resources_are_independent() {
 }
 
 #[test]
+fn separate_state_dirs_share_one_ownership_universe() {
+    let dir_a = temp_dir("locks-dirs-a");
+    let dir_b = temp_dir("locks-dirs-b");
+    let fake = osdns::testing::FakeDns::new();
+    let manager_a =
+        manager_for_testing("io.osdns.a", &dir_a, &fake, Duration::from_secs(30)).unwrap();
+    let manager_b =
+        manager_for_testing("io.osdns.b", &dir_b, &fake, Duration::from_millis(120)).unwrap();
+
+    let lease = manager_a.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    let err = manager_b.apply(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(
+        matches!(err, Error::Conflict { .. } | Error::Timeout { .. }),
+        "journal storage must not define the ownership universe: {err:?}"
+    );
+    lease.restore().unwrap();
+
+    manager_b
+        .apply(&iface_config(1, "8.8.8.8"))
+        .unwrap()
+        .restore()
+        .unwrap();
+}
+
+#[test]
 fn second_manager_on_same_state_dir_conflicts() {
     let dir = temp_dir("locks-two-managers");
     let fake = osdns::testing::FakeDns::new();

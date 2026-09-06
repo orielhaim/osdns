@@ -147,6 +147,9 @@ impl SystemdResolved {
         })
     }
 
+    /// Three D-Bus calls; a later failure may leave earlier ones applied.
+    /// The error means indeterminate state per the backend apply contract;
+    /// the engine reads back and rolls back under guard on every apply error.
     fn apply_snapshot(&self, ifindex: u32, snapshot: &ResolvedSnapshot) -> Result<()> {
         let manager = self.manager()?;
         manager

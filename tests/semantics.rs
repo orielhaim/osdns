@@ -392,7 +392,7 @@ fn update_failure_during_rollback_keeps_recoverable_journal() {
         let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(record["phase"], "Applied");
         assert_eq!(
-            record["applied"]["data"]["Configured"]["nameservers"][0],
+            record["applied"]["data"]["state"]["Configured"]["nameservers"][0],
             "1.1.1.1"
         );
     }

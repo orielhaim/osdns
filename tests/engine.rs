@@ -55,7 +55,7 @@ fn global_scope_works() {
 }
 
 #[test]
-fn semantic_noop_apply_owns_nothing() {
+fn semantic_noop_apply_is_owned_and_enforceable() {
     let fixture = new_fixture("engine-noop");
     fixture
         .fake
@@ -63,9 +63,16 @@ fn semantic_noop_apply_owns_nothing() {
         .unwrap();
 
     let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    // A no-op apply still owns the resource: journal records (applied ==
+    // before) keyed by the lease id, plus live reconciliation state, so
+    // Enforce leases over pre-existing desired state are enforceable.
     assert!(lease.is_noop());
-    assert!(lease.lease_id().is_none());
-    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(
+        journal_record_json(&fixture.dir)["lease_id"]
+            .as_str()
+            .unwrap(),
+        lease.lease_id().to_string()
+    );
 
     lease.restore().unwrap();
     assert_eq!(
@@ -73,6 +80,7 @@ fn semantic_noop_apply_owns_nothing() {
         Some(state_with("1.1.1.1")),
         "no-op lease restore must not change anything"
     );
+    assert!(journal_files(&fixture.dir).is_empty());
 }
 
 #[test]
@@ -329,4 +337,59 @@ fn removed_interface_is_reported() {
     assert!(fixture.fake.external_remove(IFACE2).unwrap());
     let missing = fixture.manager.snapshot(&iface_scope(2)).unwrap_err();
     assert!(matches!(missing, Error::InvalidConfig(_)));
+}
+
+#[test]
+fn noop_lease_updates_without_rebind() {
+    let fixture = new_fixture("engine-noop-update");
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    assert!(lease.is_noop());
+
+    lease.update(&config(1, "8.8.8.8")).unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("8.8.8.8"))
+    );
+
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1")),
+        "restore returns to the base captured by the no-op apply"
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn partial_apply_failure_rolls_back_without_journal_leak() {
+    let fixture = new_fixture("engine-partial-apply");
+    fixture.fake.inject_partial_apply_failure(1);
+    let err = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap_err();
+    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(FakeState::Empty),
+        "the partial mutation must have been rolled back"
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn partial_update_failure_rolls_back_failed_resource() {
+    let fixture = new_fixture("engine-partial-update");
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    fixture.fake.inject_partial_apply_failure(1);
+    let err = lease.update(&config(1, "8.8.8.8")).unwrap_err();
+    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1")),
+        "the failed resource must roll back to its previous applied state"
+    );
+    lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
 }

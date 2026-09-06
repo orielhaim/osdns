@@ -104,12 +104,12 @@ struct Runner {
 }
 
 impl Runner {
+    /// Mirrors production recovery exactly: only verified state counts.
+    /// `current == desired` alone never proves ownership.
     fn recover_decision(&self, rec: &Rec) -> RecDecision {
         if self.model.current == rec.before {
             RecDecision::Cleared
-        } else if rec.applied.as_ref() == Some(&self.model.current)
-            || self.model.current == rec.desired
-        {
+        } else if rec.applied.as_ref() == Some(&self.model.current) {
             RecDecision::Restored
         } else {
             RecDecision::Conflict
@@ -137,9 +137,16 @@ impl Runner {
             }
         }
         if self.model.current == plan_state(plan) {
+            // Semantic no-op, but still a fully owned lease: journal with
+            // applied == before.
             let lease = self.fixture.manager.apply(&plan_config(plan)).unwrap();
             assert!(lease.is_noop(), "step {step}");
             self.model.lease = Some(LeaseM::Noop);
+            self.model.journal = Some(Rec {
+                before: self.model.current.clone(),
+                desired: plan_state(plan),
+                applied: Some(plan_state(plan)),
+            });
             self.live = Some(lease);
         } else {
             let before = self.model.current.clone();
@@ -181,7 +188,22 @@ impl Runner {
             }
             Op::Update(plan) => match self.model.lease.clone().expect("lease") {
                 LeaseM::Noop => {
-                    if self.model.current == plan_state(plan) {
+                    // A no-op lease owns applied == before == original
+                    // state. An external change since apply breaks the
+                    // update exactly like an owned lease.
+                    let rec = self.model.journal.clone().expect("journal");
+                    if self.model.current != rec.before {
+                        let error = self
+                            .live
+                            .as_ref()
+                            .unwrap()
+                            .update(&plan_config(plan))
+                            .unwrap_err();
+                        assert!(
+                            error.is_external_modification(),
+                            "step {step}: expected external modification, got {error:?}"
+                        );
+                    } else if self.model.current == plan_state(plan) {
                         self.live
                             .as_ref()
                             .unwrap()
@@ -252,9 +274,30 @@ impl Runner {
             }
             Op::Restore => match self.model.lease.clone().expect("lease") {
                 LeaseM::Noop => {
-                    self.live.take().unwrap().restore().unwrap();
-                    self.model.lease = None;
-                    assert!(self.model.journal.is_none(), "step {step}");
+                    // No-op leases own Applied records with applied ==
+                    // before: restore clears the journal without mutation
+                    // unless an external change arrived meanwhile.
+                    if self.model.journal.is_none() {
+                        self.live.take().unwrap().restore().unwrap();
+                        self.model.lease = None;
+                        return;
+                    }
+                    let rec = self.model.journal.clone().expect("journal");
+                    if self.model.current == rec.before {
+                        self.live.take().unwrap().restore().unwrap();
+                        self.model.journal = None;
+                        self.model.lease = None;
+                    } else {
+                        let lease = self.live.take().unwrap();
+                        let failure = lease.restore().unwrap_err();
+                        assert!(
+                            failure.error.is_external_modification(),
+                            "step {step}: {failure:?}"
+                        );
+                        failure.lease.abandon().unwrap();
+                        self.model.journal = None;
+                        self.model.lease = None;
+                    }
                 }
                 LeaseM::Owned { before, applied } => {
                     if self.model.current == applied {
@@ -285,16 +328,24 @@ impl Runner {
             Op::Abandon => {
                 let lease = self.live.take().expect("lease");
                 lease.abandon().unwrap();
-                if matches!(self.model.lease, Some(LeaseM::Owned { .. })) {
-                    self.model.journal = None;
-                }
+                // Every lease (including no-op leases) owns a journal.
+                self.model.journal = None;
                 self.model.lease = None;
             }
             Op::DropLease => {
                 let lease = self.live.take().expect("lease");
                 drop(lease);
                 match self.model.lease.take().expect("lease") {
-                    LeaseM::Noop => {}
+                    LeaseM::Noop => {
+                        // Best-effort drop restore clears the no-op journal
+                        // when the state is still ours; otherwise it is
+                        // kept for recovery. The model journals the
+                        // outcome the same way production does.
+                        let rec = self.model.journal.clone().expect("journal");
+                        if self.model.current == rec.before {
+                            self.model.journal = None;
+                        }
+                    }
                     LeaseM::Owned { before, applied } => {
                         if self.model.current == applied {
                             self.model.current = before;
@@ -316,6 +367,11 @@ impl Runner {
                     let lease = self.fixture.manager.apply(&plan_config(plan)).unwrap();
                     assert!(lease.is_noop(), "step {step}");
                     self.model.lease = Some(LeaseM::Noop);
+                    self.model.journal = Some(Rec {
+                        before: self.model.current.clone(),
+                        desired: plan_state(plan),
+                        applied: Some(plan_state(plan)),
+                    });
                     self.live = Some(lease);
                     self.assert_invariants(step);
                     return;
@@ -405,7 +461,10 @@ impl Runner {
             Op::Recover => {
                 let outcomes = self.fixture.manager.recover_stale().unwrap();
                 match (&self.model.lease, &self.model.journal) {
-                    (Some(LeaseM::Owned { .. }), Some(_)) => {
+                    // Any live lease holds its locks: recovery skips.
+                    // No-op leases own journals too, so they are Busy
+                    // like every other live lease.
+                    (Some(_), Some(_)) => {
                         assert!(
                             outcomes
                                 .iter()
@@ -413,7 +472,7 @@ impl Runner {
                             "step {step}: {outcomes:?}"
                         );
                     }
-                    (Some(LeaseM::Noop), None) => {
+                    (Some(_), None) => {
                         assert!(outcomes.is_empty(), "step {step}: {outcomes:?}");
                     }
                     (None, None) => {
@@ -447,9 +506,6 @@ impl Runner {
                                 );
                             }
                         }
-                    }
-                    (lease, journal) => {
-                        unreachable!("step {step}: impossible model state {lease:?} / {journal:?}")
                     }
                 }
             }

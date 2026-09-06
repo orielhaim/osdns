@@ -112,23 +112,42 @@ fn crash_between_resources_recovers_every_resource(#[case] point: TxPoint) {
         .iter()
         .filter(|o| matches!(o, RecoveryOutcome::JournalCleared { .. }))
         .count();
+    let conflicts = outcomes
+        .iter()
+        .filter(|o| matches!(o, RecoveryOutcome::ExternalConflict { .. }))
+        .count();
     match point {
         TxPoint::AfterPrepared => {
-            assert_eq!((restored, cleared), (0, 3), "{outcomes:?}")
+            // Nothing mutated yet: every record clears.
+            assert_eq!((restored, cleared, conflicts), (0, 3, 0), "{outcomes:?}");
+            assert!(journal_files(&fixture.dir).is_empty());
+            assert_eq!(
+                fixture.fake.current_state(IFACE1).unwrap(),
+                Some(osdns::testing::FakeState::Empty)
+            );
         }
         TxPoint::AfterApply => {
-            assert_eq!((restored, cleared), (1, 2), "{outcomes:?}")
+            // The first resource may have mutated under an unverified
+            // `Prepared` record: ambiguous, so it conflicts and its
+            // journal is kept, while the untouched resources clear.
+            // `current == desired` alone never proves ownership.
+            assert_eq!((restored, cleared, conflicts), (0, 2, 1), "{outcomes:?}");
+            assert_eq!(journal_files(&fixture.dir).len(), 1);
+            fixture
+                .manager
+                .abandon_journal(&resource_id(IFACE1))
+                .unwrap();
         }
         TxPoint::AfterApplied => {
-            assert_eq!((restored, cleared), (3, 0), "{outcomes:?}")
+            assert_eq!((restored, cleared, conflicts), (3, 0, 0), "{outcomes:?}");
+            assert!(journal_files(&fixture.dir).is_empty());
+            assert_eq!(
+                fixture.fake.current_state(IFACE1).unwrap(),
+                Some(osdns::testing::FakeState::Empty)
+            );
         }
         _ => unreachable!("apply crash phase"),
     }
-    assert!(journal_files(&fixture.dir).is_empty());
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(osdns::testing::FakeState::Empty)
-    );
 }
 
 #[test]

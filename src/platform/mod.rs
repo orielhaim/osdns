@@ -76,10 +76,36 @@ pub(crate) trait Backend: Send + Sync {
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;
 
     /// Applies `plan` to `resource`. Must be idempotent when possible.
+    ///
+    /// # Partial-mutation contract
+    ///
+    /// A backend may perform several native mutations to express one plan
+    /// (for example separate IPv4 and IPv6 calls). When any step fails the
+    /// backend returns `Err`, but the resource may already be partially
+    /// mutated: callers must treat an `Err` return as indeterminate state,
+    /// never as proof that nothing changed. The transaction engine always
+    /// reads back and rolls back after an apply failure; backends must not
+    /// rely on callers assuming atomicity.
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt>;
 
     /// Reads the state back after a mutation for verification.
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;
+
+    /// Applies `plan`, but only while the current state still matches
+    /// `expected`: the forward-mutation counterpart of
+    /// [`Backend::restore_guarded`]. The default implementation is a plain
+    /// [`Backend::apply`] (best-effort: a concurrent external change
+    /// between the engine's verification read and this apply cannot be
+    /// ruled out). Backends with native generation or version semantics
+    /// override it with a true atomic check-and-mutate.
+    fn apply_guarded(
+        &self,
+        resource: &ResourceId,
+        _expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> Result<ApplyReceipt> {
+        self.apply(resource, plan)
+    }
 
     /// Restores an exact previous snapshot.
     ///
@@ -87,7 +113,35 @@ pub(crate) trait Backend: Send + Sync {
     /// with unrelated native state where the platform requires it, so that
     /// restoration never destroys changes made by other actors to unmanaged
     /// fields.
+    ///
+    /// Prefer [`Backend::restore_guarded`]: it checks ownership of
+    /// `expected` first. Every destructive restore in the engine
+    /// (rollback, lease restore, recovery, rebase) goes through the
+    /// guarded form.
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()>;
+
+    /// Restores `target`, but only while the current state still matches
+    /// `expected`. The default implementation reads back, compares with
+    /// [`Backend::equivalent`], and restores on match, returning
+    /// [`Error::ExternalModification`](crate::Error::ExternalModification)
+    /// without mutating otherwise. Backends with native generation or
+    /// version semantics (NetworkManager `version_id`, the test fake's
+    /// generation counter) override this with a true atomic check.
+    fn restore_guarded(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> Result<()> {
+        let current = self.readback(resource)?;
+        if !self.equivalent(&current, expected) {
+            return Err(Error::ExternalModification {
+                resource: resource.clone(),
+                detail: "the current state changed since ownership was verified".to_string(),
+            });
+        }
+        self.restore(resource, target)
+    }
 
     /// Semantic equality of two snapshots of the same resource: `true` when
     /// the managed DNS fields are equivalent.

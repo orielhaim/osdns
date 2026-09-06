@@ -106,12 +106,21 @@ fn external_write_between_two_leases_is_never_overwritten() {
     );
 }
 
+/// Crash safety per phase: a crash before any mutation leaves a `Prepared`
+/// record over untouched state (cleared); a crash once the mutation may
+/// have run leaves ambiguous state (an external actor could independently
+/// have produced the same desired state), so recovery reports a conflict
+/// and mutates nothing instead of overwriting possibly-external state.
 #[rstest]
-#[case(TxPoint::AfterPrepared)]
-#[case(TxPoint::AfterApply)]
-#[case(TxPoint::AfterReadback)]
-#[case(TxPoint::AfterVerify)]
-fn crash_at_every_mutation_phase_leaves_recoverable_state(#[case] point: TxPoint) {
+#[case(TxPoint::AfterPrepared, true)]
+#[case(TxPoint::AfterApply, false)]
+#[case(TxPoint::AfterReadback, false)]
+#[case(TxPoint::AfterVerify, false)]
+fn crash_at_every_mutation_phase_leaves_recoverable_state(
+    #[case] point: TxPoint,
+    #[case] expect_cleared: bool,
+) {
+    use osdns::RecoveryOutcome;
     let fixture = new_fixture("race-crash-phases");
     let injector = FaultInjector::new();
     injector.crash_at(point);
@@ -124,12 +133,41 @@ fn crash_at_every_mutation_phase_leaves_recoverable_state(#[case] point: TxPoint
 
     let outcomes = fixture.manager.recover_stale().unwrap();
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
-    assert!(journal_files(&fixture.dir).is_empty(), "{outcomes:?}");
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(FakeState::Empty),
-        "after recovery the system must be back at the captured base"
-    );
+    if expect_cleared {
+        assert!(
+            matches!(&outcomes[0], RecoveryOutcome::JournalCleared { .. }),
+            "{outcomes:?}"
+        );
+        assert!(journal_files(&fixture.dir).is_empty(), "{outcomes:?}");
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(FakeState::Empty),
+            "a pre-mutation crash must clear the journal without touching the system"
+        );
+    } else {
+        // Ambiguous: the mutation may have run, but `current == desired`
+        // alone never proves we applied it.
+        assert!(
+            matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }),
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            journal_files(&fixture.dir).len(),
+            1,
+            "ambiguous journals are kept for forensics: {outcomes:?}"
+        );
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(state_with("1.1.1.1")),
+            "recovery must not overwrite ambiguous state"
+        );
+        // The claim can still be explicitly abandoned.
+        fixture
+            .manager
+            .abandon_journal(&resource_id(IFACE1))
+            .unwrap();
+        assert!(journal_files(&fixture.dir).is_empty());
+    }
 }
 
 #[test]
@@ -143,4 +181,41 @@ fn lease_keeps_working_after_recover_attempt_on_live_resource() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(FakeState::Empty)
     );
+}
+
+#[test]
+fn restore_refuses_concurrent_external_change() {
+    let fixture = new_fixture("race-restore-guard");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let failure = lease.restore().unwrap_err();
+    assert!(failure.error.is_external_modification());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9")),
+        "the concurrent change must survive"
+    );
+    failure.lease.abandon().unwrap();
+}
+
+#[test]
+fn update_refuses_concurrent_external_change() {
+    let fixture = new_fixture("race-update-guard");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let err = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(err.is_external_modification(), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9")),
+        "the concurrent change must survive the refused update"
+    );
+    lease.abandon().unwrap();
 }
