@@ -45,6 +45,7 @@ use crate::manager::{INITIAL_POINTS, Inner};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::PlatformSnapshot;
+use crate::platform::ResourceStatus;
 
 /// Two read-backs separated by this window must agree before the state is
 /// considered stable and actionable.
@@ -258,6 +259,34 @@ impl Inner {
             return ReconcileOutcome::NoActiveLease;
         };
 
+        let identity = entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record
+            .identity
+            .clone();
+        match self.backend.resource_status(&identity) {
+            Ok(ResourceStatus::Gone | ResourceStatus::Replaced) => {
+                let record = entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record
+                    .clone();
+                if self.journal.remove(&record.lease_id, resource).is_ok() {
+                    self.unregister_active(resource);
+                    reconciler.remove(resource);
+                    return ReconcileOutcome::NoActiveLease;
+                }
+                return ReconcileOutcome::Failed;
+            }
+            Ok(ResourceStatus::Ambiguous) => {
+                reconciler.remove(resource);
+                return ReconcileOutcome::NoActiveLease;
+            }
+            Ok(ResourceStatus::Same) => {}
+            Err(_) => return ReconcileOutcome::Failed,
+        }
+
         let outcome = self.reconcile_pass(resource, &entry, reconciler);
         match outcome {
             ReconcileOutcome::NoActiveLease
@@ -301,6 +330,18 @@ impl Inner {
     ) -> ReconcileOutcome {
         let first = match self.backend.readback(resource) {
             Ok(first) => first,
+            Err(Error::ResourceGone { .. }) => {
+                let record = entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record
+                    .clone();
+                if self.journal.remove(&record.lease_id, resource).is_ok() {
+                    self.unregister_active(resource);
+                    return ReconcileOutcome::NoActiveLease;
+                }
+                return ReconcileOutcome::Failed;
+            }
             Err(error) => {
                 osdns_warn!(
                     resource = %resource,
@@ -313,6 +354,18 @@ impl Inner {
         std::thread::sleep(STABLE_WINDOW);
         let second = match self.backend.readback(resource) {
             Ok(second) => second,
+            Err(Error::ResourceGone { .. }) => {
+                let record = entry
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .record
+                    .clone();
+                if self.journal.remove(&record.lease_id, resource).is_ok() {
+                    self.unregister_active(resource);
+                    return ReconcileOutcome::NoActiveLease;
+                }
+                return ReconcileOutcome::Failed;
+            }
             Err(error) => {
                 osdns_warn!(
                     resource = %resource,

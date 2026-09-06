@@ -12,7 +12,9 @@ use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
-use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot};
+use crate::platform::{
+    ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 /// The fake backend's representation of one resource's DNS state.
@@ -146,6 +148,7 @@ struct FakeInner {
     /// Generation bumped on every mutation; snapshots carry the generation
     /// they were captured at for atomic guarded operations.
     generations: BTreeMap<ResourceId, u64>,
+    incarnations: BTreeMap<ResourceId, u64>,
     failures: Vec<(FakeOp, u32, u32, String)>,
     readback_lie: Option<FakeState>,
     /// Pending mutate-then-fail applies (see
@@ -241,12 +244,14 @@ impl FakeBackend {
         for iface in &interfaces {
             states.insert(Self::interface_id(iface.index), FakeState::Empty);
         }
+        let incarnations = states.keys().cloned().map(|id| (id, 0)).collect();
         Self {
             caps: caps.with_mutation_guard(MutationGuard::CompareAndMutate),
             inner: Mutex::new(FakeInner {
                 interfaces,
                 states,
                 generations: BTreeMap::new(),
+                incarnations,
                 failures: Vec::new(),
                 readback_lie: None,
                 partial_apply_failures: 0,
@@ -286,6 +291,9 @@ impl FakeBackend {
     pub(crate) fn external_change(&self, resource: &ResourceId, state: FakeState) {
         {
             let mut inner = self.lock_inner();
+            if !inner.states.contains_key(resource) {
+                *inner.incarnations.entry(resource.clone()).or_insert(0) += 1;
+            }
             inner.states.insert(resource.clone(), state);
             *inner.generations.entry(resource.clone()).or_insert(0) += 1;
         }
@@ -574,6 +582,46 @@ impl Backend for FakeBackend {
 
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         Ok(self.lock_inner().interfaces.clone())
+    }
+
+    fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
+        let inner = self.lock_inner();
+        if !inner.states.contains_key(resource) {
+            return Err(Error::ResourcePlatform {
+                backend: BackendKind::Fake,
+                resource: resource.clone(),
+                message: "resource is not present".to_string(),
+            });
+        }
+        Ok(ResourceIdentity::new(
+            BackendKind::Fake,
+            resource.clone(),
+            serde_json::json!({ "incarnation": inner.incarnations.get(resource).copied().unwrap_or(0) }),
+        ))
+    }
+
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        if identity.backend != BackendKind::Fake || identity.resource.as_str().is_empty() {
+            return Ok(ResourceStatus::Replaced);
+        }
+        let inner = self.lock_inner();
+        if !inner.states.contains_key(&identity.resource) {
+            return Ok(ResourceStatus::Gone);
+        }
+        let recorded = identity
+            .data
+            .get("incarnation")
+            .and_then(serde_json::Value::as_u64);
+        let current = inner
+            .incarnations
+            .get(&identity.resource)
+            .copied()
+            .unwrap_or(0);
+        Ok(match recorded {
+            Some(value) if value == current => ResourceStatus::Same,
+            Some(_) => ResourceStatus::Replaced,
+            None => ResourceStatus::Ambiguous,
+        })
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {

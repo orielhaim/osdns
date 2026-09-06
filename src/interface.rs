@@ -9,9 +9,9 @@ use std::ffi::OsString;
 /// native identifier when available (Windows GUID, macOS service UUID).
 /// `is_up` reflects the backend's liveness signal and may be approximate.
 ///
-/// Names and indexes are convenience selectors only; backends internally
-/// identify interfaces by their stable native identifier, so a rename between
-/// `interfaces()` and `apply()` fails cleanly rather than retargeting.
+/// Names and indexes are convenience selectors only. Their lifetime and
+/// rename/reuse semantics are backend-specific; durable recovery separately
+/// validates the native resource incarnation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct InterfaceInfo {

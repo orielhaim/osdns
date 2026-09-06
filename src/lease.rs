@@ -9,6 +9,7 @@ use crate::journal::JournalRecord;
 use crate::manager::Inner;
 use crate::ownership::{ResourceId, ResourceLock};
 use crate::platform::OwnershipProof;
+use crate::platform::ResourceStatus;
 
 /// A lease's authoritative, shared journal record.
 ///
@@ -169,6 +170,33 @@ impl Lease {
         };
         let LiveLease { live, _locks } = state;
         let repack = |live: Vec<Arc<Mutex<LiveRecord>>>| LiveLease { live, _locks };
+        for entry in &live {
+            let record = entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .record
+                .clone();
+            if matches!(
+                self.inner.backend.resource_status(&record.identity),
+                Ok(ResourceStatus::Gone | ResourceStatus::Replaced)
+            ) {
+                if let Err(error) = self
+                    .inner
+                    .journal
+                    .remove(&record.lease_id, &record.resource)
+                {
+                    *guard = Some(repack(live));
+                    return Err(error);
+                }
+                self.inner.unregister_active(&record.resource);
+                *guard = Some(repack(live));
+                return Err(Error::ResourceGone {
+                    backend: self.inner.backend.kind(),
+                    resource: record.resource,
+                    message: "the leased native resource incarnation no longer exists; its journal was cleared and a fresh lease is required".to_string(),
+                });
+            }
+        }
         let wanted = match self.inner.backend.resolve_resources(config.scope(), &plan) {
             Ok(wanted) => wanted,
             Err(error) => {

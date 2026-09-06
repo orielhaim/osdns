@@ -54,24 +54,22 @@ fn external_change_between_apply_and_readback_is_rolled_back() {
 }
 
 #[test]
-fn delete_then_recreate_interface_is_transitional_not_authoritative() {
+fn delete_then_recreate_requires_a_fresh_lease() {
     let fixture = new_fixture("race-delete-recreate");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
 
     assert!(fixture.fake.external_remove(IFACE1).unwrap());
     assert!(matches!(
         lease.update(&iface_config(1, "8.8.8.8")).unwrap_err(),
-        Error::Platform { .. } | Error::InvalidConfig(_)
+        Error::ResourceGone { .. }
     ));
 
     let _ = fixture.fake.external_change(IFACE1, state_with("9.9.9.9"));
-    let failure = lease.restore().unwrap_err();
-    assert!(
-        failure.error.is_external_modification(),
-        "{:?}",
-        failure.error
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
     );
-    failure.lease.abandon().unwrap();
 }
 
 #[test]

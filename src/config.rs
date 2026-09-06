@@ -28,9 +28,9 @@ pub enum DnsScope {
 /// Selects an interface within [`DnsScope::Interface`].
 ///
 /// Names and indexes are convenience selectors resolved by the backend at
-/// apply time; the lease owns the backend's stable native identifier (GUID on
-/// Windows, ifindex on Linux, service UUID on macOS), so renames do not
-/// silently retarget a lease. `Default` resolves to the backend's notion of
+/// apply time. The lease separately records backend-native incarnation
+/// evidence; Linux names and ifindices are never treated as durable proof.
+/// `Default` resolves to the backend's notion of
 /// the primary interface (default route on Linux, primary service on macOS).
 /// macOS rejects [`InterfaceSelector::Index`] with
 /// [`Error::InvalidConfig`](crate::Error); use `Default` or `Name` there.

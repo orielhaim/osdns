@@ -16,8 +16,8 @@ use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
 use crate::platform::{
-    Backend, MutationAttempt, OwnershipProof, PlatformSnapshot, VerifiedMutation,
-    select_default_backend,
+    Backend, MutationAttempt, OwnershipProof, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    VerifiedMutation, select_default_backend,
 };
 use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
@@ -58,11 +58,9 @@ pub enum ConflictPolicy {
 
 /// The result of inspecting one journal record during stale recovery.
 ///
-/// Returned per record by [`DnsManager::recover_stale`]. `Restored` and
-/// `JournalCleared` both removed the record; `ExternalConflict` kept it (call
-/// [`DnsManager::abandon_journal`] to drop the claim without mutating);
-/// `Busy` skipped a locked resource. The enum is `#[non_exhaustive]` so new
-/// outcomes can be added without breakage.
+/// Returned per record by [`DnsManager::recover_stale`]. Terminal lifetime
+/// outcomes remove obsolete records without touching a replacement target;
+/// conflicts, ambiguity, busy resources, and failures retain the record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryOutcome {
@@ -81,6 +79,36 @@ pub enum RecoveryOutcome {
         resource: ResourceId,
         /// The lease that left the record behind.
         lease_id: Uuid,
+    },
+    /// The recorded native resource ceased to exist; its journal was removed.
+    Gone {
+        /// Historical mutation target.
+        resource: ResourceId,
+        /// Lease that owned it.
+        lease_id: Uuid,
+    },
+    /// The selector now names a different native incarnation; no DNS access occurred.
+    Replaced {
+        /// Selector that now names another incarnation.
+        resource: ResourceId,
+        /// Lease that owned the old incarnation.
+        lease_id: Uuid,
+    },
+    /// Incarnation equality cannot be proved safely; nothing was mutated.
+    IdentityMismatch {
+        /// Resource whose incarnation is ambiguous.
+        resource: ResourceId,
+        /// Lease that recorded it.
+        lease_id: Uuid,
+    },
+    /// This record failed, but recovery continued with unrelated records.
+    Failed {
+        /// Resource whose recovery failed.
+        resource: ResourceId,
+        /// Lease that recorded it.
+        lease_id: Uuid,
+        /// Failure detail.
+        detail: String,
     },
     /// The current state matches neither the recorded applied state nor the
     /// original state: another actor changed it. Nothing was mutated and the
@@ -547,6 +575,7 @@ impl Inner {
         resources: Vec<ResourceId>,
         plan: &NormalizedConfig,
         befores: Vec<PlatformSnapshot>,
+        identities: Vec<ResourceIdentity>,
     ) -> Result<PreparedLease> {
         let lease_id = Uuid::new_v4();
         let was_noop = resources
@@ -557,12 +586,14 @@ impl Inner {
             let records: Vec<JournalRecord> = resources
                 .into_iter()
                 .zip(befores)
-                .map(|(resource, before)| JournalRecord {
+                .zip(identities)
+                .map(|((resource, before), identity)| JournalRecord {
                     schema_version: SCHEMA_VERSION,
                     owner: self.owner.clone(),
                     lease_id,
                     resource,
                     backend: self.backend.kind(),
+                    identity,
                     phase: Phase::Applied,
                     before: before.clone(),
                     desired: plan.clone(),
@@ -584,12 +615,14 @@ impl Inner {
         let mut records: Vec<JournalRecord> = resources
             .into_iter()
             .zip(befores)
-            .map(|(resource, before)| JournalRecord {
+            .zip(identities)
+            .map(|((resource, before), identity)| JournalRecord {
                 schema_version: SCHEMA_VERSION,
                 owner: self.owner.clone(),
                 lease_id,
                 resource,
                 backend: self.backend.kind(),
+                identity,
                 phase: Phase::Prepared,
                 before,
                 desired: plan.clone(),
@@ -874,8 +907,29 @@ impl Inner {
     /// longer the verified applied state.
     pub(crate) fn restore_lease_state(&self, record: &JournalRecord) -> Result<()> {
         let resource = &record.resource;
+        match self.backend.resource_status(&record.identity)? {
+            ResourceStatus::Gone | ResourceStatus::Replaced => {
+                self.journal.remove(&record.lease_id, resource)?;
+                return Ok(());
+            }
+            ResourceStatus::Ambiguous => {
+                return Err(Error::ResourceIdentity {
+                    backend: self.backend.kind(),
+                    resource: resource.clone(),
+                    message: "the backend cannot prove that the current target is the leased native resource incarnation".to_string(),
+                });
+            }
+            ResourceStatus::Same => {}
+        }
         self.suppressions.suppress(resource);
-        let current = self.backend.readback(resource)?;
+        let current = match self.backend.readback(resource) {
+            Ok(current) => current,
+            Err(Error::ResourceGone { .. }) => {
+                self.journal.remove(&record.lease_id, resource)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         self.fire(TxPoint::AfterRestoreReadback)?;
         if self.backend.equivalent(&current, &record.before) {
             self.journal.remove(&record.lease_id, resource)?;
@@ -928,7 +982,40 @@ impl Inner {
     /// without mutating. Memory-only live proof is ignored.
     fn recover_record(&self, record: JournalRecord) -> Result<RecoveryOutcome> {
         let resource = record.resource.clone();
-        let current = self.backend.capture(&resource)?;
+        match self.backend.resource_status(&record.identity)? {
+            ResourceStatus::Gone => {
+                self.journal.remove(&record.lease_id, &resource)?;
+                return Ok(RecoveryOutcome::Gone {
+                    resource,
+                    lease_id: record.lease_id,
+                });
+            }
+            ResourceStatus::Replaced => {
+                self.journal.remove(&record.lease_id, &resource)?;
+                return Ok(RecoveryOutcome::Replaced {
+                    resource,
+                    lease_id: record.lease_id,
+                });
+            }
+            ResourceStatus::Ambiguous => {
+                return Ok(RecoveryOutcome::IdentityMismatch {
+                    resource,
+                    lease_id: record.lease_id,
+                });
+            }
+            ResourceStatus::Same => {}
+        }
+        let current = match self.backend.capture(&resource) {
+            Ok(current) => current,
+            Err(Error::ResourceGone { .. }) => {
+                self.journal.remove(&record.lease_id, &resource)?;
+                return Ok(RecoveryOutcome::Gone {
+                    resource,
+                    lease_id: record.lease_id,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         self.fire(TxPoint::AfterRecoveryReadback)?;
         if self.backend.equivalent(&current, &record.before) {
             self.journal.remove(&record.lease_id, &resource)?;
@@ -990,6 +1077,12 @@ impl Inner {
                             .to_string(),
                     );
                 }
+                Ok(RecoveryOutcome::IdentityMismatch { .. } | RecoveryOutcome::Failed { .. }) => {
+                    conflict = Some(
+                        "the recorded native resource incarnation cannot be recovered safely"
+                            .to_string(),
+                    );
+                }
                 Ok(_) => {}
                 Err(error @ Error::JournalCorrupt(_)) => {
                     return Err(RecoverBlock::Corrupt(error));
@@ -1010,9 +1103,16 @@ impl Inner {
         let mut outcomes = Vec::new();
         for record in records {
             let resource = record.resource.clone();
+            let lease_id = record.lease_id;
             match self.locks.try_acquire(&resource) {
                 Ok(Some(lock)) => {
-                    let outcome = self.recover_record(record)?;
+                    let outcome = self.recover_record(record).unwrap_or_else(|error| {
+                        RecoveryOutcome::Failed {
+                            resource: resource.clone(),
+                            lease_id,
+                            detail: error.to_string(),
+                        }
+                    });
                     drop(lock);
                     outcomes.push(outcome);
                 }
@@ -1020,7 +1120,11 @@ impl Inner {
                 Err(Error::Conflict { .. }) => {
                     outcomes.push(RecoveryOutcome::Busy { resource });
                 }
-                Err(error) => return Err(error),
+                Err(error) => outcomes.push(RecoveryOutcome::Failed {
+                    resource,
+                    lease_id,
+                    detail: error.to_string(),
+                }),
             }
         }
         Ok(outcomes)
@@ -1116,8 +1220,8 @@ impl DnsManager {
     /// Lists network interfaces known to the backend.
     ///
     /// Read-only; requires no privileges beyond what the platform needs for
-    /// enumeration. Names and indexes are selectors only - backends identify
-    /// interfaces by stable native identifiers internally.
+    /// enumeration. Names and indexes are selectors only; their lifetime and
+    /// reuse semantics are backend-specific.
     pub fn interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         self.inner.backend.list_interfaces()
     }
@@ -1222,12 +1326,17 @@ impl DnsManager {
         }
         self.inner.fire(TxPoint::AfterRecovery)?;
         let mut befores = Vec::with_capacity(resources.len());
+        let mut identities = Vec::with_capacity(resources.len());
         for resource in &resources {
+            identities.push(self.inner.backend.identify(resource)?);
             befores.push(self.inner.backend.capture(resource)?);
             self.inner.fire(TxPoint::AfterCapture)?;
         }
         self.inner.fire(TxPoint::AfterNoopDecision)?;
-        match self.inner.transact_with_locks(resources, &plan, befores) {
+        match self
+            .inner
+            .transact_with_locks(resources, &plan, befores, identities)
+        {
             Ok(PreparedLease {
                 lease_id,
                 records,
@@ -1316,9 +1425,11 @@ impl DnsManager {
     /// restored to the original state; records already at the original state
     /// are simply cleared; anything else — including unverified `Prepared`
     /// records whose state merely matches the desired configuration — is
-    /// reported as [`RecoveryOutcome::ExternalConflict`] and kept. On any
-    /// parse failure or unknown schema version the call fails closed with
-    /// [`Error::JournalCorrupt`] and mutates nothing.
+    /// reported as [`RecoveryOutcome::ExternalConflict`] and kept. Native
+    /// resource lifetime is checked before any DNS read. Per-record failures
+    /// are returned as [`RecoveryOutcome::Failed`] so unrelated records still
+    /// make progress. Enumeration, parse, schema, and integrity failures are
+    /// top-level errors and fail closed before recovery begins.
     pub fn recover_stale(&self) -> Result<Vec<RecoveryOutcome>> {
         self.inner.recover_stale()
     }
@@ -1359,6 +1470,12 @@ impl DnsManager {
     #[cfg(feature = "test-util")]
     pub fn set_journal_fail_writes_after(&self, skip: u32) {
         self.inner.journal.set_fail_writes_after(skip);
+    }
+
+    /// Toggles injected journal removal failures (testing only).
+    #[cfg(feature = "test-util")]
+    pub fn set_journal_fail_removes(&self, fail: bool) {
+        self.inner.journal.set_fail_removes(fail);
     }
 
     /// Number of live leases holding internal Enforce observation (testing

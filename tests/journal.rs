@@ -21,10 +21,11 @@ fn prepared_record_persisted_before_mutation() {
     injector.clear();
 
     let record = journal_record_json(&fixture.dir);
-    assert_eq!(record["schema_version"], 2);
+    assert_eq!(record["schema_version"], 3);
     assert_eq!(record["owner"], "io.osdns.test");
     assert_eq!(record["resource"], IFACE1);
     assert_eq!(record["backend"], "fake");
+    assert_eq!(record["identity"]["resource"], IFACE1);
     assert_eq!(record["phase"], "Prepared");
     assert!(record["applied"].is_null());
     assert_eq!(record["desired"]["nameservers"][0], "1.1.1.1");
@@ -122,4 +123,29 @@ fn unknown_phase_fails_closed() {
 
     let err = fixture.manager.recover_stale().unwrap_err();
     assert!(matches!(err, Error::JournalCorrupt(_)));
+}
+
+#[test]
+fn cross_backend_and_cross_resource_records_fail_closed() {
+    let fixture = new_fixture("journal-cross-field");
+    fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    let file = journal_files(&fixture.dir).pop().unwrap();
+    let path = fixture.dir.join("journal").join(file);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["before"]["resource"] = serde_json::Value::String(IFACE2.to_string());
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    assert!(matches!(
+        fixture.manager.recover_stale(),
+        Err(Error::JournalCorrupt(_))
+    ));
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
 }

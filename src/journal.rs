@@ -10,11 +10,11 @@ use crate::error::{Error, Result};
 use crate::fsutil::{ensure_private_dir, fsync_dir};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
-use crate::platform::PlatformSnapshot;
+use crate::platform::{PlatformSnapshot, ResourceIdentity};
 
 /// Current journal schema. Records with any other version are rejected
 /// (fail-closed) rather than guessed at.
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 
 /// The phase a journal record reached before its writer stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +35,7 @@ pub(crate) struct JournalRecord {
     pub(crate) lease_id: Uuid,
     pub(crate) resource: ResourceId,
     pub(crate) backend: BackendKind,
+    pub(crate) identity: ResourceIdentity,
     pub(crate) phase: Phase,
     pub(crate) before: PlatformSnapshot,
     pub(crate) desired: NormalizedConfig,
@@ -65,6 +66,8 @@ pub(crate) struct JournalStore {
     fail_writes: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-util")]
     fail_writes_skip: std::sync::atomic::AtomicU32,
+    #[cfg(feature = "test-util")]
+    fail_removes: std::sync::atomic::AtomicBool,
 }
 
 impl JournalStore {
@@ -76,6 +79,8 @@ impl JournalStore {
             fail_writes: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             fail_writes_skip: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "test-util")]
+            fail_removes: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -95,6 +100,12 @@ impl JournalStore {
             .store(skip, std::sync::atomic::Ordering::SeqCst);
         self.fail_writes
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_fail_removes(&self, fail: bool) {
+        self.fail_removes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn write(&self, record: &JournalRecord) -> Result<()> {
@@ -129,6 +140,13 @@ impl JournalStore {
     }
 
     pub(crate) fn remove(&self, lease_id: &Uuid, resource: &ResourceId) -> Result<bool> {
+        #[cfg(feature = "test-util")]
+        if self.fail_removes.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::platform(
+                BackendKind::Fake,
+                "injected journal removal failure",
+            ));
+        }
         let path = record_path(&self.dir, lease_id, resource);
         match fs::remove_file(&path) {
             Ok(()) => {
@@ -162,6 +180,19 @@ impl JournalStore {
                     path.display(),
                     record.schema_version,
                     SCHEMA_VERSION
+                )));
+            }
+            if record.backend != record.before.backend
+                || record.backend != record.identity.backend
+                || record.resource != record.before.resource
+                || record.resource != record.identity.resource
+                || record.applied.as_ref().is_some_and(|snapshot| {
+                    snapshot.backend != record.backend || snapshot.resource != record.resource
+                })
+            {
+                return Err(Error::JournalCorrupt(format!(
+                    "{}: record, identity, and snapshots name different resources or backends",
+                    path.display()
                 )));
             }
             out.push(record);

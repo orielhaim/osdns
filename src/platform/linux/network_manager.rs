@@ -19,6 +19,7 @@ use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{NmDnsFields, parse_nm_dns_fields};
 use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ResourceIdentity, ResourceStatus};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
@@ -54,6 +55,9 @@ trait NmDevice {
 
     #[zbus(property)]
     fn managed(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn active_connection(&self) -> zbus::Result<OwnedObjectPath>;
 }
 
 #[allow(clippy::type_complexity)]
@@ -111,6 +115,23 @@ impl NetworkManager {
         NmManagerProxyBlocking::builder(&self.conn)
             .build()
             .map_err(dbus_error)
+    }
+
+    fn service_owner(&self) -> Result<String> {
+        let proxy = zbus::blocking::fdo::DBusProxy::new(&self.conn).map_err(dbus_error)?;
+        let name = NM_SERVICE.try_into().map_err(|e| {
+            Error::platform(
+                BackendKind::NetworkManager,
+                format_args!("invalid NetworkManager bus name: {e}"),
+            )
+        })?;
+        proxy
+            .get_name_owner(name)
+            .map(|owner| owner.to_string())
+            .map_err(|error| Error::Platform {
+                backend: BackendKind::NetworkManager,
+                message: error.to_string(),
+            })
     }
 
     fn device(&self, path: OwnedObjectPath) -> Result<NmDeviceProxyBlocking<'_>> {
@@ -433,6 +454,75 @@ impl Backend for NetworkManager {
 
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         linux::list_interfaces()
+    }
+
+    fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
+        let (device, name) = self.device_for_resource(resource)?;
+        let (settings, version) = self.applied(&device)?;
+        let uuid =
+            extract_uuid(&to_owned_static(&settings)).ok_or_else(|| Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: resource.clone(),
+                message: "the device has no active connection UUID".to_string(),
+            })?;
+        Ok(ResourceIdentity::new(
+            BackendKind::NetworkManager,
+            resource.clone(),
+            serde_json::json!({
+                "ifname": name,
+                "device_path": device.inner().path().as_str(),
+                "active_path": device.active_connection().map_err(|e| Error::ResourcePlatform { backend: BackendKind::NetworkManager, resource: resource.clone(), message: e.to_string() })?.as_str(),
+            "connection_uuid": uuid,
+            "version": version,
+            "service_owner": self.service_owner()?,
+            }),
+        ))
+    }
+
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        if identity.backend != BackendKind::NetworkManager
+            || Self::ifname_of(&identity.resource).is_err()
+        {
+            return Ok(ResourceStatus::Replaced);
+        }
+        let (device, _) = match self.device_for_resource(&identity.resource) {
+            Ok(value) => value,
+            Err(_) => return Ok(ResourceStatus::Gone),
+        };
+        let (settings, _) = match self.applied(&device) {
+            Ok(value) => value,
+            Err(_) => return Ok(ResourceStatus::Gone),
+        };
+        let current_uuid = extract_uuid(&to_owned_static(&settings));
+        let current_active = device.active_connection().ok();
+        if identity
+            .data
+            .get("service_owner")
+            .and_then(serde_json::Value::as_str)
+            != Some(self.service_owner()?.as_str())
+        {
+            return Ok(ResourceStatus::Gone);
+        }
+        let same = identity
+            .data
+            .get("device_path")
+            .and_then(serde_json::Value::as_str)
+            == Some(device.inner().path().as_str())
+            && identity
+                .data
+                .get("active_path")
+                .and_then(serde_json::Value::as_str)
+                == current_active.as_ref().map(|p| p.as_str())
+            && identity
+                .data
+                .get("connection_uuid")
+                .and_then(serde_json::Value::as_str)
+                == current_uuid.as_deref();
+        Ok(if same {
+            ResourceStatus::Same
+        } else {
+            ResourceStatus::Replaced
+        })
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {

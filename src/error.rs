@@ -44,6 +44,10 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///   can finish the work. The lease remains usable.
 /// - [`Error::JournalCorrupt`]: no mutation was attempted. The call fails
 ///   closed; inspect or clear the state directory manually.
+/// - [`Error::ResourceGone`]: the named native incarnation no longer exists;
+///   its owned state cannot still affect the OS.
+/// - [`Error::ResourcePlatform`] / [`Error::ResourceIdentity`]: a native
+///   failure or identity ambiguity scoped to the carried resource.
 /// - [`Error::Io`] / [`Error::Platform`]: the effect is backend-dependent.
 ///   Assume the state may have changed, keep the lease, and use read-back
 ///   ([`DnsManager::snapshot`](crate::DnsManager::snapshot)) or recovery to
@@ -51,6 +55,37 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// The backend proved that this native resource incarnation is gone and
+    /// can no longer carry osdns-owned state.
+    #[error("resource is gone on {backend}: {resource}: {message}")]
+    ResourceGone {
+        /// Backend that established disappearance.
+        backend: BackendKind,
+        /// Historical mutation target.
+        resource: ResourceId,
+        /// Native diagnostic detail.
+        message: String,
+    },
+    /// A resource-scoped native failure with a programmatically available target.
+    #[error("platform error on {backend} for {resource}: {message}")]
+    ResourcePlatform {
+        /// Backend that failed.
+        backend: BackendKind,
+        /// Resource being operated on.
+        resource: ResourceId,
+        /// Native diagnostic detail.
+        message: String,
+    },
+    /// The current native target cannot be proven to be the recorded incarnation.
+    #[error("resource identity mismatch on {backend} for {resource}: {message}")]
+    ResourceIdentity {
+        /// Backend validating the identity.
+        backend: BackendKind,
+        /// Historical mutation target.
+        resource: ResourceId,
+        /// Why equality could not be established.
+        message: String,
+    },
     /// The active backend cannot represent or perform the requested operation.
     ///
     /// Nothing was mutated. Check [`Capabilities`](crate::Capabilities) before

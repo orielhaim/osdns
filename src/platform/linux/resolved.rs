@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+use std::fs::File;
 use std::net::IpAddr;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -20,7 +24,7 @@ use crate::platform::text_config::{
     resolved_dns_from_plan, resolved_dns_to_nameservers, resolved_domains_from_plan,
     resolved_domains_to_public,
 };
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, ResourceIdentity, ResourceStatus};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const RESOLVED_SERVICE: &str = "org.freedesktop.resolve1";
@@ -98,6 +102,7 @@ pub(crate) struct SystemdResolved {
     conn: Connection,
     caps: Capabilities,
     mode: Option<String>,
+    live_links: Mutex<HashMap<String, File>>,
 }
 
 impl SystemdResolved {
@@ -113,6 +118,7 @@ impl SystemdResolved {
             caps: capabilities(),
             conn,
             mode,
+            live_links: Mutex::new(HashMap::new()),
         })
     }
 
@@ -126,20 +132,25 @@ impl SystemdResolved {
             .map_err(dbus_error)
     }
 
-    fn link(&self, ifindex: i32) -> Result<Resolve1LinkProxyBlocking<'_>> {
-        let path = self.manager()?.get_link(ifindex).map_err(dbus_error)?;
-        Resolve1LinkProxyBlocking::builder(&self.conn)
-            .path(path)
+    fn snapshot_of(&self, resource: &ResourceId, ifindex: u32) -> Result<ResolvedSnapshot> {
+        let link = self
+            .manager()?
+            .get_link(ifindex as i32)
+            .map_err(|e| dbus_resource_error(resource, e))?;
+        let link = Resolve1LinkProxyBlocking::builder(&self.conn)
+            .path(link)
             .map_err(dbus_error)?
             .build()
-            .map_err(dbus_error)
-    }
-
-    fn snapshot_of(&self, ifindex: u32) -> Result<ResolvedSnapshot> {
-        let link = self.link(ifindex as i32)?;
-        let dns = link.dns().map_err(dbus_error)?;
-        let domains = link.domains().map_err(dbus_error)?;
-        let default_route = link.default_route().map_err(dbus_error)?;
+            .map_err(dbus_error)?;
+        let dns = link
+            .dns()
+            .map_err(|error| dbus_resource_error(resource, error))?;
+        let domains = link
+            .domains()
+            .map_err(|error| dbus_resource_error(resource, error))?;
+        let default_route = link
+            .default_route()
+            .map_err(|error| dbus_resource_error(resource, error))?;
         Ok(ResolvedSnapshot {
             dns,
             domains,
@@ -150,30 +161,71 @@ impl SystemdResolved {
     /// Three D-Bus calls; a later failure may leave earlier ones applied.
     /// The error means indeterminate state per the backend apply contract;
     /// the engine reads back and rolls back under guard on every apply error.
-    fn apply_snapshot(&self, ifindex: u32, snapshot: &ResolvedSnapshot) -> Result<()> {
+    fn apply_snapshot(
+        &self,
+        resource: &ResourceId,
+        ifindex: u32,
+        snapshot: &ResolvedSnapshot,
+    ) -> Result<()> {
         let manager = self.manager()?;
         manager
             .set_link_dns(ifindex as i32, snapshot.dns.clone())
-            .map_err(dbus_error)?;
+            .map_err(|e| dbus_resource_error(resource, e))?;
         manager
             .set_link_domains(ifindex as i32, snapshot.domains.clone())
-            .map_err(dbus_error)?;
+            .map_err(|e| dbus_resource_error(resource, e))?;
         manager
             .set_link_default_route(ifindex as i32, snapshot.default_route)
-            .map_err(dbus_error)?;
+            .map_err(|e| dbus_resource_error(resource, e))?;
         Ok(())
     }
 
     fn ifindex_of(resource: &ResourceId) -> Result<u32> {
-        let text = resource.as_str();
-        let index = text
-            .rsplit(':')
-            .next()
+        let index = resource
+            .as_str()
+            .strip_prefix("linux:resolved:ifindex:")
             .and_then(|s| s.parse::<u32>().ok())
             .ok_or_else(|| {
                 Error::invalid_config(format_args!("resource {resource} is not a resolved link"))
             })?;
         Ok(index)
+    }
+
+    fn identity_data(
+        ifindex: u32,
+        handle: Option<&str>,
+    ) -> Result<(serde_json::Value, Option<File>)> {
+        let entry = std::fs::read_dir("/sys/class/net")?
+            .filter_map(std::result::Result::ok)
+            .find(|entry| {
+                std::fs::read_to_string(entry.path().join("ifindex"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    == Some(ifindex)
+            });
+        let Some(entry) = entry else {
+            return Ok((serde_json::json!({ "gone": true }), None));
+        };
+        let path = entry.path();
+        let read = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .ok()
+                .map(|s| s.trim().to_string())
+        };
+        let file = File::open(&path)?;
+        Ok((
+            serde_json::json!({
+                "boot_id": std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
+                "netns": std::fs::read_link("/proc/self/ns/net")?.to_string_lossy(),
+                "ifindex": ifindex,
+                "ifname": entry.file_name().to_string_lossy(),
+                "iflink": read("iflink"),
+                "address": read("address"),
+                "uevent": read("uevent"),
+                "handle": handle,
+            }),
+            Some(file),
+        ))
     }
 }
 
@@ -181,6 +233,23 @@ fn dbus_error(error: zbus::Error) -> Error {
     Error::Platform {
         backend: BackendKind::SystemdResolved,
         message: error.to_string(),
+    }
+}
+
+fn dbus_resource_error(resource: &ResourceId, error: zbus::Error) -> Error {
+    if matches!(&error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.resolve1.NoSuchLink")
+    {
+        Error::ResourceGone {
+            backend: BackendKind::SystemdResolved,
+            resource: resource.clone(),
+            message: error.to_string(),
+        }
+    } else {
+        Error::ResourcePlatform {
+            backend: BackendKind::SystemdResolved,
+            resource: resource.clone(),
+            message: error.to_string(),
+        }
     }
 }
 
@@ -226,9 +295,77 @@ impl Backend for SystemdResolved {
         linux::list_interfaces()
     }
 
+    fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
+        let ifindex = Self::ifindex_of(resource)?;
+        let handle = uuid::Uuid::new_v4().simple().to_string();
+        let (data, file) = Self::identity_data(ifindex, Some(&handle))?;
+        if data.get("gone").is_some() {
+            return Err(Error::ResourceGone {
+                backend: BackendKind::SystemdResolved,
+                resource: resource.clone(),
+                message: "the kernel link is absent".to_string(),
+            });
+        }
+        self.live_links
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(handle, file.expect("present link has a handle"));
+        Ok(ResourceIdentity::new(
+            BackendKind::SystemdResolved,
+            resource.clone(),
+            data,
+        ))
+    }
+
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        if identity.backend != BackendKind::SystemdResolved
+            || Self::ifindex_of(&identity.resource).is_err()
+        {
+            return Ok(ResourceStatus::Replaced);
+        }
+        let (mut current, current_file) =
+            Self::identity_data(Self::ifindex_of(&identity.resource)?, None)?;
+        if current.get("gone").is_some() {
+            return Ok(ResourceStatus::Gone);
+        }
+        if current.get("boot_id") != identity.data.get("boot_id") {
+            return Ok(ResourceStatus::Gone);
+        }
+        let old_handle = identity
+            .data
+            .get("handle")
+            .and_then(serde_json::Value::as_str);
+        if let Some(object) = current.as_object_mut() {
+            object.insert(
+                "handle".to_string(),
+                identity
+                    .data
+                    .get("handle")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if current != identity.data {
+            return Ok(ResourceStatus::Replaced);
+        }
+        // Linux exposes no durable netdev creation cookie. Equal selectors and
+        // attributes after a process boundary are evidence, not proof.
+        let handles = self.live_links.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(match old_handle.and_then(|key| handles.get(key)) {
+            Some(original)
+                if original.metadata()?.ino()
+                    == current_file.expect("present link").metadata()?.ino() =>
+            {
+                ResourceStatus::Same
+            }
+            Some(_) => ResourceStatus::Replaced,
+            None => ResourceStatus::Ambiguous,
+        })
+    }
+
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         let ifindex = Self::ifindex_of(resource)?;
-        let snapshot = self.snapshot_of(ifindex)?;
+        let snapshot = self.snapshot_of(resource, ifindex)?;
         to_platform_snapshot(resource, snapshot)
     }
 
@@ -236,9 +373,9 @@ impl Backend for SystemdResolved {
         let ifindex = Self::ifindex_of(resource)?;
         // Preserve the current default-route flag when the plan leaves it
         // unspecified (`None`); only an explicit `Some(_)` may change it.
-        let current = self.snapshot_of(ifindex)?;
+        let current = self.snapshot_of(resource, ifindex)?;
         let merged = ResolvedSnapshot::merged_from_plan(&current, plan);
-        self.apply_snapshot(ifindex, &merged)?;
+        self.apply_snapshot(resource, ifindex, &merged)?;
         Ok(ApplyReceipt {
             resource: resource.clone(),
         })
@@ -246,14 +383,14 @@ impl Backend for SystemdResolved {
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         let ifindex = Self::ifindex_of(resource)?;
-        let snapshot = self.snapshot_of(ifindex)?;
+        let snapshot = self.snapshot_of(resource, ifindex)?;
         to_platform_snapshot(resource, snapshot)
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
         let ifindex = Self::ifindex_of(resource)?;
         let captured: ResolvedSnapshot = from_platform_snapshot(snapshot)?;
-        self.apply_snapshot(ifindex, &captured)?;
+        self.apply_snapshot(resource, ifindex, &captured)?;
         Ok(())
     }
 
@@ -368,6 +505,31 @@ fn from_platform_snapshot(snapshot: &PlatformSnapshot) -> Result<ResolvedSnapsho
             format_args!("snapshot data cannot be interpreted: {e}"),
         )
     })
+}
+
+#[cfg(test)]
+mod resource_identity_tests {
+    use super::SystemdResolved;
+    use crate::error::Error;
+    use crate::platform::Backend;
+
+    #[test]
+    fn resolved_resource_parser_validates_the_complete_kind() {
+        let malformed = "fake:anything:8".parse().unwrap();
+        assert!(SystemdResolved::ifindex_of(&malformed).is_err());
+        let valid = "linux:resolved:ifindex:8".parse().unwrap();
+        assert_eq!(SystemdResolved::ifindex_of(&valid).unwrap(), 8);
+    }
+
+    #[test]
+    fn native_no_such_link_is_resource_scoped_when_resolved_is_available() {
+        let Ok(backend) = SystemdResolved::connect() else {
+            return;
+        };
+        let resource = "linux:resolved:ifindex:2147483647".parse().unwrap();
+        let error = backend.capture(&resource).unwrap_err();
+        assert!(matches!(error, Error::ResourceGone { resource: found, .. } if found == resource));
+    }
 }
 
 #[cfg(test)]

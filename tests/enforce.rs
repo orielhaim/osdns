@@ -388,61 +388,32 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
 }
 
 #[test]
-fn events_during_defer_windows_are_pending_never_dropped() {
+fn vanished_enforce_resource_is_terminal_and_never_rebound() {
     let fixture = enforce_manager("enforce-defer");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     fixture.manager.suspend_enforce_background();
 
-    // Transitional churn: the interface disappears, then returns with an
-    // external configuration. The first reconcile cannot read the resource
-    // and defers; the second (after re-creation) must still act.
+    // Interface disappearance ends this incarnation. A later resource at the
+    // same selector must not inherit the old lease.
     assert!(fixture.fake.external_remove(IFACE1).unwrap());
     let outcome = fixture.manager.debug_reconcile("fake:interface:1").unwrap();
-    assert_eq!(outcome, DebugReconcile::Deferred);
+    assert_eq!(outcome, DebugReconcile::NotOwned);
 
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
         .unwrap();
     let outcome = fixture.manager.debug_reconcile("fake:interface:1").unwrap();
-    assert_eq!(outcome, DebugReconcile::Rebased);
+    assert_eq!(outcome, DebugReconcile::NotOwned);
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("1.1.1.1"))
-    );
-
-    // Two rapid external changes: the final journal base must be the last
-    // external state, and the overlay must survive both rebases.
-    fixture
-        .fake
-        .external_change(IFACE1, state_with("9.9.9.9"))
-        .unwrap();
-    assert_eq!(
-        fixture.manager.debug_reconcile("fake:interface:1").unwrap(),
-        DebugReconcile::Rebased
-    );
-    fixture
-        .fake
-        .external_change(IFACE1, state_with("8.8.8.8"))
-        .unwrap();
-    assert_eq!(
-        fixture.manager.debug_reconcile("fake:interface:1").unwrap(),
-        DebugReconcile::Rebased
-    );
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("1.1.1.1"))
-    );
-    let record = journal_record_json(&fixture.dir);
-    assert_eq!(
-        record["before"]["data"]["state"]["Configured"]["nameservers"][0], "8.8.8.8",
-        "the rebased journal base must track the latest external state"
+        Some(state_with("9.9.9.9"))
     );
 
     lease.restore().unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("8.8.8.8"))
+        Some(state_with("9.9.9.9"))
     );
 }
 

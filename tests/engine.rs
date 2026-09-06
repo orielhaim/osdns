@@ -340,6 +340,28 @@ fn removed_interface_is_reported() {
 }
 
 #[test]
+fn update_of_vanished_incarnation_requires_a_fresh_lease_without_rebinding() {
+    let fixture = new_fixture("update-gone");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    let error = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(
+        matches!(error, Error::ResourceGone { resource, .. } if resource == resource_id(IFACE1))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
 fn noop_lease_updates_without_rebind() {
     let fixture = new_fixture("engine-noop-update");
     fixture

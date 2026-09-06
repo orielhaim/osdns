@@ -31,6 +31,35 @@ pub(crate) struct PlatformSnapshot {
     pub(crate) data: serde_json::Value,
 }
 
+/// Backend-defined evidence naming the native resource incarnation that a
+/// journal record was created against.  This is deliberately separate from
+/// [`ResourceId`], which is only the current mutation/locking target.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResourceIdentity {
+    pub(crate) backend: BackendKind,
+    pub(crate) resource: ResourceId,
+    pub(crate) data: serde_json::Value,
+}
+
+impl ResourceIdentity {
+    pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: serde_json::Value) -> Self {
+        Self {
+            backend,
+            resource,
+            data,
+        }
+    }
+}
+
+/// Result of comparing durable incarnation evidence with the current OS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResourceStatus {
+    Same,
+    Gone,
+    Replaced,
+    Ambiguous,
+}
+
 impl PlatformSnapshot {
     #[allow(dead_code)]
     pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: serde_json::Value) -> Self {
@@ -146,6 +175,24 @@ pub(crate) trait Backend: Send + Sync {
     ) -> Result<Vec<ResourceId>>;
 
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>>;
+
+    /// Captures the native lifetime identity before a journal is written.
+    fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
+        Ok(ResourceIdentity::new(
+            self.kind(),
+            resource.clone(),
+            serde_json::Value::Null,
+        ))
+    }
+
+    /// Establishes whether `identity` still denotes the same native object.
+    /// This must run before any resource-scoped DNS read or mutation.
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        if identity.backend != self.kind() || identity.resource.as_str().is_empty() {
+            return Ok(ResourceStatus::Replaced);
+        }
+        Ok(ResourceStatus::Same)
+    }
 
     /// Reads the authoritative current state of `resource`.
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;

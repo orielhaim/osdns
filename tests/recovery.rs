@@ -305,3 +305,120 @@ fn external_revert_of_applied_state_clears_journal() {
     );
     assert!(journal_files(&fixture.dir).is_empty());
 }
+
+#[test]
+fn vanished_resource_is_terminal_and_journal_is_removed_without_dns_read() {
+    let fixture = new_fixture("recovery-gone");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    lease.debug_release_locks_keep_journal();
+    assert!(fixture.fake.external_remove(IFACE1).unwrap());
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Capture,
+        1,
+        "must not capture gone resource",
+    );
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(
+        matches!(&outcomes[..], [RecoveryOutcome::Gone { resource, .. }] if resource == &resource_id(IFACE1))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn replacement_at_same_selector_is_never_read_or_restored() {
+    let fixture = new_fixture("recovery-replaced");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    lease.debug_release_locks_keep_journal();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Capture,
+        1,
+        "replacement DNS must not be read",
+    );
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(
+        matches!(&outcomes[..], [RecoveryOutcome::Replaced { resource, .. }] if resource == &resource_id(IFACE1))
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn one_gone_record_does_not_block_a_recoverable_record() {
+    let fixture = new_fixture("recovery-forward-progress");
+    fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    fixture
+        .manager
+        .apply(&iface_config(2, "8.8.8.8"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    fixture.fake.external_remove(IFACE1).unwrap();
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(outcomes.iter().any(
+        |o| matches!(o, RecoveryOutcome::Gone { resource, .. } if resource == &resource_id(IFACE1))
+    ));
+    assert!(outcomes.iter().any(|o| matches!(o, RecoveryOutcome::Restored { resource, .. } if resource == &resource_id(IFACE2))));
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn explicit_restore_terminally_releases_a_gone_resource() {
+    let fixture = new_fixture("restore-gone");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn drop_terminally_releases_a_gone_resource() {
+    let fixture = new_fixture("drop-gone");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    drop(lease);
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn gone_is_not_reported_as_cleaned_when_journal_removal_fails() {
+    let fixture = new_fixture("gone-remove-failure");
+    fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    fixture.manager.set_journal_fail_removes(true);
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(
+        matches!(&outcomes[..], [RecoveryOutcome::Failed { resource, .. }] if resource == &resource_id(IFACE1))
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+}
+
+#[test]
+fn resource_scoped_platform_errors_carry_the_target_structurally() {
+    let error = Error::ResourcePlatform {
+        backend: osdns::BackendKind::Fake,
+        resource: resource_id(IFACE1),
+        message: "native failure".to_string(),
+    };
+    assert!(
+        matches!(error, Error::ResourcePlatform { resource, .. } if resource == resource_id(IFACE1))
+    );
+}
