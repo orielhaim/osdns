@@ -149,3 +149,30 @@ fn cross_backend_and_cross_resource_records_fail_closed() {
         Some(state_with("1.1.1.1"))
     );
 }
+
+#[test]
+fn malformed_backend_identity_cannot_trigger_destructive_recovery() {
+    let fixture = new_fixture("journal-invalid-identity");
+    fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    let file = journal_files(&fixture.dir).pop().unwrap();
+    let path = fixture.dir.join("journal").join(file);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["identity"]["data"] = json!({ "incarnation": "not-a-number" });
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(matches!(
+        &outcomes[..],
+        [osdns::RecoveryOutcome::Failed { .. }]
+    ));
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+}

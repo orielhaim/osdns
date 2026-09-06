@@ -91,6 +91,35 @@ impl FakeDns {
         Ok(self.backend.external_remove(&id))
     }
 
+    /// Forces incarnation validation for `resource` to be ambiguous.
+    pub fn set_identity_ambiguous(&self, resource: &str, ambiguous: bool) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend.set_identity_ambiguous(id, ambiguous);
+        Ok(())
+    }
+
+    /// Replaces `resource` with a new incarnation immediately before the
+    /// next guarded apply.
+    pub fn replace_before_next_apply(&self, resource: &str, state: FakeState) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend.replace_before_next_apply(id, state);
+        Ok(())
+    }
+
+    /// Replaces `resource` between identity and snapshot acquisition inside
+    /// the next bound observation.
+    pub fn replace_during_next_observe(&self, resource: &str, state: FakeState) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend.replace_during_next_observe(id, state);
+        Ok(())
+    }
+
     /// Reads the current fake OS state of `resource`.
     pub fn current_state(&self, resource: &str) -> Result<Option<FakeState>> {
         let id: crate::ResourceId = resource.parse().map_err(|e| {

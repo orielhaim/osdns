@@ -362,6 +362,43 @@ fn update_of_vanished_incarnation_requires_a_fresh_lease_without_rebinding() {
 }
 
 #[test]
+fn ambiguous_identity_before_update_fails_closed_without_mutation() {
+    let fixture = new_fixture("update-ambiguous-identity");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.set_identity_ambiguous(IFACE1, true).unwrap();
+
+    let error = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(matches!(error, Error::ResourceIdentity { .. }));
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    fixture.fake.set_identity_ambiguous(IFACE1, false).unwrap();
+    lease.restore().unwrap();
+}
+
+#[test]
+fn identity_error_before_update_fails_closed_without_mutation() {
+    let fixture = new_fixture("update-identity-error");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Identity,
+        1,
+        "transient identity failure",
+    );
+
+    let error = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(matches!(error, Error::Platform { .. }));
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    lease.restore().unwrap();
+}
+
+#[test]
 fn noop_lease_updates_without_rebind() {
     let fixture = new_fixture("engine-noop-update");
     fixture

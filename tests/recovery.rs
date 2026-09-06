@@ -422,3 +422,22 @@ fn resource_scoped_platform_errors_carry_the_target_structurally() {
         matches!(error, Error::ResourcePlatform { resource, .. } if resource == resource_id(IFACE1))
     );
 }
+
+#[test]
+fn transient_identity_failure_never_becomes_gone() {
+    let fixture = new_fixture("recovery-transient-identity-error");
+    fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap()
+        .debug_release_locks_keep_journal();
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Identity,
+        1,
+        "temporary platform failure",
+    );
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(matches!(&outcomes[..], [RecoveryOutcome::Failed { .. }]));
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+}

@@ -176,25 +176,45 @@ impl Lease {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .record
                 .clone();
-            if matches!(
-                self.inner.backend.resource_status(&record.identity),
-                Ok(ResourceStatus::Gone | ResourceStatus::Replaced)
-            ) {
-                if let Err(error) = self
-                    .inner
-                    .journal
-                    .remove(&record.lease_id, &record.resource)
-                {
+            match self.inner.backend.resource_status(&record.identity) {
+                Ok(ResourceStatus::Same) => {}
+                Ok(status @ (ResourceStatus::Gone | ResourceStatus::Replaced)) => {
+                    if let Err(error) = self
+                        .inner
+                        .journal
+                        .remove(&record.lease_id, &record.resource)
+                    {
+                        *guard = Some(repack(live));
+                        return Err(error);
+                    }
+                    self.inner.unregister_active(&record.resource);
+                    *guard = Some(repack(live));
+                    return Err(match status {
+                        ResourceStatus::Gone => Error::ResourceGone {
+                            backend: self.inner.backend.kind(),
+                            resource: record.resource,
+                            message: "the leased native resource incarnation is gone; its journal was cleared and a fresh lease is required".to_string(),
+                        },
+                        ResourceStatus::Replaced => Error::ResourceIdentity {
+                            backend: self.inner.backend.kind(),
+                            resource: record.resource,
+                            message: "the lease target was replaced; its journal was cleared and a fresh lease is required".to_string(),
+                        },
+                        _ => unreachable!(),
+                    });
+                }
+                Ok(ResourceStatus::Ambiguous) => {
+                    *guard = Some(repack(live));
+                    return Err(Error::ResourceIdentity {
+                        backend: self.inner.backend.kind(),
+                        resource: record.resource,
+                        message: "the leased native resource incarnation cannot be proven; refusing update".to_string(),
+                    });
+                }
+                Err(error) => {
                     *guard = Some(repack(live));
                     return Err(error);
                 }
-                self.inner.unregister_active(&record.resource);
-                *guard = Some(repack(live));
-                return Err(Error::ResourceGone {
-                    backend: self.inner.backend.kind(),
-                    resource: record.resource,
-                    message: "the leased native resource incarnation no longer exists; its journal was cleared and a fresh lease is required".to_string(),
-                });
             }
         }
         let wanted = match self.inner.backend.resolve_resources(config.scope(), &plan) {

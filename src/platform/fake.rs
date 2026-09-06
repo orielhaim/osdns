@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,6 +132,8 @@ impl From<&DnsConfig> for FakeState {
 /// Which backend operation to fail when injecting faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FakeOp {
+    /// Fail resource-incarnation validation.
+    Identity,
     /// Fail capture.
     Capture,
     /// Fail apply.
@@ -149,6 +151,9 @@ struct FakeInner {
     /// they were captured at for atomic guarded operations.
     generations: BTreeMap<ResourceId, u64>,
     incarnations: BTreeMap<ResourceId, u64>,
+    ambiguous: BTreeSet<ResourceId>,
+    replace_before_apply: Option<(ResourceId, FakeState)>,
+    replace_during_observe: Option<(ResourceId, FakeState)>,
     failures: Vec<(FakeOp, u32, u32, String)>,
     readback_lie: Option<FakeState>,
     /// Pending mutate-then-fail applies (see
@@ -157,6 +162,12 @@ struct FakeInner {
     before_guarded: Option<(ResourceId, FakeState)>,
     after_guarded: Option<(ResourceId, FakeState)>,
     before_nth_guarded: Option<(u32, ResourceId, FakeState)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FakeIdentity {
+    incarnation: u64,
 }
 
 /// Wire format of a fake snapshot: the managed state plus the generation
@@ -198,7 +209,8 @@ impl FakeBackend {
                 .with_watch(true)
                 .with_cache_flush(true)
                 .with_mutation_guard(MutationGuard::CompareAndMutate)
-                .with_ownership_identity(OwnershipIdentity::Durable),
+                .with_ownership_identity(OwnershipIdentity::Durable)
+                .with_resource_binding(crate::capability::ResourceBinding::NativeGuarded),
         )
     }
 
@@ -246,12 +258,17 @@ impl FakeBackend {
         }
         let incarnations = states.keys().cloned().map(|id| (id, 0)).collect();
         Self {
-            caps: caps.with_mutation_guard(MutationGuard::CompareAndMutate),
+            caps: caps
+                .with_mutation_guard(MutationGuard::CompareAndMutate)
+                .with_resource_binding(crate::capability::ResourceBinding::NativeGuarded),
             inner: Mutex::new(FakeInner {
                 interfaces,
                 states,
                 generations: BTreeMap::new(),
                 incarnations,
+                ambiguous: BTreeSet::new(),
+                replace_before_apply: None,
+                replace_during_observe: None,
                 failures: Vec::new(),
                 readback_lie: None,
                 partial_apply_failures: 0,
@@ -363,6 +380,23 @@ impl FakeBackend {
             });
         }
         removed
+    }
+
+    pub(crate) fn set_identity_ambiguous(&self, resource: ResourceId, ambiguous: bool) {
+        let mut inner = self.lock_inner();
+        if ambiguous {
+            inner.ambiguous.insert(resource);
+        } else {
+            inner.ambiguous.remove(&resource);
+        }
+    }
+
+    pub(crate) fn replace_before_next_apply(&self, resource: ResourceId, state: FakeState) {
+        self.lock_inner().replace_before_apply = Some((resource, state));
+    }
+
+    pub(crate) fn replace_during_next_observe(&self, resource: ResourceId, state: FakeState) {
+        self.lock_inner().replace_during_observe = Some((resource, state));
     }
 
     pub(crate) fn state_of(&self, resource: &ResourceId) -> Option<FakeState> {
@@ -596,31 +630,77 @@ impl Backend for FakeBackend {
         Ok(ResourceIdentity::new(
             BackendKind::Fake,
             resource.clone(),
-            serde_json::json!({ "incarnation": inner.incarnations.get(resource).copied().unwrap_or(0) }),
+            serde_json::to_value(FakeIdentity {
+                incarnation: inner.incarnations.get(resource).copied().unwrap_or(0),
+            })
+            .map_err(|error| Error::platform(BackendKind::Fake, error))?,
         ))
     }
 
-    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
-        if identity.backend != BackendKind::Fake || identity.resource.as_str().is_empty() {
-            return Ok(ResourceStatus::Replaced);
+    fn observe(&self, resource: &ResourceId) -> Result<crate::platform::BoundObservation> {
+        self.check_failure(FakeOp::Identity)?;
+        let mut inner = self.lock_inner();
+        if !inner.states.contains_key(resource) {
+            return Err(Error::ResourceGone {
+                backend: BackendKind::Fake,
+                resource: resource.clone(),
+                message: "resource is absent".to_string(),
+            });
         }
+        let identity = ResourceIdentity::new(
+            BackendKind::Fake,
+            resource.clone(),
+            serde_json::to_value(FakeIdentity {
+                incarnation: inner.incarnations.get(resource).copied().unwrap_or(0),
+            })
+            .map_err(|error| Error::platform(BackendKind::Fake, error))?,
+        );
+        if let Some((wanted, state)) = inner.replace_during_observe.take() {
+            inner.states.insert(wanted.clone(), state);
+            *inner.incarnations.entry(wanted.clone()).or_insert(0) += 1;
+            *inner.generations.entry(wanted).or_insert(0) += 1;
+        }
+        let observed_incarnation = serde_json::from_value::<FakeIdentity>(identity.data.clone())
+            .expect("fresh fake identity")
+            .incarnation;
+        if inner.incarnations.get(resource).copied().unwrap_or(0) != observed_incarnation {
+            return Err(Error::ResourceIdentity {
+                backend: BackendKind::Fake,
+                resource: resource.clone(),
+                message: "resource was replaced during bound observation".to_string(),
+            });
+        }
+        let snapshot = Self::snapshot_from(&inner, resource)?;
+        Ok(crate::platform::BoundObservation { identity, snapshot })
+    }
+
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        self.check_failure(FakeOp::Identity)?;
+        if identity.backend != BackendKind::Fake {
+            return Err(Error::JournalCorrupt(
+                "fake identity has the wrong backend".to_string(),
+            ));
+        }
+        let decoded: FakeIdentity =
+            serde_json::from_value(identity.data.clone()).map_err(|error| {
+                Error::JournalCorrupt(format!("invalid fake resource identity: {error}"))
+            })?;
         let inner = self.lock_inner();
+        if inner.ambiguous.contains(&identity.resource) {
+            return Ok(ResourceStatus::Ambiguous);
+        }
         if !inner.states.contains_key(&identity.resource) {
             return Ok(ResourceStatus::Gone);
         }
-        let recorded = identity
-            .data
-            .get("incarnation")
-            .and_then(serde_json::Value::as_u64);
         let current = inner
             .incarnations
             .get(&identity.resource)
             .copied()
             .unwrap_or(0);
-        Ok(match recorded {
-            Some(value) if value == current => ResourceStatus::Same,
-            Some(_) => ResourceStatus::Replaced,
-            None => ResourceStatus::Ambiguous,
+        Ok(if decoded.incarnation == current {
+            ResourceStatus::Same
+        } else {
+            ResourceStatus::Replaced
         })
     }
 
@@ -731,6 +811,14 @@ impl Backend for FakeBackend {
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
     ) -> MutationAttempt {
+        {
+            let mut inner = self.lock_inner();
+            if let Some((wanted, state)) = inner.replace_before_apply.take() {
+                inner.states.insert(wanted.clone(), state);
+                *inner.incarnations.entry(wanted.clone()).or_insert(0) += 1;
+                *inner.generations.entry(wanted).or_insert(0) += 1;
+            }
+        }
         {
             let mut inner = self.lock_inner();
             if let Some((skip, id, state)) = inner.before_nth_guarded.take() {

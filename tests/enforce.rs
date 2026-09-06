@@ -418,6 +418,31 @@ fn vanished_enforce_resource_is_terminal_and_never_rebound() {
 }
 
 #[test]
+fn replacement_during_enforce_reapply_is_not_mutated() {
+    let fixture = enforce_manager("enforce-replacement-race");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("8.8.8.8"))
+        .unwrap();
+    fixture
+        .fake
+        .replace_before_next_apply(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    lease.abandon().unwrap();
+}
+
+#[test]
 fn enforce_reconciles_initial_noop_lease() {
     let fixture = enforce_manager("enforce-initial-noop");
     fixture

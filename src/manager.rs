@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::capability::{Capabilities, MutationGuard, OwnershipIdentity};
+use crate::capability::{Capabilities, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope, validate_against};
 use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
@@ -381,20 +381,21 @@ impl Inner {
     /// never a fresh post-failure read.
     pub(crate) fn mutate_and_verify(
         &self,
-        resource: &ResourceId,
+        identity: &ResourceIdentity,
         expected_current: &PlatformSnapshot,
         plan: &NormalizedConfig,
         rollback_to: Option<&PlatformSnapshot>,
         points: MutatePoints,
         residue: &mut MutationResidue,
     ) -> Result<VerifiedMutation> {
+        let resource = &identity.resource;
         residue.leftover = None;
         residue.restored = None;
         self.suppressions.suppress(resource);
-        match self.apply_attempt(resource, expected_current, plan) {
+        match self.apply_attempt(identity, expected_current, plan) {
             MutationAttempt::Rejected { error } => Err(error),
             MutationAttempt::Indeterminate { error, produced } => {
-                match self.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                match self.rollback_proven(resource, identity, produced.as_ref(), rollback_to) {
                     Some(identity) => residue.restored = identity,
                     None => residue.leftover = produced.map(OwnershipProof::issued),
                 }
@@ -405,7 +406,7 @@ impl Inner {
                             residue: &mut MutationResidue,
                             produced: Option<PlatformSnapshot>,
                             error: Error| {
-                    match this.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                    match this.rollback_proven(resource, identity, produced.as_ref(), rollback_to) {
                         Some(identity) => residue.restored = identity,
                         None => residue.leftover = produced.map(OwnershipProof::issued),
                     }
@@ -413,6 +414,24 @@ impl Inner {
                 };
                 if let Err(error) = self.fire(points.apply) {
                     return fail(self, residue, produced, error);
+                }
+                match self.backend.resource_status(identity) {
+                    Ok(ResourceStatus::Same) => {}
+                    Ok(status) => {
+                        return fail(
+                            self,
+                            residue,
+                            produced,
+                            Error::ResourceIdentity {
+                                backend: self.backend.kind(),
+                                resource: resource.clone(),
+                                message: format!(
+                                    "resource incarnation became {status:?} during mutation"
+                                ),
+                            },
+                        );
+                    }
+                    Err(error) => return fail(self, residue, produced, error),
                 }
                 match self.backend.readback(resource) {
                     Ok(actual) => {
@@ -430,6 +449,24 @@ impl Inner {
                                         .to_string(),
                                 },
                             );
+                        }
+                        match self.backend.resource_status(identity) {
+                            Ok(ResourceStatus::Same) => {}
+                            Ok(status) => {
+                                return fail(
+                                    self,
+                                    residue,
+                                    produced,
+                                    Error::ResourceIdentity {
+                                        backend: self.backend.kind(),
+                                        resource: resource.clone(),
+                                        message: format!(
+                                            "resource incarnation became {status:?} during verification"
+                                        ),
+                                    },
+                                );
+                            }
+                            Err(error) => return fail(self, residue, produced, error),
                         }
                         if let Err(error) = self.fire(points.verify) {
                             return fail(self, residue, produced, error);
@@ -479,43 +516,24 @@ impl Inner {
 
     fn apply_attempt(
         &self,
-        resource: &ResourceId,
+        identity: &ResourceIdentity,
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
     ) -> MutationAttempt {
-        match self.backend.mutation_guard() {
-            MutationGuard::CompareAndMutate => self.backend.apply_guarded(resource, expected, plan),
-            MutationGuard::Unconditional => {
-                MutationAttempt::from_apply_result(self.backend.apply(resource, plan))
-            }
-        }
+        self.backend.apply_bound(identity, expected, plan)
     }
 
     fn restore_if_current(
         &self,
-        resource: &ResourceId,
+        _resource: &ResourceId,
+        identity: &ResourceIdentity,
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
     ) -> Result<Option<PlatformSnapshot>> {
-        match self.backend.mutation_guard() {
-            MutationGuard::CompareAndMutate => {
-                match self.backend.restore_guarded(resource, expected, target) {
-                    MutationAttempt::Performed { produced } => Ok(produced),
-                    MutationAttempt::Rejected { error }
-                    | MutationAttempt::Indeterminate { error, .. } => Err(error),
-                }
-            }
-            MutationGuard::Unconditional => {
-                let current = self.backend.readback(resource)?;
-                if !self.backend.owns_current(expected, &current) {
-                    return Err(Error::ExternalModification {
-                        resource: resource.clone(),
-                        detail: "the current state changed since ownership was verified"
-                            .to_string(),
-                    });
-                }
-                self.backend.restore(resource, target)?;
-                Ok(None)
+        match self.backend.restore_bound(identity, expected, target) {
+            MutationAttempt::Performed { produced } => Ok(produced),
+            MutationAttempt::Rejected { error } | MutationAttempt::Indeterminate { error, .. } => {
+                Err(error)
             }
         }
     }
@@ -528,6 +546,7 @@ impl Inner {
     fn rollback_proven(
         &self,
         resource: &ResourceId,
+        identity: &ResourceIdentity,
         proof: Option<&PlatformSnapshot>,
         target: Option<&PlatformSnapshot>,
     ) -> Option<Option<PlatformSnapshot>> {
@@ -537,7 +556,7 @@ impl Inner {
         if self.backend.equivalent(proof, target) {
             return Some(Some(proof.clone()));
         }
-        let produced = match self.restore_if_current(resource, proof, target) {
+        let produced = match self.restore_if_current(resource, identity, proof, target) {
             Ok(produced) => produced,
             Err(error) => {
                 osdns_warn!(
@@ -638,7 +657,7 @@ impl Inner {
             let expected = records[index].before.clone();
             let mut residue = MutationResidue::new();
             match self.mutate_and_verify(
-                &records[index].resource,
+                &records[index].identity,
                 &expected,
                 plan,
                 Some(&records[index].before),
@@ -651,6 +670,7 @@ impl Inner {
                         if self
                             .rollback_proven(
                                 &record.resource,
+                                &record.identity,
                                 Some(&mutation.persist()),
                                 Some(&record.before),
                             )
@@ -781,11 +801,10 @@ impl Inner {
         // restored to their pre-update form.
         let mut mutations: Vec<Option<VerifiedMutation>> = vec![None; live.len()];
         for index in 0..live.len() {
-            let resource = olds[index].resource.clone();
             let expected = applieds[index].clone();
             let mut residue = MutationResidue::new();
             match self.mutate_and_verify(
-                &resource,
+                &olds[index].identity,
                 &expected,
                 plan,
                 Some(&applieds[index]),
@@ -800,6 +819,7 @@ impl Inner {
                         if let Some(mutation) = &mutations[rollback_index]
                             && let Some(Some(identity)) = self.rollback_proven(
                                 &olds[rollback_index].resource,
+                                &olds[rollback_index].identity,
                                 Some(&mutation.persist()),
                                 Some(&applieds[rollback_index]),
                             )
@@ -948,7 +968,7 @@ impl Inner {
                     .to_string(),
             });
         }
-        self.restore_if_current(resource, applied, &record.before)?;
+        self.restore_if_current(resource, &record.identity, applied, &record.before)?;
         self.fire(TxPoint::AfterRestoreRestore)?;
         let now = self.backend.readback(resource)?;
         if !self.backend.equivalent(&now, &record.before) {
@@ -1032,7 +1052,9 @@ impl Inner {
         if owned {
             self.suppressions.suppress(&resource);
             let applied = record.applied.as_ref().expect("applied snapshot");
-            if let Err(error) = self.restore_if_current(&resource, applied, &record.before) {
+            if let Err(error) =
+                self.restore_if_current(&resource, &record.identity, applied, &record.before)
+            {
                 if error.is_external_modification() {
                     return Ok(RecoveryOutcome::ExternalConflict {
                         resource,
@@ -1328,8 +1350,9 @@ impl DnsManager {
         let mut befores = Vec::with_capacity(resources.len());
         let mut identities = Vec::with_capacity(resources.len());
         for resource in &resources {
-            identities.push(self.inner.backend.identify(resource)?);
-            befores.push(self.inner.backend.capture(resource)?);
+            let observation = self.inner.backend.observe(resource)?;
+            identities.push(observation.identity);
+            befores.push(observation.snapshot);
             self.inner.fire(TxPoint::AfterCapture)?;
         }
         self.inner.fire(TxPoint::AfterNoopDecision)?;

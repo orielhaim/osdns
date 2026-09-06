@@ -73,6 +73,51 @@ fn delete_then_recreate_requires_a_fresh_lease() {
 }
 
 #[test]
+fn incarnation_replaced_between_bound_observation_and_apply_is_not_mutated() {
+    let fixture = new_fixture("race-incarnation-before-apply");
+    fixture
+        .fake
+        .replace_before_next_apply(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    assert!(fixture.manager.apply(&iface_config(1, "1.1.1.1")).is_err());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
+fn incarnation_replaced_between_identity_and_snapshot_is_rejected() {
+    let fixture = new_fixture("race-incarnation-during-observe");
+    fixture
+        .fake
+        .replace_during_next_observe(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    assert!(fixture.manager.apply(&iface_config(1, "1.1.1.1")).is_err());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn incarnation_replaced_during_update_is_not_mutated() {
+    let fixture = new_fixture("race-incarnation-update");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture
+        .fake
+        .replace_before_next_apply(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    assert!(lease.update(&iface_config(1, "8.8.8.8")).is_err());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    lease.abandon().unwrap();
+}
+
+#[test]
 fn external_write_between_two_leases_is_never_overwritten() {
     let fixture = new_fixture("race-two-leases");
     let first = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();

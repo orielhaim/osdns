@@ -105,6 +105,73 @@ pub(crate) struct SystemdResolved {
     live_links: Mutex<HashMap<String, File>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResolvedIdentity {
+    boot_id: uuid::Uuid,
+    netns: String,
+    ifindex: u32,
+    ifname: String,
+    iflink: Option<u32>,
+    address: Option<String>,
+    uevent: Option<String>,
+    handle: uuid::Uuid,
+}
+
+impl ResolvedIdentity {
+    fn decode(identity: &ResourceIdentity) -> Result<Self> {
+        if identity.backend != BackendKind::SystemdResolved {
+            return Err(Error::JournalCorrupt(
+                "resolved identity has the wrong backend".to_string(),
+            ));
+        }
+        let decoded: Self = serde_json::from_value(identity.data.clone()).map_err(|error| {
+            Error::JournalCorrupt(format!("invalid resolved identity: {error}"))
+        })?;
+        decoded.validate(&identity.resource)?;
+        Ok(decoded)
+    }
+
+    fn validate(&self, resource: &ResourceId) -> Result<()> {
+        let resource_ifindex = SystemdResolved::ifindex_of(resource).map_err(|_| {
+            Error::JournalCorrupt("invalid systemd-resolved resource selector".to_string())
+        })?;
+        let netns_id = self
+            .netns
+            .strip_prefix("net:[")
+            .and_then(|value| value.strip_suffix(']'));
+        if self.ifindex == 0
+            || self.ifindex != resource_ifindex
+            || self.ifname.is_empty()
+            || !netns_id
+                .is_some_and(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(Error::JournalCorrupt(
+                "invalid systemd-resolved resource identity".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn classify_identity(
+    recorded: &ResolvedIdentity,
+    current: Option<&ResolvedIdentity>,
+    live_inodes: Option<(u64, u64)>,
+) -> ResourceStatus {
+    let Some(current) = current else {
+        return ResourceStatus::Gone;
+    };
+    if current.boot_id != recorded.boot_id {
+        return ResourceStatus::Gone;
+    }
+    match live_inodes {
+        Some((old, now)) if old == now => ResourceStatus::Same,
+        Some(_) => ResourceStatus::Replaced,
+        None => ResourceStatus::Ambiguous,
+    }
+}
+
 impl SystemdResolved {
     pub(crate) fn connect() -> Result<Self> {
         let conn = Connection::system().map_err(|e| {
@@ -191,10 +258,7 @@ impl SystemdResolved {
         Ok(index)
     }
 
-    fn identity_data(
-        ifindex: u32,
-        handle: Option<&str>,
-    ) -> Result<(serde_json::Value, Option<File>)> {
+    fn identity_data(ifindex: u32, handle: uuid::Uuid) -> Result<Option<(ResolvedIdentity, File)>> {
         let entry = std::fs::read_dir("/sys/class/net")?
             .filter_map(std::result::Result::ok)
             .find(|entry| {
@@ -204,7 +268,7 @@ impl SystemdResolved {
                     == Some(ifindex)
             });
         let Some(entry) = entry else {
-            return Ok((serde_json::json!({ "gone": true }), None));
+            return Ok(None);
         };
         let path = entry.path();
         let read = |name: &str| {
@@ -213,19 +277,25 @@ impl SystemdResolved {
                 .map(|s| s.trim().to_string())
         };
         let file = File::open(&path)?;
-        Ok((
-            serde_json::json!({
-                "boot_id": std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim(),
-                "netns": std::fs::read_link("/proc/self/ns/net")?.to_string_lossy(),
-                "ifindex": ifindex,
-                "ifname": entry.file_name().to_string_lossy(),
-                "iflink": read("iflink"),
-                "address": read("address"),
-                "uevent": read("uevent"),
-                "handle": handle,
-            }),
-            Some(file),
-        ))
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+            .trim()
+            .parse()
+            .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?;
+        Ok(Some((
+            ResolvedIdentity {
+                boot_id,
+                netns: std::fs::read_link("/proc/self/ns/net")?
+                    .to_string_lossy()
+                    .into_owned(),
+                ifindex,
+                ifname: entry.file_name().to_string_lossy().into_owned(),
+                iflink: read("iflink").and_then(|value| value.parse().ok()),
+                address: read("address"),
+                uevent: read("uevent"),
+                handle,
+            },
+            file,
+        )))
     }
 }
 
@@ -263,6 +333,7 @@ fn capabilities() -> Capabilities {
         .with_default_route(true)
         .with_watch(true)
         .with_cache_flush(true)
+        .with_resource_binding(crate::capability::ResourceBinding::PreflightOnly)
 }
 
 impl Backend for SystemdResolved {
@@ -297,70 +368,41 @@ impl Backend for SystemdResolved {
 
     fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
         let ifindex = Self::ifindex_of(resource)?;
-        let handle = uuid::Uuid::new_v4().simple().to_string();
-        let (data, file) = Self::identity_data(ifindex, Some(&handle))?;
-        if data.get("gone").is_some() {
+        let handle = uuid::Uuid::new_v4();
+        let Some((data, file)) = Self::identity_data(ifindex, handle)? else {
             return Err(Error::ResourceGone {
                 backend: BackendKind::SystemdResolved,
                 resource: resource.clone(),
                 message: "the kernel link is absent".to_string(),
             });
-        }
+        };
+        data.validate(resource)?;
         self.live_links
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(handle, file.expect("present link has a handle"));
+            .insert(handle.simple().to_string(), file);
         Ok(ResourceIdentity::new(
             BackendKind::SystemdResolved,
             resource.clone(),
-            data,
+            serde_json::to_value(data)
+                .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?,
         ))
     }
 
     fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
-        if identity.backend != BackendKind::SystemdResolved
-            || Self::ifindex_of(&identity.resource).is_err()
-        {
-            return Ok(ResourceStatus::Replaced);
-        }
-        let (mut current, current_file) =
-            Self::identity_data(Self::ifindex_of(&identity.resource)?, None)?;
-        if current.get("gone").is_some() {
+        let old = ResolvedIdentity::decode(identity)?;
+        let current_handle = uuid::Uuid::new_v4();
+        let Some((current, current_file)) = Self::identity_data(old.ifindex, current_handle)?
+        else {
             return Ok(ResourceStatus::Gone);
-        }
-        if current.get("boot_id") != identity.data.get("boot_id") {
-            return Ok(ResourceStatus::Gone);
-        }
-        let old_handle = identity
-            .data
-            .get("handle")
-            .and_then(serde_json::Value::as_str);
-        if let Some(object) = current.as_object_mut() {
-            object.insert(
-                "handle".to_string(),
-                identity
-                    .data
-                    .get("handle")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            );
-        }
-        if current != identity.data {
-            return Ok(ResourceStatus::Replaced);
-        }
-        // Linux exposes no durable netdev creation cookie. Equal selectors and
-        // attributes after a process boundary are evidence, not proof.
+        };
         let handles = self.live_links.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(match old_handle.and_then(|key| handles.get(key)) {
-            Some(original)
-                if original.metadata()?.ino()
-                    == current_file.expect("present link").metadata()?.ino() =>
-            {
-                ResourceStatus::Same
-            }
-            Some(_) => ResourceStatus::Replaced,
-            None => ResourceStatus::Ambiguous,
-        })
+        let live_inodes = if let Some(original) = handles.get(&old.handle.simple().to_string()) {
+            Some((original.metadata()?.ino(), current_file.metadata()?.ino()))
+        } else {
+            None
+        };
+        Ok(classify_identity(&old, Some(&current), live_inodes))
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
@@ -509,9 +551,22 @@ fn from_platform_snapshot(snapshot: &PlatformSnapshot) -> Result<ResolvedSnapsho
 
 #[cfg(test)]
 mod resource_identity_tests {
-    use super::SystemdResolved;
+    use super::{ResolvedIdentity, SystemdResolved, classify_identity, dbus_resource_error};
     use crate::error::Error;
-    use crate::platform::Backend;
+    use crate::platform::{Backend, ResourceStatus};
+
+    fn identity() -> ResolvedIdentity {
+        ResolvedIdentity {
+            boot_id: uuid::Uuid::new_v4(),
+            netns: "net:[4026531840]".to_string(),
+            ifindex: 8,
+            ifname: "tun0".to_string(),
+            iflink: Some(8),
+            address: Some("02:00:00:00:00:01".to_string()),
+            uevent: Some("INTERFACE=tun0".to_string()),
+            handle: uuid::Uuid::new_v4(),
+        }
+    }
 
     #[test]
     fn resolved_resource_parser_validates_the_complete_kind() {
@@ -529,6 +584,75 @@ mod resource_identity_tests {
         let resource = "linux:resolved:ifindex:2147483647".parse().unwrap();
         let error = backend.capture(&resource).unwrap_err();
         assert!(matches!(error, Error::ResourceGone { resource: found, .. } if found == resource));
+    }
+
+    #[test]
+    fn transient_resolved_error_is_not_resource_gone() {
+        let resource = "linux:resolved:ifindex:8".parse().unwrap();
+        let error = dbus_resource_error(&resource, zbus::Error::Failure("timeout".to_string()));
+        assert!(
+            matches!(error, Error::ResourcePlatform { resource: found, .. } if found == resource)
+        );
+    }
+
+    #[test]
+    fn live_handle_proof_wins_over_mutable_metadata() {
+        let old = identity();
+        let mut renamed = old.clone();
+        renamed.ifname = "renamed0".to_string();
+        renamed.address = Some("02:00:00:00:00:02".to_string());
+        renamed.uevent = Some("INTERFACE=renamed0".to_string());
+        renamed.iflink = Some(9);
+        assert_eq!(
+            classify_identity(&old, Some(&renamed), Some((42, 42))),
+            ResourceStatus::Same
+        );
+    }
+
+    #[test]
+    fn restart_fingerprints_are_never_replacement_proof() {
+        let old = identity();
+        assert_eq!(
+            classify_identity(&old, Some(&old), None),
+            ResourceStatus::Ambiguous
+        );
+        let mut changed = old.clone();
+        changed.ifname = "renamed0".to_string();
+        changed.address = None;
+        assert_eq!(
+            classify_identity(&old, Some(&changed), None),
+            ResourceStatus::Ambiguous
+        );
+    }
+
+    #[test]
+    fn different_live_sysfs_object_proves_replacement() {
+        let old = identity();
+        assert_eq!(
+            classify_identity(&old, Some(&old), Some((42, 43))),
+            ResourceStatus::Replaced
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_resolved_identity_is_rejected() {
+        let resource: crate::ResourceId = "linux:resolved:ifindex:8".parse().unwrap();
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({ "boot_id": 7 }),
+            serde_json::json!({
+                "boot_id": uuid::Uuid::new_v4(), "netns": "net:[]", "ifindex": 9,
+                "ifname": "tun0", "iflink": 8, "address": null, "uevent": null,
+                "handle": uuid::Uuid::new_v4()
+            }),
+        ] {
+            let identity = crate::platform::ResourceIdentity::new(
+                crate::BackendKind::SystemdResolved,
+                resource.clone(),
+                data,
+            );
+            assert!(ResolvedIdentity::decode(&identity).is_err());
+        }
     }
 }
 

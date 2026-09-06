@@ -436,8 +436,9 @@ impl Inner {
         rollback_to: &PlatformSnapshot,
     ) -> ReconcileOutcome {
         let mut residue = crate::manager::MutationResidue::new();
+        let identity = lock_live(entry).record.identity.clone();
         match self.mutate_and_verify(
-            resource,
+            &identity,
             expected,
             desired,
             Some(rollback_to),

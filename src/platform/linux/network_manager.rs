@@ -293,9 +293,18 @@ impl NetworkManager {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
     ) -> Result<(NmDeviceProxyBlocking<'_>, OwnedSettings, u64)> {
+        let (device, _name) = self.device_for_resource(resource)?;
+        self.guarded_baseline_device(resource, device, expected)
+    }
+
+    fn guarded_baseline_device<'a>(
+        &'a self,
+        resource: &ResourceId,
+        device: NmDeviceProxyBlocking<'a>,
+        expected: &PlatformSnapshot,
+    ) -> Result<(NmDeviceProxyBlocking<'a>, OwnedSettings, u64)> {
         let expected_fields = Self::fields_from_snapshot(expected)?;
         let expected_version = Self::version_from_snapshot(expected);
-        let (device, _name) = self.device_for_resource(resource)?;
         let (live_settings, live_version) = self.applied(&device)?;
         if parse_nm_dns_fields(&convert_settings(&live_settings)) != expected_fields {
             return Err(Error::ExternalModification {
@@ -368,6 +377,81 @@ struct NmSnapshotData {
     version: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NmResourceIdentity {
+    ifname: String,
+    device_path: String,
+    active_path: String,
+    connection_uuid: uuid::Uuid,
+    service_owner: String,
+}
+
+impl NmResourceIdentity {
+    fn decode(identity: &ResourceIdentity) -> Result<Self> {
+        if identity.backend != BackendKind::NetworkManager {
+            return Err(Error::JournalCorrupt(
+                "NetworkManager identity has the wrong backend".to_string(),
+            ));
+        }
+        let selector_name = NetworkManager::ifname_of(&identity.resource).map_err(|_| {
+            Error::JournalCorrupt("invalid NetworkManager resource selector".to_string())
+        })?;
+        let decoded: Self = serde_json::from_value(identity.data.clone()).map_err(|error| {
+            Error::JournalCorrupt(format!("invalid NetworkManager resource identity: {error}"))
+        })?;
+        if decoded.ifname != selector_name
+            || zbus::names::UniqueName::try_from(decoded.service_owner.as_str()).is_err()
+            || OwnedObjectPath::try_from(decoded.device_path.as_str()).is_err()
+            || OwnedObjectPath::try_from(decoded.active_path.as_str()).is_err()
+            || !native_object_path(&decoded.device_path, "Devices")
+            || !native_object_path(&decoded.active_path, "ActiveConnection")
+        {
+            return Err(Error::JournalCorrupt(
+                "invalid NetworkManager resource identity fields".to_string(),
+            ));
+        }
+        Ok(decoded)
+    }
+}
+
+fn native_object_path(path: &str, kind: &str) -> bool {
+    path.strip_prefix(&format!("/org/freedesktop/NetworkManager/{kind}/"))
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn classify_nm_activation(
+    recorded: &NmResourceIdentity,
+    service_owner: &str,
+    active_path: &str,
+    connection_uuid: uuid::Uuid,
+) -> ResourceStatus {
+    if recorded.service_owner != service_owner {
+        ResourceStatus::Ambiguous
+    } else if recorded.active_path != active_path || recorded.connection_uuid != connection_uuid {
+        ResourceStatus::Replaced
+    } else {
+        ResourceStatus::Same
+    }
+}
+
+fn nm_resource_error(resource: &ResourceId, error: zbus::Error) -> Error {
+    if matches!(&error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject")
+    {
+        Error::ResourceGone {
+            backend: BackendKind::NetworkManager,
+            resource: resource.clone(),
+            message: error.to_string(),
+        }
+    } else {
+        Error::ResourcePlatform {
+            backend: BackendKind::NetworkManager,
+            resource: resource.clone(),
+            message: error.to_string(),
+        }
+    }
+}
+
 fn capabilities(dns_mode: &str) -> Capabilities {
     Capabilities::new(BackendKind::NetworkManager)
         .with_read(true)
@@ -380,6 +464,7 @@ fn capabilities(dns_mode: &str) -> Capabilities {
         .with_cache_flush(false)
         .with_mutation_guard(crate::capability::MutationGuard::CompareAndMutate)
         .with_ownership_identity(crate::capability::OwnershipIdentity::BestEffort)
+        .with_resource_binding(crate::capability::ResourceBinding::NativeGuarded)
 }
 
 fn u32_array(values: &[u32]) -> Array<'static> {
@@ -458,71 +543,122 @@ impl Backend for NetworkManager {
 
     fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
         let (device, name) = self.device_for_resource(resource)?;
-        let (settings, version) = self.applied(&device)?;
+        let (settings, _version) = self.applied(&device)?;
         let uuid =
             extract_uuid(&to_owned_static(&settings)).ok_or_else(|| Error::ResourcePlatform {
                 backend: BackendKind::NetworkManager,
                 resource: resource.clone(),
                 message: "the device has no active connection UUID".to_string(),
             })?;
+        let data = NmResourceIdentity {
+            ifname: name,
+            device_path: device.inner().path().as_str().to_string(),
+            active_path: device
+                .active_connection()
+                .map_err(|error| nm_resource_error(resource, error))?
+                .as_str()
+                .to_string(),
+            connection_uuid: uuid.parse().map_err(|error| Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: resource.clone(),
+                message: format!("invalid active connection UUID: {error}"),
+            })?,
+            service_owner: self.service_owner()?,
+        };
         Ok(ResourceIdentity::new(
             BackendKind::NetworkManager,
             resource.clone(),
-            serde_json::json!({
-                "ifname": name,
-                "device_path": device.inner().path().as_str(),
-                "active_path": device.active_connection().map_err(|e| Error::ResourcePlatform { backend: BackendKind::NetworkManager, resource: resource.clone(), message: e.to_string() })?.as_str(),
-            "connection_uuid": uuid,
-            "version": version,
-            "service_owner": self.service_owner()?,
-            }),
+            serde_json::to_value(data)
+                .map_err(|error| Error::platform(BackendKind::NetworkManager, error))?,
         ))
     }
 
     fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
-        if identity.backend != BackendKind::NetworkManager
-            || Self::ifname_of(&identity.resource).is_err()
-        {
+        let recorded = NmResourceIdentity::decode(identity)?;
+        let service_owner = self.service_owner()?;
+        if recorded.service_owner != service_owner {
+            return Ok(ResourceStatus::Ambiguous);
+        }
+        let path =
+            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
+        let device = self.device(path)?;
+        let active = device
+            .active_connection()
+            .map_err(|error| nm_resource_error(&identity.resource, error))?;
+        if active.as_str() != recorded.active_path {
             return Ok(ResourceStatus::Replaced);
         }
-        let (device, _) = match self.device_for_resource(&identity.resource) {
-            Ok(value) => value,
-            Err(_) => return Ok(ResourceStatus::Gone),
-        };
-        let (settings, _) = match self.applied(&device) {
-            Ok(value) => value,
-            Err(_) => return Ok(ResourceStatus::Gone),
-        };
-        let current_uuid = extract_uuid(&to_owned_static(&settings));
-        let current_active = device.active_connection().ok();
-        if identity
-            .data
-            .get("service_owner")
-            .and_then(serde_json::Value::as_str)
-            != Some(self.service_owner()?.as_str())
+        let (settings, _) = self.applied(&device).map_err(|error| match error {
+            Error::Platform { message, .. } => Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: identity.resource.clone(),
+                message,
+            },
+            other => other,
+        })?;
+        let current_uuid = extract_uuid(&to_owned_static(&settings))
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: identity.resource.clone(),
+                message: "the applied connection has no valid UUID".to_string(),
+            })?;
+        Ok(classify_nm_activation(
+            &recorded,
+            &service_owner,
+            active.as_str(),
+            current_uuid,
+        ))
+    }
+
+    fn observe(&self, resource: &ResourceId) -> Result<crate::platform::BoundObservation> {
+        let (device, name) = self.device_for_resource(resource)?;
+        let owner = self.service_owner()?;
+        let active = device
+            .active_connection()
+            .map_err(|error| nm_resource_error(resource, error))?;
+        let (settings, version) = self.applied(&device)?;
+        let uuid: uuid::Uuid = extract_uuid(&to_owned_static(&settings))
+            .ok_or_else(|| Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: resource.clone(),
+                message: "the device has no active connection UUID".to_string(),
+            })?
+            .parse()
+            .map_err(|error| Error::ResourcePlatform {
+                backend: BackendKind::NetworkManager,
+                resource: resource.clone(),
+                message: format!("invalid active connection UUID: {error}"),
+            })?;
+        if owner != self.service_owner()?
+            || active
+                != device
+                    .active_connection()
+                    .map_err(|error| nm_resource_error(resource, error))?
         {
-            return Ok(ResourceStatus::Gone);
+            return Err(Error::ResourceIdentity {
+                backend: BackendKind::NetworkManager,
+                resource: resource.clone(),
+                message: "NetworkManager activation changed while it was being observed"
+                    .to_string(),
+            });
         }
-        let same = identity
-            .data
-            .get("device_path")
-            .and_then(serde_json::Value::as_str)
-            == Some(device.inner().path().as_str())
-            && identity
-                .data
-                .get("active_path")
-                .and_then(serde_json::Value::as_str)
-                == current_active.as_ref().map(|p| p.as_str())
-            && identity
-                .data
-                .get("connection_uuid")
-                .and_then(serde_json::Value::as_str)
-                == current_uuid.as_deref();
-        Ok(if same {
-            ResourceStatus::Same
-        } else {
-            ResourceStatus::Replaced
-        })
+        let data = NmResourceIdentity {
+            ifname: name,
+            device_path: device.inner().path().as_str().to_string(),
+            active_path: active.as_str().to_string(),
+            connection_uuid: uuid,
+            service_owner: owner,
+        };
+        let identity = ResourceIdentity::new(
+            BackendKind::NetworkManager,
+            resource.clone(),
+            serde_json::to_value(data)
+                .map_err(|error| Error::platform(BackendKind::NetworkManager, error))?,
+        );
+        let fields = parse_nm_dns_fields(&convert_settings(&settings));
+        let snapshot = Self::to_platform_snapshot(resource, &fields, version)?;
+        Ok(crate::platform::BoundObservation { identity, snapshot })
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
@@ -559,6 +695,140 @@ impl Backend for NetworkManager {
         Self::with_dns_fields(&mut settings, &before, true);
         self.reapply(&device, settings)?;
         Ok(())
+    }
+
+    fn apply_bound(
+        &self,
+        identity: &ResourceIdentity,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> crate::platform::MutationAttempt {
+        if let Err(error) = match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => Ok(()),
+            Ok(status) => Err(Error::ResourceIdentity {
+                backend: BackendKind::NetworkManager,
+                resource: identity.resource.clone(),
+                message: format!("activation is {status:?}; refusing reapply"),
+            }),
+            Err(error) => Err(error),
+        } {
+            return crate::platform::MutationAttempt::Rejected { error };
+        }
+        let recorded = match NmResourceIdentity::decode(identity) {
+            Ok(recorded) => recorded,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        let path =
+            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
+        let device = match self.device(path) {
+            Ok(device) => device,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        let (device, live_settings, expected_version) =
+            match self.guarded_baseline_device(&identity.resource, device, expected) {
+                Ok(value) => value,
+                Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+            };
+        match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => {}
+            Ok(status) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: Error::ResourceIdentity {
+                        backend: BackendKind::NetworkManager,
+                        resource: identity.resource.clone(),
+                        message: format!("activation became {status:?} before reapply"),
+                    },
+                };
+            }
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        }
+        let mut settings = to_owned_static(&live_settings);
+        Self::with_dns_fields(
+            &mut settings,
+            &NmDnsFields::from_plan(plan, self.caps.split_dns),
+            false,
+        );
+        match self.reapply_versioned(&device, settings, expected_version) {
+            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
+            Err(error) => crate::platform::MutationAttempt::Indeterminate {
+                error: self.map_reapply_error(
+                    &identity.resource,
+                    &device,
+                    expected_version,
+                    "apply",
+                    error,
+                ),
+                produced: None,
+            },
+        }
+    }
+
+    fn restore_bound(
+        &self,
+        identity: &ResourceIdentity,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> crate::platform::MutationAttempt {
+        let before = match Self::fields_from_snapshot(target) {
+            Ok(fields) => fields,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => {}
+            Ok(status) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: Error::ResourceIdentity {
+                        backend: BackendKind::NetworkManager,
+                        resource: identity.resource.clone(),
+                        message: format!("activation is {status:?}; refusing restore"),
+                    },
+                };
+            }
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        }
+        let recorded = match NmResourceIdentity::decode(identity) {
+            Ok(recorded) => recorded,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        let path =
+            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
+        let device = match self.device(path) {
+            Ok(device) => device,
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        };
+        let (device, live_settings, expected_version) =
+            match self.guarded_baseline_device(&identity.resource, device, expected) {
+                Ok(value) => value,
+                Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+            };
+        match self.resource_status(identity) {
+            Ok(ResourceStatus::Same) => {}
+            Ok(status) => {
+                return crate::platform::MutationAttempt::Rejected {
+                    error: Error::ResourceIdentity {
+                        backend: BackendKind::NetworkManager,
+                        resource: identity.resource.clone(),
+                        message: format!("activation became {status:?} before restore"),
+                    },
+                };
+            }
+            Err(error) => return crate::platform::MutationAttempt::Rejected { error },
+        }
+        let mut settings = to_owned_static(&live_settings);
+        Self::with_dns_fields(&mut settings, &before, true);
+        match self.reapply_versioned(&device, settings, expected_version) {
+            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
+            Err(error) => crate::platform::MutationAttempt::Indeterminate {
+                error: self.map_reapply_error(
+                    &identity.resource,
+                    &device,
+                    expected_version,
+                    "restore",
+                    error,
+                ),
+                produced: None,
+            },
+        }
     }
 
     fn apply_guarded(
@@ -862,5 +1132,79 @@ fn to_setting_value(owned: &OwnedValue) -> crate::platform::text_config::Setting
             }
         }
         _ => SettingValue::Other,
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::{NmResourceIdentity, classify_nm_activation, nm_resource_error};
+    use crate::Error;
+    use crate::platform::ResourceIdentity;
+    use crate::platform::ResourceStatus;
+
+    #[test]
+    fn malformed_network_manager_identity_is_rejected() {
+        let resource: crate::ResourceId = "linux:network-manager:ifname:eth0".parse().unwrap();
+        let valid_uuid = uuid::Uuid::new_v4();
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "ifname": "renamed0", "device_path": "/org/freedesktop/NetworkManager/Devices/1",
+                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/1",
+                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            }),
+            serde_json::json!({
+                "ifname": "eth0", "device_path": "not/a/path",
+                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/1",
+                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            }),
+            serde_json::json!({
+                "ifname": "eth0", "device_path": "/org/freedesktop/NetworkManager/Devices/1",
+                "active_path": "/", "connection_uuid": "not-a-uuid",
+                "service_owner": "org.freedesktop.NetworkManager"
+            }),
+            serde_json::json!({
+                "ifname": "eth0", "device_path": "/unrelated/Devices/1",
+                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/not_numeric",
+                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            }),
+        ] {
+            let identity =
+                ResourceIdentity::new(crate::BackendKind::NetworkManager, resource.clone(), data);
+            assert!(NmResourceIdentity::decode(&identity).is_err());
+        }
+    }
+
+    #[test]
+    fn device_rename_does_not_change_activation_identity() {
+        let connection_uuid = uuid::Uuid::new_v4();
+        let recorded = NmResourceIdentity {
+            ifname: "old0".to_string(),
+            device_path: "/org/freedesktop/NetworkManager/Devices/7".to_string(),
+            active_path: "/org/freedesktop/NetworkManager/ActiveConnection/9".to_string(),
+            connection_uuid,
+            service_owner: ":1.42".to_string(),
+        };
+        // The current interface name is deliberately not an input: a rename
+        // cannot override the Device + ActiveConnection object identity.
+        let _current_interface_name = "renamed0";
+        assert_eq!(
+            classify_nm_activation(
+                &recorded,
+                ":1.42",
+                "/org/freedesktop/NetworkManager/ActiveConnection/9",
+                connection_uuid,
+            ),
+            ResourceStatus::Same
+        );
+    }
+
+    #[test]
+    fn transient_network_manager_error_is_not_resource_gone() {
+        let resource = "linux:network-manager:ifname:eth0".parse().unwrap();
+        let error = nm_resource_error(&resource, zbus::Error::Failure("timeout".to_string()));
+        assert!(
+            matches!(error, Error::ResourcePlatform { resource: found, .. } if found == resource)
+        );
     }
 }

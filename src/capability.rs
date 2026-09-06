@@ -104,6 +104,8 @@ pub struct Capabilities {
     pub mutation_guard: MutationGuard,
     /// Whether a successful mutation can name the resulting state.
     pub ownership_identity: OwnershipIdentity,
+    /// How strongly an observed resource incarnation is bound to mutation.
+    pub resource_binding: ResourceBinding,
 }
 
 impl Capabilities {
@@ -121,6 +123,7 @@ impl Capabilities {
             cache_flush: false,
             mutation_guard: MutationGuard::Unconditional,
             ownership_identity: OwnershipIdentity::BestEffort,
+            resource_binding: ResourceBinding::StableTarget,
         }
     }
 
@@ -183,6 +186,25 @@ impl Capabilities {
         self.ownership_identity = identity;
         self
     }
+
+    /// Sets [`Capabilities::resource_binding`].
+    pub fn with_resource_binding(mut self, binding: ResourceBinding) -> Self {
+        self.resource_binding = binding;
+        self
+    }
+}
+
+/// Strength of the binding between a captured incarnation and mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum ResourceBinding {
+    /// The mutation target itself has stable native identity.
+    StableTarget,
+    /// A native generation/object guard binds mutation to the observation.
+    NativeGuarded,
+    /// Identity is rechecked immediately before an unconditional native API;
+    /// the platform still permits a final selector-reuse race.
+    PreflightOnly,
 }
 
 /// How a backend conditions mutations on observed state.

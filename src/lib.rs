@@ -244,7 +244,9 @@ mod journal;
 mod platform;
 mod reconciliation;
 
-pub use capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
+pub use capability::{
+    BackendKind, Capabilities, MutationGuard, OwnershipIdentity, ResourceBinding,
+};
 pub use config::{DnsConfig, DnsConfigBuilder, DnsScope, InterfaceSelector};
 pub use error::{ConflictReason, Error, Result};
 pub use interface::InterfaceInfo;
