@@ -277,3 +277,102 @@ fn indeterminate_apply_without_proof_does_not_rollback() {
         Some(FakeState::Empty)
     );
 }
+
+#[test]
+fn same_dns_generation_bump_is_not_ours_on_update_or_restore() {
+    let fixture = new_fixture("race-same-dns-gen");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    let ours = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let external = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    assert!(external > ours);
+
+    let err = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(err.is_external_modification(), "{err:?}");
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    assert_eq!(
+        journal_record_json(&fixture.dir)["applied"]["data"]["generation"],
+        serde_json::json!(ours)
+    );
+
+    let failure = lease.restore().unwrap_err();
+    assert!(
+        failure.error.is_external_modification(),
+        "{:?}",
+        failure.error
+    );
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    failure.lease.abandon().unwrap();
+}
+
+#[test]
+fn mutation_proof_is_not_replaced_by_equivalent_readback() {
+    let fixture = new_fixture("race-readback-identity");
+    fixture
+        .fake
+        .inject_external_after_guarded_mutation(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let err = fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap_err();
+    assert!(err.is_external_modification(), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    if journal_files(&fixture.dir).is_empty() {
+        return;
+    }
+    let record = journal_record_json(&fixture.dir);
+    assert!(
+        record["applied"].is_null()
+            || record["applied"]["data"]["generation"]
+                != serde_json::json!(fixture.fake.generation(IFACE1).unwrap().unwrap())
+    );
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
+}
+
+#[test]
+fn same_dns_rewrite_blocks_rollback_of_earlier_resource() {
+    let fixture = new_multi_fixture("race-rollback-same-dns");
+    let lease = fixture
+        .manager
+        .apply(&routing_config(&["corp.example"]))
+        .unwrap();
+    fixture
+        .fake
+        .inject_external_before_nth_guarded(1, IFACE1, state_with("8.8.8.8"))
+        .unwrap();
+    fixture.fake.inject_backend_failure_after(
+        osdns::testing::FakeOp::Apply,
+        1,
+        1,
+        "later resource apply failed",
+    );
+    let updated = osdns::DnsConfig::builder(iface_scope(1))
+        .nameserver(ip("8.8.8.8"))
+        .routing_domain("corp.example")
+        .build()
+        .unwrap();
+    let err = lease.update(&updated).unwrap_err();
+    assert!(
+        matches!(err, Error::Platform { .. }) || err.is_external_modification(),
+        "{err:?}"
+    );
+    let generation = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("8.8.8.8"))
+    );
+    let retry = lease.update(&updated);
+    assert!(retry.is_err(), "{retry:?}");
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(generation));
+    lease.abandon().unwrap();
+}

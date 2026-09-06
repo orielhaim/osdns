@@ -99,6 +99,14 @@ impl FakeDns {
         Ok(self.backend.state_of(&id))
     }
 
+    /// Reads the fake generation token of `resource`.
+    pub fn generation(&self, resource: &str) -> Result<Option<u64>> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        Ok(self.backend.generation_of(&id))
+    }
+
     /// Delivers a watch event through any registered callback.
     pub fn emit_event(&self, event: DnsEvent) {
         self.backend.notify(event);
@@ -159,6 +167,22 @@ impl FakeDns {
         })?;
         self.backend
             .inject_external_after_guarded_mutation(id, state);
+        Ok(())
+    }
+
+    /// Rewrites `resource` to `state` at the start of the guarded apply
+    /// after `skip` successful guarded-apply entries.
+    pub fn inject_external_before_nth_guarded(
+        &self,
+        skip: u32,
+        resource: &str,
+        state: FakeState,
+    ) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend
+            .inject_external_before_nth_guarded(skip, id, state);
         Ok(())
     }
 

@@ -123,6 +123,34 @@ fn crash_after_journal_applied_restores_original() {
 }
 
 #[test]
+fn crash_recovery_does_not_claim_equivalent_rewritten_generation() {
+    let fixture = new_fixture("recovery-same-dns-gen");
+    crash_apply(&fixture, TxPoint::AfterApplied, "1.1.1.1");
+    let ours = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let external = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    assert!(external > ours);
+
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(
+        matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }),
+        "{outcomes:?}"
+    );
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    fixture
+        .manager
+        .abandon_journal(&resource_id(IFACE1))
+        .unwrap();
+}
+
+#[test]
 fn crash_is_recovered_implicitly_by_next_apply() {
     let fixture = new_fixture("recovery-implicit");
     // A pre-mutation crash is unambiguous (nothing of ours is on the OS),

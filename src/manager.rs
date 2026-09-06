@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::capability::{Capabilities, MutationGuard};
+use crate::capability::{Capabilities, MutationGuard, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope, validate_against};
 use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
@@ -15,7 +15,10 @@ use crate::journal::{JournalRecord, JournalStore, Phase, SCHEMA_VERSION};
 use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
-use crate::platform::{Backend, MutationAttempt, PlatformSnapshot, select_default_backend};
+use crate::platform::{
+    Backend, MutationAttempt, OwnershipProof, PlatformSnapshot, VerifiedMutation,
+    select_default_backend,
+};
 use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
 use crate::watch::{WatchCallback, WatchHandle};
@@ -293,6 +296,27 @@ const UPDATE_POINTS: MutatePoints = MutatePoints {
     verify: TxPoint::AfterUpdateVerify,
 };
 
+pub(crate) struct MutationResidue {
+    pub(crate) leftover: Option<OwnershipProof>,
+    restored: Option<PlatformSnapshot>,
+}
+
+impl MutationResidue {
+    pub(crate) fn new() -> Self {
+        Self {
+            leftover: None,
+            restored: None,
+        }
+    }
+}
+
+pub(crate) struct PreparedLease {
+    lease_id: Uuid,
+    records: Vec<JournalRecord>,
+    verified: Vec<Option<OwnershipProof>>,
+    was_noop: bool,
+}
+
 enum RecoverBlock {
     Corrupt(Error),
     Conflict(String),
@@ -334,40 +358,43 @@ impl Inner {
         plan: &NormalizedConfig,
         rollback_to: Option<&PlatformSnapshot>,
         points: MutatePoints,
-        leftover: &mut Option<PlatformSnapshot>,
-    ) -> Result<PlatformSnapshot> {
-        leftover.take();
+        residue: &mut MutationResidue,
+    ) -> Result<VerifiedMutation> {
+        residue.leftover = None;
+        residue.restored = None;
         self.suppressions.suppress(resource);
         match self.apply_attempt(resource, expected_current, plan) {
             MutationAttempt::Rejected { error } => Err(error),
             MutationAttempt::Indeterminate { error, produced } => {
-                if !self.rollback_proven(resource, produced.as_ref(), rollback_to) {
-                    *leftover = produced;
+                match self.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                    Some(identity) => residue.restored = identity,
+                    None => residue.leftover = produced.map(OwnershipProof::issued),
                 }
                 Err(error)
             }
             MutationAttempt::Performed { produced } => {
                 let fail = |this: &Self,
-                            leftover: &mut Option<PlatformSnapshot>,
+                            residue: &mut MutationResidue,
                             produced: Option<PlatformSnapshot>,
                             error: Error| {
-                    if !this.rollback_proven(resource, produced.as_ref(), rollback_to) {
-                        *leftover = produced;
+                    match this.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                        Some(identity) => residue.restored = identity,
+                        None => residue.leftover = produced.map(OwnershipProof::issued),
                     }
                     Err(error)
                 };
                 if let Err(error) = self.fire(points.apply) {
-                    return fail(self, leftover, produced, error);
+                    return fail(self, residue, produced, error);
                 }
                 match self.backend.readback(resource) {
                     Ok(actual) => {
                         if let Err(error) = self.fire(points.readback) {
-                            return fail(self, leftover, produced, error);
+                            return fail(self, residue, produced, error);
                         }
                         if !self.backend.matches_desired(&actual, plan) {
                             return fail(
                                 self,
-                                leftover,
+                                residue,
                                 produced,
                                 Error::VerificationFailed {
                                     resource: resource.clone(),
@@ -377,11 +404,46 @@ impl Inner {
                             );
                         }
                         if let Err(error) = self.fire(points.verify) {
-                            return fail(self, leftover, produced, error);
+                            return fail(self, residue, produced, error);
                         }
-                        Ok(actual)
+                        match self.backend.ownership_identity() {
+                            OwnershipIdentity::Durable => {
+                                let Some(produced) = produced else {
+                                    return fail(
+                                        self,
+                                        residue,
+                                        None,
+                                        Error::VerificationFailed {
+                                            resource: resource.clone(),
+                                            detail: "the mutation issued no ownership proof"
+                                                .to_string(),
+                                        },
+                                    );
+                                };
+                                if !self.backend.proves_current(&produced, &actual) {
+                                    return fail(
+                                        self,
+                                        residue,
+                                        Some(produced),
+                                        Error::ExternalModification {
+                                            resource: resource.clone(),
+                                            detail: "the state read back does not carry the identity of our mutation"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                Ok(VerifiedMutation {
+                                    proof: Some(OwnershipProof::issued(produced)),
+                                    observed: actual,
+                                })
+                            }
+                            OwnershipIdentity::BestEffort => Ok(VerifiedMutation {
+                                proof: produced.map(OwnershipProof::issued),
+                                observed: actual,
+                            }),
+                        }
                     }
-                    Err(error) => fail(self, leftover, produced, error),
+                    Err(error) => fail(self, residue, produced, error),
                 }
             }
         }
@@ -406,58 +468,68 @@ impl Inner {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
-    ) -> Result<()> {
+    ) -> Result<Option<PlatformSnapshot>> {
         match self.backend.mutation_guard() {
-            MutationGuard::CompareAndMutate => self
-                .backend
-                .restore_guarded(resource, expected, target)
-                .into_result(),
+            MutationGuard::CompareAndMutate => {
+                match self.backend.restore_guarded(resource, expected, target) {
+                    MutationAttempt::Performed { produced } => Ok(produced),
+                    MutationAttempt::Rejected { error }
+                    | MutationAttempt::Indeterminate { error, .. } => Err(error),
+                }
+            }
             MutationGuard::Unconditional => {
                 let current = self.backend.readback(resource)?;
-                if !self.backend.equivalent(&current, expected) {
+                if !self.backend.owns_current(expected, &current) {
                     return Err(Error::ExternalModification {
                         resource: resource.clone(),
                         detail: "the current state changed since ownership was verified"
                             .to_string(),
                     });
                 }
-                self.backend.restore(resource, target)
+                self.backend.restore(resource, target)?;
+                Ok(None)
             }
         }
     }
 
     /// Rolls back only when `proof` is backend-issued identity of a state we
-    /// created. A post-failure read is not proof.
+    /// created. A post-failure read is not proof. `Some(identity)` is the
+    /// snapshot that now names the restored state when the backend issued
+    /// one.
     #[allow(unused_variables)]
     fn rollback_proven(
         &self,
         resource: &ResourceId,
         proof: Option<&PlatformSnapshot>,
         target: Option<&PlatformSnapshot>,
-    ) -> bool {
+    ) -> Option<Option<PlatformSnapshot>> {
         let (Some(proof), Some(target)) = (proof, target) else {
-            return false;
+            return None;
         };
         if self.backend.equivalent(proof, target) {
-            return true;
+            return Some(Some(proof.clone()));
         }
-        if let Err(error) = self.restore_if_current(resource, proof, target) {
-            osdns_warn!(
-                resource = %resource,
-                error = %error,
-                "rollback could not restore the previous state; the journal record was kept for later recovery"
-            );
-            return false;
-        }
+        let produced = match self.restore_if_current(resource, proof, target) {
+            Ok(produced) => produced,
+            Err(error) => {
+                osdns_warn!(
+                    resource = %resource,
+                    error = %error,
+                    "rollback could not restore the previous state; the journal record was kept for later recovery"
+                );
+                return None;
+            }
+        };
         match self.backend.readback(resource) {
-            Ok(now) => self.backend.equivalent(&now, target),
+            Ok(now) if self.backend.equivalent(&now, target) => Some(produced),
+            Ok(_) => None,
             Err(error) => {
                 osdns_warn!(
                     resource = %resource,
                     error = %error,
                     "rollback could not read back the restored state; the journal record was kept for later recovery"
                 );
-                false
+                None
             }
         }
     }
@@ -475,7 +547,7 @@ impl Inner {
         resources: Vec<ResourceId>,
         plan: &NormalizedConfig,
         befores: Vec<PlatformSnapshot>,
-    ) -> Result<(Uuid, Vec<JournalRecord>, bool)> {
+    ) -> Result<PreparedLease> {
         let lease_id = Uuid::new_v4();
         let was_noop = resources
             .iter()
@@ -501,7 +573,13 @@ impl Inner {
                 self.journal.write(record)?;
             }
             self.fire(TxPoint::AfterApplied)?;
-            return Ok((lease_id, records, true));
+            let n = records.len();
+            return Ok(PreparedLease {
+                lease_id,
+                records,
+                verified: vec![None; n],
+                was_noop: true,
+            });
         }
         let mut records: Vec<JournalRecord> = resources
             .into_iter()
@@ -522,28 +600,34 @@ impl Inner {
             self.journal.write(record)?;
         }
         self.fire(TxPoint::AfterPrepared)?;
-        let mut actuals: Vec<PlatformSnapshot> = Vec::new();
+        let mut mutations: Vec<VerifiedMutation> = Vec::new();
         for index in 0..records.len() {
             let expected = records[index].before.clone();
-            let mut leftover = None;
+            let mut residue = MutationResidue::new();
             match self.mutate_and_verify(
                 &records[index].resource,
                 &expected,
                 plan,
                 Some(&records[index].before),
                 INITIAL_POINTS,
-                &mut leftover,
+                &mut residue,
             ) {
-                Ok(actual) => actuals.push(actual),
+                Ok(mutation) => mutations.push(mutation),
                 Err(error) => {
-                    for (record, proof) in records[..index].iter().zip(&actuals) {
-                        if self.rollback_proven(&record.resource, Some(proof), Some(&record.before))
+                    for (record, mutation) in records[..index].iter().zip(&mutations) {
+                        if self
+                            .rollback_proven(
+                                &record.resource,
+                                Some(&mutation.persist()),
+                                Some(&record.before),
+                            )
+                            .is_some()
                         {
                             let _ = self.journal.remove(&record.lease_id, &record.resource);
                         }
                     }
                     let failed = &records[index];
-                    if leftover.is_none()
+                    if residue.leftover.is_none()
                         && let Ok(now) = self.backend.readback(&failed.resource)
                         && self.backend.equivalent(&now, &failed.before)
                     {
@@ -556,16 +640,30 @@ impl Inner {
                 }
             }
         }
-        for (record, actual) in records.iter_mut().zip(actuals) {
+        let mut verified = vec![None; records.len()];
+        let mut all_written = true;
+        for (index, record) in records.iter_mut().enumerate() {
             record.phase = Phase::Applied;
-            record.applied = Some(actual);
+            record.applied = Some(mutations[index].persist());
+            if self.journal.write(record).is_err() {
+                verified[index] = mutations[index]
+                    .proof
+                    .clone()
+                    .or_else(|| record.applied.take().map(OwnershipProof::issued));
+                record.applied = None;
+                record.phase = Phase::Prepared;
+                all_written = false;
+            }
         }
-        let written = records.clone();
-        for record in &written {
-            self.journal.write(record)?;
+        if all_written {
+            self.fire(TxPoint::AfterApplied)?;
         }
-        self.fire(TxPoint::AfterApplied)?;
-        Ok((lease_id, records, false))
+        Ok(PreparedLease {
+            lease_id,
+            records,
+            verified,
+            was_noop: false,
+        })
     }
 
     /// Transactionally moves every owned resource to `plan` as one logical
@@ -588,38 +686,35 @@ impl Inner {
         let mut olds: Vec<JournalRecord> = Vec::with_capacity(live.len());
         let mut applieds: Vec<PlatformSnapshot> = Vec::with_capacity(live.len());
         for record in live {
-            let guard = record
+            let mut guard = record
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.finalize_live(&mut guard, None)?;
             let applied = guard.record.applied.clone().ok_or_else(|| {
-                Error::platform(
-                    self.backend.kind(),
-                    format_args!(
-                        "owned lease record for {} is missing its applied snapshot",
-                        guard.record.resource
-                    ),
-                )
+                Error::ExternalModification {
+                    resource: guard.record.resource.clone(),
+                    detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
+                        .to_string(),
+                }
             })?;
             olds.push(guard.record.clone());
             applieds.push(applied);
         }
-        let mut currents = Vec::with_capacity(live.len());
         for index in 0..live.len() {
             let resource = olds[index].resource.clone();
             let current = self.backend.readback(&resource)?;
             self.fire(TxPoint::AfterUpdateCapture)?;
-            if !self.backend.equivalent(&current, &applieds[index]) {
+            if !self.backend.owns_current(&applieds[index], &current) {
                 return Err(Error::ExternalModification {
                     resource,
                     detail: "the current state no longer matches the state applied by this lease"
                         .to_string(),
                 });
             }
-            currents.push(current);
         }
-        if currents
+        if applieds
             .iter()
-            .all(|current| self.backend.matches_desired(current, plan))
+            .all(|applied| self.backend.matches_desired(applied, plan))
         {
             self.fire(TxPoint::AfterUpdateNoopCheck)?;
             return Ok(());
@@ -651,28 +746,32 @@ impl Inner {
         // On failure every touched resource (including the failed one)
         // rolls back to its previous applied state; journals are then
         // restored to their pre-update form.
-        let mut actuals: Vec<Option<PlatformSnapshot>> = vec![None; live.len()];
+        let mut mutations: Vec<Option<VerifiedMutation>> = vec![None; live.len()];
         for index in 0..live.len() {
             let resource = olds[index].resource.clone();
-            let expected = currents[index].clone();
-            let mut leftover = None;
+            let expected = applieds[index].clone();
+            let mut residue = MutationResidue::new();
             match self.mutate_and_verify(
                 &resource,
                 &expected,
                 plan,
                 Some(&applieds[index]),
                 UPDATE_POINTS,
-                &mut leftover,
+                &mut residue,
             ) {
-                Ok(actual) => actuals[index] = Some(actual),
+                Ok(mutation) => mutations[index] = Some(mutation),
                 Err(error) => {
+                    let mut restored_identity: Vec<Option<PlatformSnapshot>> =
+                        vec![None; live.len()];
                     for rollback_index in 0..index {
-                        if let Some(proof) = &actuals[rollback_index] {
-                            self.rollback_proven(
+                        if let Some(mutation) = &mutations[rollback_index]
+                            && let Some(Some(identity)) = self.rollback_proven(
                                 &olds[rollback_index].resource,
-                                Some(proof),
+                                Some(&mutation.persist()),
                                 Some(&applieds[rollback_index]),
-                            );
+                            )
+                        {
+                            restored_identity[rollback_index] = Some(identity);
                         }
                     }
                     self.fire(TxPoint::AfterUpdateVerify).ok();
@@ -681,13 +780,20 @@ impl Inner {
                         let mut guard = live_record
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if old_index == index && leftover.is_some() {
-                            guard.verified = leftover.take();
+                        if old_index == index && residue.leftover.is_some() {
+                            guard.verified = residue.leftover.take();
                             guard.record.phase = Phase::Prepared;
                             guard.record.applied = None;
                             let _ = self.journal.write(&guard.record);
                         } else {
                             guard.record = old.clone();
+                            if old_index == index {
+                                if let Some(identity) = residue.restored.take() {
+                                    guard.record.applied = Some(identity);
+                                }
+                            } else if let Some(identity) = restored_identity[old_index].take() {
+                                guard.record.applied = Some(identity);
+                            }
                             guard.verified = None;
                             let _ = self.journal.write(&guard.record);
                         }
@@ -696,22 +802,70 @@ impl Inner {
                 }
             }
         }
+        let mut write_error = None;
         for (index, record) in live.iter().enumerate() {
             let mut guard = record
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mutation = mutations[index].as_ref().expect("mutation succeeded");
+            let persisted = mutation.persist();
             guard.record.phase = Phase::Applied;
-            guard.record.applied = actuals[index].clone();
+            guard.record.applied = Some(persisted.clone());
             if let Err(error) = self.journal.write(&guard.record) {
-                guard.verified = actuals[index].clone();
+                guard.verified = mutation
+                    .proof
+                    .clone()
+                    .or(Some(OwnershipProof::issued(persisted)));
                 guard.record.applied = None;
                 guard.record.phase = Phase::Prepared;
-                drop(guard);
-                return Err(error);
+                if write_error.is_none() {
+                    write_error = Some(error);
+                }
+            } else {
+                guard.verified = None;
             }
-            guard.verified = None;
+        }
+        if let Some(error) = write_error {
+            return Err(error);
         }
         self.fire(TxPoint::AfterUpdateApplied)?;
+        Ok(())
+    }
+
+    pub(crate) fn finalize_live(
+        &self,
+        live: &mut LiveRecord,
+        current: Option<&PlatformSnapshot>,
+    ) -> Result<()> {
+        if live.record.phase == Phase::Applied && live.record.applied.is_some() {
+            live.verified = None;
+            return Ok(());
+        }
+        let Some(proof) = live.verified.clone() else {
+            return Err(Error::ExternalModification {
+                resource: live.record.resource.clone(),
+                detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
+                    .to_string(),
+            });
+        };
+        let owned;
+        let current = match current {
+            Some(current) => current,
+            None => {
+                owned = self.backend.readback(&live.record.resource)?;
+                &owned
+            }
+        };
+        if !self.backend.owns_current(proof.as_snapshot(), current) {
+            return Err(Error::ExternalModification {
+                resource: live.record.resource.clone(),
+                detail: "the retained mutation proof no longer names the current state".to_string(),
+            });
+        }
+        live.record.applied = Some(proof.into_snapshot());
+        live.record.phase = Phase::Applied;
+        self.journal.write(&live.record)?;
+        live.verified = None;
         Ok(())
     }
 
@@ -728,21 +882,19 @@ impl Inner {
             self.fire(TxPoint::AfterRestoreJournal)?;
             return Ok(());
         }
-        // Only a verified applied snapshot proves ownership; a state that
-        // merely matches the desired configuration does not.
         let applied = record.applied.as_ref().ok_or_else(|| Error::ExternalModification {
             resource: resource.clone(),
             detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
                 .to_string(),
         })?;
-        if !self.backend.equivalent(&current, applied) {
+        if !self.backend.owns_current(applied, &current) {
             return Err(Error::ExternalModification {
                 resource: resource.clone(),
                 detail: "the current state is neither the state applied by this lease nor the original state"
                     .to_string(),
             });
         }
-        self.restore_if_current(resource, &current, &record.before)?;
+        self.restore_if_current(resource, applied, &record.before)?;
         self.fire(TxPoint::AfterRestoreRestore)?;
         let now = self.backend.readback(resource)?;
         if !self.backend.equivalent(&now, &record.before) {
@@ -769,10 +921,11 @@ impl Inner {
     }
 
     /// Crash recovery for one journal record. Only verified state is acted
-    /// on: `current == before` clears the record, and `current == applied`
-    /// restores the original. Anything else (including an unverified
-    /// `Prepared` record whose state merely matches `desired`) reports
-    /// `ExternalConflict` without mutating.
+    /// on: semantic equality with `before` clears the record, and
+    /// [`Backend::owns_current`] on the applied snapshot restores the
+    /// original. Anything else (including an unverified `Prepared` record
+    /// whose state merely matches `desired`) reports `ExternalConflict`
+    /// without mutating. Memory-only live proof is ignored.
     fn recover_record(&self, record: JournalRecord) -> Result<RecoveryOutcome> {
         let resource = record.resource.clone();
         let current = self.backend.capture(&resource)?;
@@ -785,13 +938,14 @@ impl Inner {
                 lease_id: record.lease_id,
             });
         }
-        let verified = record
+        let owned = record
             .applied
             .as_ref()
-            .is_some_and(|applied| self.backend.equivalent(&current, applied));
-        if verified {
+            .is_some_and(|applied| self.backend.owns_current(applied, &current));
+        if owned {
             self.suppressions.suppress(&resource);
-            if let Err(error) = self.restore_if_current(&resource, &current, &record.before) {
+            let applied = record.applied.as_ref().expect("applied snapshot");
+            if let Err(error) = self.restore_if_current(&resource, applied, &record.before) {
                 if error.is_external_modification() {
                     return Ok(RecoveryOutcome::ExternalConflict {
                         resource,
@@ -1074,9 +1228,20 @@ impl DnsManager {
         }
         self.inner.fire(TxPoint::AfterNoopDecision)?;
         match self.inner.transact_with_locks(resources, &plan, befores) {
-            Ok((lease_id, records, was_noop)) => {
-                let lease =
-                    Lease::new_owned(self.inner.clone(), lease_id, records, locks, was_noop);
+            Ok(PreparedLease {
+                lease_id,
+                records,
+                verified,
+                was_noop,
+            }) => {
+                let lease = Lease::new_owned(
+                    self.inner.clone(),
+                    lease_id,
+                    records,
+                    verified,
+                    locks,
+                    was_noop,
+                );
                 if let Err(error) = self.inner.ensure_enforce_watch() {
                     let _ = lease.restore();
                     return Err(error);

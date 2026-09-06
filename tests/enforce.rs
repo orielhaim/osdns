@@ -104,10 +104,15 @@ fn reconciled_lease_update_and_still_ours_are_stable() {
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("8.8.8.8")),
-        "an event matching the applied state must not trigger a reapply loop"
+        "an event matching the applied DNS values must not trigger a reapply loop"
     );
 
-    lease.restore().unwrap();
+    let failure = lease.restore().unwrap_err();
+    assert!(
+        failure.error.is_external_modification(),
+        "a same-values rewrite advances generation and is not ours"
+    );
+    failure.lease.abandon().unwrap();
 }
 
 #[test]
@@ -359,7 +364,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
         );
         return;
     } else {
-        drop(lease);
+        lease.debug_release_locks_keep_journal();
         drop(fixture.manager);
         let recovered = manager_for_testing(
             "io.osdns.test",
@@ -568,6 +573,30 @@ fn verified_mutation_finalizes_only_from_retained_proof() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9"))
     );
+}
+
+#[test]
+fn equivalent_rewrite_is_not_still_ours() {
+    let fixture = enforce_manager("enforce-same-dns-gen");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    let ours = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let external = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    assert!(external > ours);
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    assert_eq!(
+        journal_record_json(&fixture.dir)["applied"]["data"]["generation"],
+        serde_json::json!(ours)
+    );
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    lease.abandon().unwrap();
 }
 
 #[test]

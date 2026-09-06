@@ -11,7 +11,7 @@ pub(crate) mod windows;
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{BackendKind, Capabilities, MutationGuard};
+use crate::capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
@@ -39,6 +39,48 @@ impl PlatformSnapshot {
             resource,
             data,
         }
+    }
+}
+
+/// Backend-issued identity of a mutation we performed.
+///
+/// Constructed only from a mutation result. A later capture is not an
+/// [`OwnershipProof`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OwnershipProof {
+    snapshot: PlatformSnapshot,
+}
+
+impl OwnershipProof {
+    pub(crate) fn issued(snapshot: PlatformSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    pub(crate) fn as_snapshot(&self) -> &PlatformSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) fn into_snapshot(self) -> PlatformSnapshot {
+        self.snapshot
+    }
+}
+
+/// A mutation that matched the desired configuration on read-back.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedMutation {
+    /// Durable identity when the backend issued one that still names
+    /// [`VerifiedMutation::observed`].
+    pub(crate) proof: Option<OwnershipProof>,
+    /// Semantic snapshot from the verification read.
+    pub(crate) observed: PlatformSnapshot,
+}
+
+impl VerifiedMutation {
+    pub(crate) fn persist(&self) -> PlatformSnapshot {
+        self.proof
+            .as_ref()
+            .map(|proof| proof.as_snapshot().clone())
+            .unwrap_or_else(|| self.observed.clone())
     }
 }
 
@@ -79,13 +121,6 @@ impl MutationAttempt {
                 error,
                 produced: None,
             },
-        }
-    }
-
-    pub(crate) fn into_result(self) -> Result<()> {
-        match self {
-            Self::Performed { .. } => Ok(()),
-            Self::Rejected { error } | Self::Indeterminate { error, .. } => Err(error),
         }
     }
 }
@@ -130,6 +165,20 @@ pub(crate) trait Backend: Send + Sync {
     /// in [`Capabilities::mutation_guard`].
     fn mutation_guard(&self) -> MutationGuard {
         self.capabilities().mutation_guard
+    }
+
+    /// Whether snapshots carry mutation identity. Defaults to
+    /// [`Capabilities::ownership_identity`].
+    fn ownership_identity(&self) -> OwnershipIdentity {
+        self.capabilities().ownership_identity
+    }
+
+    /// Whether `claimed` still names `current` as a state we produced.
+    fn owns_current(&self, claimed: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
+        match self.ownership_identity() {
+            OwnershipIdentity::Durable => self.proves_current(claimed, current),
+            OwnershipIdentity::BestEffort => self.equivalent(claimed, current),
+        }
     }
 
     /// Applies `plan` only while current state still matches `expected`.

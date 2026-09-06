@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{BackendKind, Capabilities, MutationGuard};
+use crate::capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope, InterfaceSelector};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
@@ -153,6 +153,7 @@ struct FakeInner {
     partial_apply_failures: u32,
     before_guarded: Option<(ResourceId, FakeState)>,
     after_guarded: Option<(ResourceId, FakeState)>,
+    before_nth_guarded: Option<(u32, ResourceId, FakeState)>,
 }
 
 /// Wire format of a fake snapshot: the managed state plus the generation
@@ -193,13 +194,15 @@ impl FakeBackend {
                 .with_default_route(true)
                 .with_watch(true)
                 .with_cache_flush(true)
-                .with_mutation_guard(MutationGuard::CompareAndMutate),
+                .with_mutation_guard(MutationGuard::CompareAndMutate)
+                .with_ownership_identity(OwnershipIdentity::Durable),
         )
     }
 
     pub(crate) fn with_capabilities(caps: Capabilities) -> Self {
         Self::build(
-            caps.with_mutation_guard(MutationGuard::CompareAndMutate),
+            caps.with_mutation_guard(MutationGuard::CompareAndMutate)
+                .with_ownership_identity(OwnershipIdentity::Durable),
             false,
         )
     }
@@ -210,7 +213,8 @@ impl FakeBackend {
     /// tests.
     pub(crate) fn with_multi_resource(caps: Capabilities) -> Self {
         Self::build(
-            caps.with_mutation_guard(MutationGuard::CompareAndMutate),
+            caps.with_mutation_guard(MutationGuard::CompareAndMutate)
+                .with_ownership_identity(OwnershipIdentity::Durable),
             true,
         )
     }
@@ -248,6 +252,7 @@ impl FakeBackend {
                 partial_apply_failures: 0,
                 before_guarded: None,
                 after_guarded: None,
+                before_nth_guarded: None,
             }),
             watchers: Arc::new(Mutex::new(Vec::new())),
             multi_resource,
@@ -307,6 +312,15 @@ impl FakeBackend {
         self.lock_inner().after_guarded = Some((resource, state));
     }
 
+    pub(crate) fn inject_external_before_nth_guarded(
+        &self,
+        skip: u32,
+        resource: ResourceId,
+        state: FakeState,
+    ) {
+        self.lock_inner().before_nth_guarded = Some((skip, resource, state));
+    }
+
     /// Blocks the next [`Backend::start_watch`] until the returned release
     /// function is called.
     pub(crate) fn block_next_start_watch(&self) -> impl FnOnce() + Send {
@@ -345,6 +359,10 @@ impl FakeBackend {
 
     pub(crate) fn state_of(&self, resource: &ResourceId) -> Option<FakeState> {
         self.lock_inner().states.get(resource).cloned()
+    }
+
+    pub(crate) fn generation_of(&self, resource: &ResourceId) -> Option<u64> {
+        self.lock_inner().generations.get(resource).copied()
     }
 
     pub(crate) fn inject_failure(&self, op: FakeOp, times: u32, message: impl Into<String>) {
@@ -665,6 +683,17 @@ impl Backend for FakeBackend {
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
     ) -> MutationAttempt {
+        {
+            let mut inner = self.lock_inner();
+            if let Some((skip, id, state)) = inner.before_nth_guarded.take() {
+                if skip == 0 {
+                    inner.states.insert(id.clone(), state);
+                    *inner.generations.entry(id).or_insert(0) += 1;
+                } else {
+                    inner.before_nth_guarded = Some((skip - 1, id, state));
+                }
+            }
+        }
         if let Err(error) = self.check_failure(FakeOp::Apply) {
             return MutationAttempt::Indeterminate {
                 error,
@@ -783,7 +812,7 @@ impl Backend for FakeBackend {
                 };
             }
         };
-        {
+        let produced = {
             let mut inner = self.lock_inner();
             Self::take_adversary(&mut inner, true, resource);
             if !inner.states.contains_key(resource) {
@@ -807,12 +836,24 @@ impl Backend for FakeBackend {
             }
             inner.states.insert(resource.clone(), target_state);
             *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+            let produced = match Self::snapshot_from(&inner, resource) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    };
+                }
+            };
             Self::take_adversary(&mut inner, false, resource);
-        }
+            produced
+        };
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
         });
-        MutationAttempt::Performed { produced: None }
+        MutationAttempt::Performed {
+            produced: Some(produced),
+        }
     }
 
     fn proves_current(&self, proof: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {

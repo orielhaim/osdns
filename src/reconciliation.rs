@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::Error;
 use crate::fault::TxPoint;
-use crate::journal::{JournalRecord, Phase};
+use crate::journal::Phase;
 use crate::lease::LiveRecord;
 use crate::manager::{INITIAL_POINTS, Inner};
 use crate::normalize::NormalizedConfig;
@@ -209,7 +209,7 @@ impl Inner {
     pub(crate) fn with_live_record(
         &self,
         live: &Arc<Mutex<LiveRecord>>,
-        f: impl FnOnce(&ResourceId, &JournalRecord),
+        f: impl FnOnce(&mut LiveRecord),
     ) {
         let resource = live
             .lock()
@@ -221,8 +221,8 @@ impl Inner {
         let _token_guard = token
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let guard = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&resource, &guard.record);
+        let mut guard = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut guard);
     }
 
     pub(crate) fn reconcile_resource(
@@ -329,38 +329,29 @@ impl Inner {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        if guard.record.phase == Phase::Prepared {
-            if let Some(proof) = guard.verified.clone()
-                && self.backend.proves_current(&proof, &second)
-            {
-                guard.record.applied = Some(proof);
-                guard.record.phase = Phase::Applied;
-                match self.journal.write(&guard.record) {
-                    Ok(()) => {
-                        guard.verified = None;
-                        return ReconcileOutcome::StillOurs;
-                    }
-                    Err(error) => {
-                        osdns_warn!(
-                            resource = %resource,
-                            error = %error,
-                            "reconciliation could not finalize the pending transaction; deferring"
-                        );
-                        guard.record.applied = None;
-                        guard.record.phase = Phase::Prepared;
-                        return ReconcileOutcome::Deferred;
-                    }
+        match self.finalize_live(&mut guard, Some(&second)) {
+            Ok(()) => {}
+            Err(error) if error.is_external_modification() => {
+                if guard.record.phase == Phase::Prepared
+                    && !self.backend.equivalent(&second, &guard.record.before)
+                {
+                    return ReconcileOutcome::Deferred;
                 }
             }
-            if !self.backend.equivalent(&second, &guard.record.before) {
-                return ReconcileOutcome::Deferred;
-            }
+            Err(_) => return ReconcileOutcome::Deferred,
         }
 
         if let Some(applied) = &guard.record.applied
-            && self.backend.equivalent(&second, applied)
+            && self.backend.owns_current(applied, &second)
         {
             return ReconcileOutcome::StillOurs;
+        }
+
+        if let Some(applied) = &guard.record.applied
+            && self.backend.matches_desired(&second, &guard.record.desired)
+            && !self.backend.owns_current(applied, &second)
+        {
+            return ReconcileOutcome::Deferred;
         }
 
         if self.backend.equivalent(&second, &guard.record.before) {
@@ -390,19 +381,19 @@ impl Inner {
         desired: &NormalizedConfig,
         rollback_to: &PlatformSnapshot,
     ) -> ReconcileOutcome {
-        let mut leftover = None;
+        let mut residue = crate::manager::MutationResidue::new();
         match self.mutate_and_verify(
             resource,
             expected,
             desired,
             Some(rollback_to),
             INITIAL_POINTS,
-            &mut leftover,
+            &mut residue,
         ) {
-            Ok(actual) => self.commit_applied(resource, entry, actual),
+            Ok(mutation) => self.commit_applied(resource, entry, mutation),
             Err(_) => {
-                if leftover.is_some() {
-                    lock_live(entry).verified = leftover;
+                if residue.leftover.is_some() {
+                    lock_live(entry).verified = residue.leftover;
                 }
                 ReconcileOutcome::Deferred
             }
@@ -414,10 +405,11 @@ impl Inner {
         &self,
         resource: &ResourceId,
         entry: &Arc<Mutex<LiveRecord>>,
-        actual: PlatformSnapshot,
+        mutation: crate::platform::VerifiedMutation,
     ) -> ReconcileOutcome {
+        let persisted = mutation.persist();
         let mut live = lock_live(entry);
-        live.record.applied = Some(actual.clone());
+        live.record.applied = Some(persisted.clone());
         live.record.phase = Phase::Applied;
         match self.journal.write(&live.record) {
             Ok(()) => {
@@ -432,7 +424,9 @@ impl Inner {
                     error = %error,
                     "mutation was verified but the Applied journal write failed; deferring"
                 );
-                live.verified = Some(actual);
+                live.verified = mutation
+                    .proof
+                    .or(Some(crate::platform::OwnershipProof::issued(persisted)));
                 live.record.applied = None;
                 live.record.phase = Phase::Prepared;
                 ReconcileOutcome::Deferred

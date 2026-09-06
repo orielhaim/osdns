@@ -393,3 +393,45 @@ fn partial_update_failure_rolls_back_failed_resource() {
     lease.restore().unwrap();
     assert!(journal_files(&fixture.dir).is_empty());
 }
+
+#[test]
+fn live_proof_finalizes_cooperative_lease_after_applied_journal_failure() {
+    let fixture = new_fixture("engine-live-finalize");
+    fixture.manager.set_journal_fail_writes_after(1);
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    fixture.manager.set_journal_fail_writes(false);
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Prepared");
+    assert!(record["applied"].is_null());
+    lease.update(&config(1, "8.8.8.8")).unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("8.8.8.8"))
+    );
+    assert_eq!(journal_record_json(&fixture.dir)["phase"], "Applied");
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(FakeState::Empty)
+    );
+}
+
+#[test]
+fn live_proof_does_not_finalize_equivalent_rewritten_generation() {
+    let fixture = new_fixture("engine-live-proof-gen");
+    fixture.manager.set_journal_fail_writes_after(1);
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    fixture.manager.set_journal_fail_writes(false);
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    let external = fixture.fake.generation(IFACE1).unwrap().unwrap();
+    let err = lease.update(&config(1, "8.8.8.8")).unwrap_err();
+    assert!(err.is_external_modification(), "{err:?}");
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    let failure = lease.restore().unwrap_err();
+    assert!(failure.error.is_external_modification());
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    failure.lease.abandon().unwrap();
+}

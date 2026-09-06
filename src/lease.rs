@@ -8,6 +8,7 @@ use crate::error::{ConflictReason, Error, Result};
 use crate::journal::JournalRecord;
 use crate::manager::Inner;
 use crate::ownership::{ResourceId, ResourceLock};
+use crate::platform::OwnershipProof;
 
 /// A lease's authoritative, shared journal record.
 ///
@@ -18,7 +19,7 @@ pub(crate) struct LiveRecord {
     pub(crate) record: JournalRecord,
     /// Verified mutation identity retained when the durable `Applied` write
     /// failed. Never serialized; recovery must not see it.
-    pub(crate) verified: Option<crate::platform::PlatformSnapshot>,
+    pub(crate) verified: Option<OwnershipProof>,
 }
 
 /// The live state of a [`Lease`]: shared journal records plus the
@@ -88,17 +89,15 @@ impl Lease {
         inner: Arc<Inner>,
         lease_id: Uuid,
         records: Vec<JournalRecord>,
+        verified: Vec<Option<OwnershipProof>>,
         locks: Vec<ResourceLock>,
         was_noop: bool,
     ) -> Self {
         let mut resources = Vec::with_capacity(records.len());
         let mut live = Vec::with_capacity(records.len());
-        for record in records {
+        for (record, verified) in records.into_iter().zip(verified) {
             resources.push(record.resource.clone());
-            let shared = Arc::new(Mutex::new(LiveRecord {
-                record,
-                verified: None,
-            }));
+            let shared = Arc::new(Mutex::new(LiveRecord { record, verified }));
             inner.register_active(Arc::clone(&shared));
             live.push(shared);
         }
@@ -222,8 +221,9 @@ impl Lease {
     /// Restores the pre-lease state and ends the lease.
     ///
     /// This is the canonical way to end a lease. It consumes the lease; every
-    /// owned resource is restored independently with compare-before-restore
-    /// semantics. Resources whose state was externally modified keep their
+    /// owned resource is restored independently while the lease still owns
+    /// current state ([`crate::OwnershipIdentity::Durable`] identity, or
+    /// best-effort DNS comparison). Resources whose state was externally modified keep their
     /// journal record, and the first failure is reported through
     /// [`RestoreFailure`] together with the still-usable lease so it can be
     /// retried or explicitly given up with [`Lease::abandon`]. A no-op lease
@@ -274,9 +274,16 @@ impl Lease {
         let LiveLease { live, _locks } = state;
         let mut first_error = None;
         for record in &live {
-            self.inner.with_live_record(record, |resource, journal| {
-                match self.inner.restore_lease_state(journal) {
-                    Ok(()) => self.inner.unregister_active(resource),
+            self.inner.with_live_record(record, |live| {
+                let resource = live.record.resource.clone();
+                if let Err(error) = self.inner.finalize_live(live, None) {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    return;
+                }
+                match self.inner.restore_lease_state(&live.record) {
+                    Ok(()) => self.inner.unregister_active(&resource),
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -313,13 +320,15 @@ impl Lease {
         if let Some(LiveLease { live, _locks }) = guard.take() {
             let mut failure = None;
             for record in &live {
-                self.inner.with_live_record(record, |resource, journal| {
+                self.inner.with_live_record(record, |live| {
+                    let resource = live.record.resource.clone();
                     if failure.is_none()
-                        && let Err(error) = self.inner.journal.remove(&journal.lease_id, resource)
+                        && let Err(error) =
+                            self.inner.journal.remove(&live.record.lease_id, &resource)
                     {
                         failure = Some(error);
                     }
-                    self.inner.unregister_active(resource);
+                    self.inner.unregister_active(&resource);
                 });
             }
             drop(_locks);
@@ -330,6 +339,27 @@ impl Lease {
             }
         }
         Ok(())
+    }
+
+    /// Releases locks and live registration without restoring or removing
+    /// journals. Models process death for crash-recovery tests: in-memory
+    /// proof is discarded.
+    #[cfg(feature = "test-util")]
+    pub fn debug_release_locks_keep_journal(self) {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(LiveLease { live, _locks }) = guard.take() {
+            for record in &live {
+                self.inner.with_live_record(record, |live| {
+                    let resource = live.record.resource.clone();
+                    self.inner.unregister_active(&resource);
+                });
+            }
+            drop(_locks);
+            self.inner.release_enforce_watch();
+        }
     }
 }
 
@@ -384,9 +414,11 @@ impl Drop for Lease {
             .take()
         {
             for record in &live {
-                self.inner.with_live_record(record, |resource, journal| {
-                    self.inner.best_effort_restore(journal);
-                    self.inner.unregister_active(resource);
+                self.inner.with_live_record(record, |live| {
+                    let resource = live.record.resource.clone();
+                    let _ = self.inner.finalize_live(live, None);
+                    self.inner.best_effort_restore(&live.record);
+                    self.inner.unregister_active(&resource);
                 });
             }
             drop(_locks);

@@ -358,6 +358,7 @@ fn capabilities(dns_mode: &str) -> Capabilities {
         .with_watch(true)
         .with_cache_flush(false)
         .with_mutation_guard(crate::capability::MutationGuard::CompareAndMutate)
+        .with_ownership_identity(crate::capability::OwnershipIdentity::BestEffort)
 }
 
 fn u32_array(values: &[u32]) -> Array<'static> {
@@ -493,15 +494,7 @@ impl Backend for NetworkManager {
         let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
         Self::with_dns_fields(&mut settings, &fields, false);
         match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => match self.capture(resource) {
-                Ok(produced) => crate::platform::MutationAttempt::Performed {
-                    produced: Some(produced),
-                },
-                Err(error) => crate::platform::MutationAttempt::Indeterminate {
-                    error,
-                    produced: None,
-                },
-            },
+            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
             Err(error) => {
                 let error =
                     self.map_reapply_error(resource, &device, expected_version, "apply", error);

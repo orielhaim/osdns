@@ -65,14 +65,13 @@ impl fmt::Display for BackendKind {
 /// backends behave identically: these fields exist precisely because they do
 /// not.
 ///
-/// Linux backends: systemd-resolved supports per-interface DNS, search
-/// domains, split DNS, explicit default-route control, watch, and cache
-/// flush, but mutations are unconditional writes. NetworkManager supports
-/// per-interface DNS with backend-dependent split DNS, watch, and
-/// compare-and-mutate via applied-connection `version_id`. resolvconf and
-/// direct `/etc/resolv.conf` are unconditional. Windows and macOS
-/// mutations are unconditional: those platforms have no generation CAS
-/// for interface DNS. Check [`Capabilities::mutation_guard`].
+/// Linux: systemd-resolved mutations are unconditional and best-effort.
+/// NetworkManager can compare-and-mutate on applied-connection
+/// `version_id` but Reapply does not return the resulting version, so
+/// ownership identity is best-effort. resolvconf, `/etc/resolv.conf`,
+/// Windows, and macOS are unconditional and best-effort. Check
+/// [`Capabilities::mutation_guard`] and
+/// [`Capabilities::ownership_identity`].
 ///
 /// The struct is `#[non_exhaustive]`: construct with [`Capabilities::new`]
 /// plus `with_*` builders, never with a literal.
@@ -103,6 +102,8 @@ pub struct Capabilities {
     pub cache_flush: bool,
     /// How strongly this backend can condition a mutation on current state.
     pub mutation_guard: MutationGuard,
+    /// Whether a successful mutation can name the resulting state.
+    pub ownership_identity: OwnershipIdentity,
 }
 
 impl Capabilities {
@@ -119,6 +120,7 @@ impl Capabilities {
             watch: false,
             cache_flush: false,
             mutation_guard: MutationGuard::Unconditional,
+            ownership_identity: OwnershipIdentity::BestEffort,
         }
     }
 
@@ -175,22 +177,42 @@ impl Capabilities {
         self.mutation_guard = guard;
         self
     }
+
+    /// Sets [`Capabilities::ownership_identity`].
+    pub fn with_ownership_identity(mut self, identity: OwnershipIdentity) -> Self {
+        self.ownership_identity = identity;
+        self
+    }
 }
 
 /// How a backend conditions mutations on observed state.
 ///
-/// This is part of the public capability contract. A backend that cannot
-/// compare-and-mutate atomically reports [`MutationGuard::Unconditional`]
-/// rather than advertising a guarded apply it does not actually provide.
+/// Independent of [`OwnershipIdentity`]: a backend may refuse a write when
+/// the expected generation does not match and still be unable to name the
+/// state that write produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum MutationGuard {
     /// Native compare-and-mutate. A rejection means the backend did not
-    /// mutate. Ownership proof for a successful mutation is a generation,
-    /// version, or file identity issued by the backend.
+    /// mutate.
     CompareAndMutate,
     /// The platform has no atomic conditional mutation. Applies and restores
-    /// are ordinary writes. A later read is not proof that osdns produced
-    /// the current state, and a compare-then-write sequence is not atomic.
+    /// are ordinary writes. A compare-then-write sequence can lose a race
+    /// with another writer.
     Unconditional,
+}
+
+/// Whether a backend can name the state produced by a mutation.
+///
+/// [`OwnershipIdentity::Durable`] means later ownership checks use that
+/// identity. [`OwnershipIdentity::BestEffort`] means they compare DNS values
+/// only, which cannot tell an external rewrite of the same values apart from
+/// our own write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum OwnershipIdentity {
+    /// Generation, version, or file identity issued with the mutation.
+    Durable,
+    /// No mutation identity. Restoration compares DNS values and then writes.
+    BestEffort,
 }

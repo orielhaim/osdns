@@ -21,11 +21,14 @@
 //! systemd-resolved, other VPN software, administrators, and device-management
 //! tooling may change it at any time.
 //!
-//! Every mutation therefore belongs to an explicit owner and [`Lease`], is
-//! journaled before it happens, is verified by read-back, and is restored
-//! only while ownership can still be established. When another actor has
-//! changed the state, restoration fails with
-//! [`Error::ExternalModification`] and nothing is mutated.
+//! Every mutation belongs to an explicit owner and [`Lease`], is journaled
+//! before it happens, and is restored only while the backend can still
+//! establish that the current state is the one this lease produced. Backends
+//! with [`OwnershipIdentity::Durable`] check a generation or version.
+//! Backends with [`OwnershipIdentity::BestEffort`] compare DNS values and
+//! then write; another actor can win the gap between those steps.
+//! [`Capabilities::mutation_guard`] is separate: it is whether the write
+//! itself can be refused when the expected state has already changed.
 //!
 //! # Basic usage
 //!
@@ -71,16 +74,13 @@
 //!
 //! # Safe restoration
 //!
-//! Restoration overwrites a resource only while a backend-issued identity
-//! still names the state we applied (generation, version, or file
-//! identity). [`Capabilities::mutation_guard`] reports whether the active
-//! backend can compare-and-mutate atomically. Backends without that
-//! primitive restore with an ordinary write after a non-atomic comparison
-//! and do not advertise a stronger contract. A state that merely matches
-//! the desired configuration proves nothing by itself. Otherwise
-//! [`Error::ExternalModification`] is returned, nothing is mutated, and the
-//! lease remains usable so the caller can retry or call [`Lease::abandon`]
-//! to leave the external state untouched.
+//! Restoration overwrites a resource only while the lease still owns it.
+//! With [`OwnershipIdentity::Durable`], that means a backend-issued identity
+//! still names the applied state. With [`OwnershipIdentity::BestEffort`],
+//! the backend compares DNS values and then writes; that sequence is not
+//! atomic. [`Capabilities::mutation_guard`] reports whether a write can be
+//! refused when the expected generation no longer matches. A state that
+//! merely matches the desired configuration proves nothing by itself.
 //!
 //! # Crash recovery
 //!
@@ -94,8 +94,8 @@
 //! A process crash may release an OS lock without removing its journal.
 //! [`DnsManager::recover_stale`] inspects records left behind by crashed or
 //! exited processes and recovers them where it is safe to do so. Recovery
-//! never guesses ownership: only a verified applied snapshot (or the
-//! original state) authorizes action. In particular, an unverified
+//! never guesses ownership: only an applied snapshot the backend still
+//! considers ours, or the original state, authorizes action. In particular, an unverified
 //! `Prepared` record whose current state merely matches the desired
 //! configuration proves nothing — the crash may predate the mutation while
 //! an external actor independently produced that state — so the resource is
@@ -244,7 +244,7 @@ mod journal;
 mod platform;
 mod reconciliation;
 
-pub use capability::{BackendKind, Capabilities, MutationGuard};
+pub use capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
 pub use config::{DnsConfig, DnsConfigBuilder, DnsScope, InterfaceSelector};
 pub use error::{ConflictReason, Error, Result};
 pub use interface::InterfaceInfo;
