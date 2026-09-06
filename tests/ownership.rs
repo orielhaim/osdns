@@ -124,3 +124,14 @@ fn resource_ids_validate() {
     assert!("space jam".parse::<osdns::ResourceId>().is_err());
     assert!("trailing:".parse::<osdns::ResourceId>().is_err());
 }
+
+#[test]
+fn production_lock_root_is_stable_across_calls() {
+    let a = osdns::testing::production_lock_root().unwrap();
+    let b = osdns::testing::production_lock_root().unwrap();
+    assert_eq!(a, b);
+    assert!(
+        a.ends_with("osdns") || a.ends_with("osdns\\") || a.file_name().is_some(),
+        "{a:?}"
+    );
+}

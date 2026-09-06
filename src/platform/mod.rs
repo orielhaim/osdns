@@ -11,7 +11,7 @@ pub(crate) mod windows;
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{BackendKind, Capabilities};
+use crate::capability::{BackendKind, Capabilities, MutationGuard};
 use crate::config::{DnsConfig, DnsScope};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
@@ -50,6 +50,46 @@ pub(crate) struct ApplyReceipt {
     pub(crate) resource: ResourceId,
 }
 
+/// What a backend mutation actually did. The engine must not treat every
+/// `Err` as the same state: a CAS rejection is not a partial write.
+#[derive(Debug)]
+pub(crate) enum MutationAttempt {
+    /// The mutation completed. `produced` is backend-issued identity of the
+    /// resulting state (generation, version, file identity) when the backend
+    /// can name it. A later rollback may use it as `expected`; a fresh read
+    /// after failure is not a substitute.
+    Performed { produced: Option<PlatformSnapshot> },
+    /// The backend guarantees it did not mutate (compare-and-mutate rejected
+    /// the call). Must never trigger rollback.
+    Rejected { error: Error },
+    /// The mutation may have occurred. Rollback is allowed only when
+    /// `produced` is backend-issued proof of the state we created.
+    Indeterminate {
+        error: Error,
+        produced: Option<PlatformSnapshot>,
+    },
+}
+
+impl MutationAttempt {
+    pub(crate) fn from_apply_result(result: Result<ApplyReceipt>) -> Self {
+        match result {
+            Ok(_) => Self::Performed { produced: None },
+            Err(error) if error.is_external_modification() => Self::Rejected { error },
+            Err(error) => Self::Indeterminate {
+                error,
+                produced: None,
+            },
+        }
+    }
+
+    pub(crate) fn into_result(self) -> Result<()> {
+        match self {
+            Self::Performed { .. } => Ok(()),
+            Self::Rejected { error } | Self::Indeterminate { error, .. } => Err(error),
+        }
+    }
+}
+
 /// The boundary between the transaction engine and platform-specific code.
 ///
 /// Implementations are crate-internal; the public API never exposes
@@ -77,34 +117,38 @@ pub(crate) trait Backend: Send + Sync {
 
     /// Applies `plan` to `resource`. Must be idempotent when possible.
     ///
-    /// # Partial-mutation contract
-    ///
-    /// A backend may perform several native mutations to express one plan
-    /// (for example separate IPv4 and IPv6 calls). When any step fails the
-    /// backend returns `Err`, but the resource may already be partially
-    /// mutated: callers must treat an `Err` return as indeterminate state,
-    /// never as proof that nothing changed. The transaction engine always
-    /// reads back and rolls back after an apply failure; backends must not
-    /// rely on callers assuming atomicity.
+    /// A backend may perform several native mutations to express one plan.
+    /// When any step fails the backend returns `Err`, and the resource may
+    /// already be partially mutated. That is
+    /// [`MutationAttempt::Indeterminate`], never proof that nothing changed.
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt>;
 
     /// Reads the state back after a mutation for verification.
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;
 
-    /// Applies `plan`, but only while the current state still matches
-    /// `expected`: the forward-mutation counterpart of
-    /// [`Backend::restore_guarded`]. The default implementation is a plain
-    /// [`Backend::apply`] (best-effort: a concurrent external change
-    /// between the engine's verification read and this apply cannot be
-    /// ruled out). Backends with native generation or version semantics
-    /// override it with a true atomic check-and-mutate.
+    /// Native compare-and-mutate strength. Defaults to the value advertised
+    /// in [`Capabilities::mutation_guard`].
+    fn mutation_guard(&self) -> MutationGuard {
+        self.capabilities().mutation_guard
+    }
+
+    /// Applies `plan` only while current state still matches `expected`.
+    ///
+    /// Implemented only by backends with [`MutationGuard::CompareAndMutate`].
+    /// The default does not fall back to [`Backend::apply`]: a missing
+    /// primitive is a rejection, not a silent unguarded write.
     fn apply_guarded(
         &self,
-        resource: &ResourceId,
+        _resource: &ResourceId,
         _expected: &PlatformSnapshot,
-        plan: &NormalizedConfig,
-    ) -> Result<ApplyReceipt> {
-        self.apply(resource, plan)
+        _plan: &NormalizedConfig,
+    ) -> MutationAttempt {
+        MutationAttempt::Rejected {
+            error: Error::unsupported(
+                self.kind(),
+                "this backend has no compare-and-mutate primitive",
+            ),
+        }
     }
 
     /// Restores an exact previous snapshot.
@@ -113,34 +157,32 @@ pub(crate) trait Backend: Send + Sync {
     /// with unrelated native state where the platform requires it, so that
     /// restoration never destroys changes made by other actors to unmanaged
     /// fields.
-    ///
-    /// Prefer [`Backend::restore_guarded`]: it checks ownership of
-    /// `expected` first. Every destructive restore in the engine
-    /// (rollback, lease restore, recovery, rebase) goes through the
-    /// guarded form.
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()>;
 
-    /// Restores `target`, but only while the current state still matches
-    /// `expected`. The default implementation reads back, compares with
-    /// [`Backend::equivalent`], and restores on match, returning
-    /// [`Error::ExternalModification`](crate::Error::ExternalModification)
-    /// without mutating otherwise. Backends with native generation or
-    /// version semantics (NetworkManager `version_id`, the test fake's
-    /// generation counter) override this with a true atomic check.
+    /// Restores `target` only while current state still matches `expected`.
+    ///
+    /// Implemented only by backends with [`MutationGuard::CompareAndMutate`].
+    /// The default does not perform a read-then-write.
     fn restore_guarded(
         &self,
-        resource: &ResourceId,
-        expected: &PlatformSnapshot,
-        target: &PlatformSnapshot,
-    ) -> Result<()> {
-        let current = self.readback(resource)?;
-        if !self.equivalent(&current, expected) {
-            return Err(Error::ExternalModification {
-                resource: resource.clone(),
-                detail: "the current state changed since ownership was verified".to_string(),
-            });
+        _resource: &ResourceId,
+        _expected: &PlatformSnapshot,
+        _target: &PlatformSnapshot,
+    ) -> MutationAttempt {
+        MutationAttempt::Rejected {
+            error: Error::unsupported(
+                self.kind(),
+                "this backend has no compare-and-mutate primitive",
+            ),
         }
-        self.restore(resource, target)
+    }
+
+    /// Whether `proof` still names `current` as the same backend-issued
+    /// mutation (generation, version, or file identity). Semantic DNS
+    /// equality is not enough: an external writer can reproduce the same
+    /// nameservers under a new identity.
+    fn proves_current(&self, _proof: &PlatformSnapshot, _current: &PlatformSnapshot) -> bool {
+        false
     }
 
     /// Semantic equality of two snapshots of the same resource: `true` when

@@ -16,6 +16,9 @@ use crate::ownership::{ResourceId, ResourceLock};
 /// in-memory state, the journal, and the registry consistent.
 pub(crate) struct LiveRecord {
     pub(crate) record: JournalRecord,
+    /// Verified mutation identity retained when the durable `Applied` write
+    /// failed. Never serialized; recovery must not see it.
+    pub(crate) verified: Option<crate::platform::PlatformSnapshot>,
 }
 
 /// The live state of a [`Lease`]: shared journal records plus the
@@ -92,7 +95,10 @@ impl Lease {
         let mut live = Vec::with_capacity(records.len());
         for record in records {
             resources.push(record.resource.clone());
-            let shared = Arc::new(Mutex::new(LiveRecord { record }));
+            let shared = Arc::new(Mutex::new(LiveRecord {
+                record,
+                verified: None,
+            }));
             inner.register_active(Arc::clone(&shared));
             live.push(shared);
         }

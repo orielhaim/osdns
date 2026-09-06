@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use crate::capability::Capabilities;
+use crate::capability::{Capabilities, MutationGuard};
 use crate::config::{DnsConfig, DnsScope, validate_against};
 use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
@@ -15,7 +15,7 @@ use crate::journal::{JournalRecord, JournalStore, Phase, SCHEMA_VERSION};
 use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
-use crate::platform::{Backend, PlatformSnapshot, select_default_backend};
+use crate::platform::{Backend, MutationAttempt, PlatformSnapshot, select_default_backend};
 use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
 use crate::watch::{WatchCallback, WatchHandle};
@@ -121,6 +121,7 @@ pub(crate) struct EnforceState {
     refs: usize,
     handle: Option<WatchHandle>,
     feed: Option<std::sync::mpsc::Sender<ResourceId>>,
+    parked: bool,
 }
 
 impl std::fmt::Debug for EnforceState {
@@ -163,6 +164,7 @@ impl Inner {
                 Ok(handle) => {
                     enforce.handle = Some(handle);
                     enforce.feed = Some(feed);
+                    enforce.parked = false;
                 }
                 Err(error) => {
                     drop(feed);
@@ -191,6 +193,7 @@ impl Inner {
         if enforce.refs == 0 {
             enforce.handle = None;
             enforce.feed = None;
+            enforce.parked = false;
         }
     }
 
@@ -219,15 +222,45 @@ impl Inner {
     /// so deterministic tests can drive reconciliation via `debug_reconcile`
     /// without racing a background worker. The lease-drop balance is kept:
     /// `release_enforce_watch` still runs once per lease.
+    pub(crate) fn enforce_parked(&self) -> bool {
+        self.enforce
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .parked
+    }
+
     #[cfg(feature = "test-util")]
     #[allow(dead_code)]
     pub(crate) fn suspend_enforce_watch(&self) {
-        let mut enforce = self
-            .enforce
+        {
+            let mut enforce = self
+                .enforce
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            enforce.handle = None;
+            enforce.feed = None;
+            enforce.parked = true;
+        }
+        self.reconciler.clear();
+    }
+
+    /// Queues an authoritative reconciliation of every active resource.
+    /// Called after native observation is installed so changes that arrived
+    /// in the watcher-start window cannot be missed.
+    pub(crate) fn rescan_enforce(&self) {
+        let Some(feed) = self.enforce_feed() else {
+            return;
+        };
+        let resources: Vec<ResourceId> = self
+            .active
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        enforce.handle = None;
-        enforce.feed = None;
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        for resource in resources {
+            let _ = feed.send(resource);
+        }
     }
 
     /// Whether the internal Enforce watcher is currently running.
@@ -289,16 +322,11 @@ impl Inner {
 
     /// Applies `plan` and verifies by read-back.
     ///
-    /// `expected_current` is the caller's fresh ownership read: the forward
-    /// mutation is issued as a guarded apply against it, so backends with
-    /// atomic compare-and-swap refuse to overwrite a concurrent external
-    /// change instead of silently winning the race.
-    ///
-    /// An `Err` from the apply means indeterminate state (the backend may
-    /// have partially mutated before failing), never proof that nothing
-    /// changed. Every failure path therefore reads back and attempts a
-    /// guarded rollback to `rollback_to` before returning; the journal
-    /// record is always kept by the caller for later recovery.
+    /// `expected_current` is the caller's fresh ownership read. Backends with
+    /// [`MutationGuard::CompareAndMutate`] refuse to overwrite a concurrent
+    /// external change. A CAS rejection never rolls back. Rollback after a
+    /// performed or proven-partial mutation uses the backend-issued proof,
+    /// never a fresh post-failure read.
     pub(crate) fn mutate_and_verify(
         &self,
         resource: &ResourceId,
@@ -306,86 +334,114 @@ impl Inner {
         plan: &NormalizedConfig,
         rollback_to: Option<&PlatformSnapshot>,
         points: MutatePoints,
+        leftover: &mut Option<PlatformSnapshot>,
     ) -> Result<PlatformSnapshot> {
+        leftover.take();
         self.suppressions.suppress(resource);
-        if let Err(error) = self.backend.apply_guarded(resource, expected_current, plan) {
-            if let Some(target) = rollback_to {
-                self.attempt_rollback(resource, None, target);
-            }
-            return Err(error);
-        }
-        self.fire(points.apply)?;
-        let actual = match self.backend.readback(resource) {
-            Ok(actual) => actual,
-            Err(error) => {
-                if let Some(target) = rollback_to {
-                    self.attempt_rollback(resource, None, target);
+        match self.apply_attempt(resource, expected_current, plan) {
+            MutationAttempt::Rejected { error } => Err(error),
+            MutationAttempt::Indeterminate { error, produced } => {
+                if !self.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                    *leftover = produced;
                 }
-                return Err(error);
+                Err(error)
             }
-        };
-        self.fire(points.readback)?;
-        if !self.backend.matches_desired(&actual, plan) {
-            if let Some(target) = rollback_to {
-                self.attempt_rollback(resource, Some(&actual), target);
-            }
-            return Err(Error::VerificationFailed {
-                resource: resource.clone(),
-                detail:
-                    "the state read back from the system does not match the desired configuration"
-                        .to_string(),
-            });
-        }
-        self.fire(points.verify)?;
-        Ok(actual)
-    }
-
-    /// Best-effort rollback to `target` after a failed mutation, using a
-    /// held read-back when the caller has one and a fresh read otherwise.
-    /// Never fails: journals are always retained for
-    /// [`DnsManager::recover_stale`].
-    #[allow(unused_variables)]
-    fn attempt_rollback(
-        &self,
-        resource: &ResourceId,
-        current: Option<&PlatformSnapshot>,
-        target: &PlatformSnapshot,
-    ) {
-        let current = match current {
-            Some(current) => current.clone(),
-            None => match self.backend.readback(resource) {
-                Ok(current) => current,
-                Err(error) => {
-                    osdns_warn!(
-                        resource = %resource,
-                        error = %error,
-                        "rollback could not read back the current state; the journal record was kept for later recovery"
-                    );
-                    return;
+            MutationAttempt::Performed { produced } => {
+                let fail = |this: &Self,
+                            leftover: &mut Option<PlatformSnapshot>,
+                            produced: Option<PlatformSnapshot>,
+                            error: Error| {
+                    if !this.rollback_proven(resource, produced.as_ref(), rollback_to) {
+                        *leftover = produced;
+                    }
+                    Err(error)
+                };
+                if let Err(error) = self.fire(points.apply) {
+                    return fail(self, leftover, produced, error);
                 }
-            },
-        };
-        if !self.rollback_guarded(resource, &current, target) {
-            osdns_warn!(
-                resource = %resource,
-                "rollback did not restore the previous state; the journal record was kept for later recovery"
-            );
+                match self.backend.readback(resource) {
+                    Ok(actual) => {
+                        if let Err(error) = self.fire(points.readback) {
+                            return fail(self, leftover, produced, error);
+                        }
+                        if !self.backend.matches_desired(&actual, plan) {
+                            return fail(
+                                self,
+                                leftover,
+                                produced,
+                                Error::VerificationFailed {
+                                    resource: resource.clone(),
+                                    detail: "the state read back from the system does not match the desired configuration"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        if let Err(error) = self.fire(points.verify) {
+                            return fail(self, leftover, produced, error);
+                        }
+                        Ok(actual)
+                    }
+                    Err(error) => fail(self, leftover, produced, error),
+                }
+            }
         }
     }
 
-    /// Guarded rollback to `target`, expecting `current`. Returns whether
-    /// the resource reads back as `target` afterwards.
-    #[allow(unused_variables)]
-    fn rollback_guarded(
+    fn apply_attempt(
         &self,
         resource: &ResourceId,
-        current: &PlatformSnapshot,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> MutationAttempt {
+        match self.backend.mutation_guard() {
+            MutationGuard::CompareAndMutate => self.backend.apply_guarded(resource, expected, plan),
+            MutationGuard::Unconditional => {
+                MutationAttempt::from_apply_result(self.backend.apply(resource, plan))
+            }
+        }
+    }
+
+    fn restore_if_current(
+        &self,
+        resource: &ResourceId,
+        expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
+    ) -> Result<()> {
+        match self.backend.mutation_guard() {
+            MutationGuard::CompareAndMutate => self
+                .backend
+                .restore_guarded(resource, expected, target)
+                .into_result(),
+            MutationGuard::Unconditional => {
+                let current = self.backend.readback(resource)?;
+                if !self.backend.equivalent(&current, expected) {
+                    return Err(Error::ExternalModification {
+                        resource: resource.clone(),
+                        detail: "the current state changed since ownership was verified"
+                            .to_string(),
+                    });
+                }
+                self.backend.restore(resource, target)
+            }
+        }
+    }
+
+    /// Rolls back only when `proof` is backend-issued identity of a state we
+    /// created. A post-failure read is not proof.
+    #[allow(unused_variables)]
+    fn rollback_proven(
+        &self,
+        resource: &ResourceId,
+        proof: Option<&PlatformSnapshot>,
+        target: Option<&PlatformSnapshot>,
     ) -> bool {
-        if self.backend.equivalent(current, target) {
+        let (Some(proof), Some(target)) = (proof, target) else {
+            return false;
+        };
+        if self.backend.equivalent(proof, target) {
             return true;
         }
-        if let Err(error) = self.backend.restore_guarded(resource, current, target) {
+        if let Err(error) = self.restore_if_current(resource, proof, target) {
             osdns_warn!(
                 resource = %resource,
                 error = %error,
@@ -469,17 +525,29 @@ impl Inner {
         let mut actuals: Vec<PlatformSnapshot> = Vec::new();
         for index in 0..records.len() {
             let expected = records[index].before.clone();
+            let mut leftover = None;
             match self.mutate_and_verify(
                 &records[index].resource,
                 &expected,
                 plan,
                 Some(&records[index].before),
                 INITIAL_POINTS,
+                &mut leftover,
             ) {
                 Ok(actual) => actuals.push(actual),
                 Err(error) => {
-                    for record in &records[..=index] {
-                        self.revert_record(record);
+                    for (record, proof) in records[..index].iter().zip(&actuals) {
+                        if self.rollback_proven(&record.resource, Some(proof), Some(&record.before))
+                        {
+                            let _ = self.journal.remove(&record.lease_id, &record.resource);
+                        }
+                    }
+                    let failed = &records[index];
+                    if leftover.is_none()
+                        && let Ok(now) = self.backend.readback(&failed.resource)
+                        && self.backend.equivalent(&now, &failed.before)
+                    {
+                        let _ = self.journal.remove(&failed.lease_id, &failed.resource);
                     }
                     for record in &records[index + 1..] {
                         let _ = self.journal.remove(&record.lease_id, &record.resource);
@@ -498,28 +566,6 @@ impl Inner {
         }
         self.fire(TxPoint::AfterApplied)?;
         Ok((lease_id, records, false))
-    }
-
-    /// Rolls one `Prepared` record back to its captured `before` state,
-    /// removing the journal on success and keeping it for recovery on
-    /// failure.
-    #[allow(unused_variables)]
-    fn revert_record(&self, record: &JournalRecord) {
-        self.suppressions.suppress(&record.resource);
-        let current = match self.backend.readback(&record.resource) {
-            Ok(current) => current,
-            Err(error) => {
-                osdns_warn!(
-                    resource = %record.resource,
-                    error = %error,
-                    "transaction rollback could not read the current state; the journal record was kept for later recovery"
-                );
-                return;
-            }
-        };
-        if self.rollback_guarded(&record.resource, &current, &record.before) {
-            let _ = self.journal.remove(&record.lease_id, &record.resource);
-        }
     }
 
     /// Transactionally moves every owned resource to `plan` as one logical
@@ -609,43 +655,42 @@ impl Inner {
         for index in 0..live.len() {
             let resource = olds[index].resource.clone();
             let expected = currents[index].clone();
+            let mut leftover = None;
             match self.mutate_and_verify(
                 &resource,
                 &expected,
                 plan,
                 Some(&applieds[index]),
                 UPDATE_POINTS,
+                &mut leftover,
             ) {
                 Ok(actual) => actuals[index] = Some(actual),
                 Err(error) => {
-                    for rollback_index in 0..=index {
-                        let old = &olds[rollback_index];
-                        let resource = &old.resource;
-                        self.suppressions.suppress(resource);
-                        let current = match self.backend.readback(resource) {
-                            Ok(current) => current,
-                            Err(_) => continue,
-                        };
-                        // Untouched resources already equal their previous
-                        // applied state; only moved ones need a rollback.
-                        let moved = actuals[rollback_index].is_some()
-                            || (rollback_index == index
-                                && !self.backend.equivalent(&current, &applieds[rollback_index]));
-                        if moved {
-                            self.attempt_rollback(
-                                resource,
-                                Some(&current),
-                                &applieds[rollback_index],
+                    for rollback_index in 0..index {
+                        if let Some(proof) = &actuals[rollback_index] {
+                            self.rollback_proven(
+                                &olds[rollback_index].resource,
+                                Some(proof),
+                                Some(&applieds[rollback_index]),
                             );
                         }
                     }
                     self.fire(TxPoint::AfterUpdateVerify).ok();
-                    for (old, live_record) in olds.iter().zip(live.iter()) {
+                    for (old_index, (old, live_record)) in olds.iter().zip(live.iter()).enumerate()
+                    {
                         let mut guard = live_record
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        guard.record = old.clone();
-                        let _ = self.journal.write(&guard.record);
+                        if old_index == index && leftover.is_some() {
+                            guard.verified = leftover.take();
+                            guard.record.phase = Phase::Prepared;
+                            guard.record.applied = None;
+                            let _ = self.journal.write(&guard.record);
+                        } else {
+                            guard.record = old.clone();
+                            guard.verified = None;
+                            let _ = self.journal.write(&guard.record);
+                        }
                     }
                     return Err(error);
                 }
@@ -658,13 +703,13 @@ impl Inner {
             guard.record.phase = Phase::Applied;
             guard.record.applied = actuals[index].clone();
             if let Err(error) = self.journal.write(&guard.record) {
-                // The OS already holds the new configuration for this and
-                // earlier resources while later journals still say Prepared;
-                // keep the in-memory applied state and report the error so
-                // recovery can finalize. Remaining journals stay Prepared.
+                guard.verified = actuals[index].clone();
+                guard.record.applied = None;
+                guard.record.phase = Phase::Prepared;
                 drop(guard);
                 return Err(error);
             }
+            guard.verified = None;
         }
         self.fire(TxPoint::AfterUpdateApplied)?;
         Ok(())
@@ -697,8 +742,7 @@ impl Inner {
                     .to_string(),
             });
         }
-        self.backend
-            .restore_guarded(resource, &current, &record.before)?;
+        self.restore_if_current(resource, &current, &record.before)?;
         self.fire(TxPoint::AfterRestoreRestore)?;
         let now = self.backend.readback(resource)?;
         if !self.backend.equivalent(&now, &record.before) {
@@ -747,10 +791,7 @@ impl Inner {
             .is_some_and(|applied| self.backend.equivalent(&current, applied));
         if verified {
             self.suppressions.suppress(&resource);
-            if let Err(error) = self
-                .backend
-                .restore_guarded(&resource, &current, &record.before)
-            {
+            if let Err(error) = self.restore_if_current(&resource, &current, &record.before) {
                 if error.is_external_modification() {
                     return Ok(RecoveryOutcome::ExternalConflict {
                         resource,
@@ -1037,11 +1078,10 @@ impl DnsManager {
                 let lease =
                     Lease::new_owned(self.inner.clone(), lease_id, records, locks, was_noop);
                 if let Err(error) = self.inner.ensure_enforce_watch() {
-                    // Best-effort restore; dropping the lease on failure
-                    // still cleans up its registry, journals, and refcount.
                     let _ = lease.restore();
                     return Err(error);
                 }
+                self.inner.rescan_enforce();
                 Ok(lease)
             }
             Err(error) => Err(error),
@@ -1147,6 +1187,13 @@ impl DnsManager {
     #[cfg(feature = "test-util")]
     pub fn set_journal_fail_writes(&self, fail: bool) {
         self.inner.journal.set_fail_writes(fail);
+    }
+
+    /// Allows `skip` journal writes, then fails subsequent writes (testing
+    /// only).
+    #[cfg(feature = "test-util")]
+    pub fn set_journal_fail_writes_after(&self, skip: u32) {
+        self.inner.journal.set_fail_writes_after(skip);
     }
 
     /// Number of live leases holding internal Enforce observation (testing
@@ -1312,7 +1359,7 @@ impl DnsManagerBuilder {
         // ownership universe. The directory is created lazily on first
         // lock acquisition so read-only flows never require its
         // privileges.
-        let global_lock_dir = default_state_dir()?.join("locks");
+        let global_lock_dir = global_lock_root()?.join("locks");
         let locks = ResourceLockManager::new(global_lock_dir, self.lock_timeout);
         let journal = JournalStore::open(state_dir.join("journal"))?;
         let backend = select_default_backend(&owner)?;
@@ -1362,16 +1409,7 @@ fn validate_owner(owner: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn default_state_dir() -> Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("PROGRAMDATA") {
-        return Ok(PathBuf::from(dir).join("osdns"));
-    }
-    if let Some(dir) = std::env::var_os("LOCALAPPDATA") {
-        return Ok(PathBuf::from(dir).join("osdns"));
-    }
-    Err(Error::RequiresPrivilege(
-        "cannot determine the default state directory; set one explicitly with state_dir()"
-            .to_string(),
-    ))
+    windows_program_data().map(|dir| dir.join("osdns"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1382,4 +1420,78 @@ fn default_state_dir() -> Result<PathBuf> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn default_state_dir() -> Result<PathBuf> {
     Ok(PathBuf::from("/var/lib/osdns"))
+}
+
+/// Machine-wide lock namespace. Independent of journal `state_dir` and of
+/// process environment variables that can alias per-user directories.
+pub(crate) fn global_lock_root() -> Result<PathBuf> {
+    default_state_dir()
+}
+
+#[cfg(target_os = "windows")]
+fn windows_program_data() -> Result<PathBuf> {
+    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    use windows::core::PWSTR;
+
+    let pwstr: PWSTR = unsafe {
+        SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None)
+    }
+    .map_err(|error| {
+        Error::RequiresPrivilege(format!(
+            "cannot resolve the machine ProgramData folder for the global lock namespace: {error}"
+        ))
+    })?;
+    let path = unsafe { pwstr.to_string() }.map_err(|error| {
+        Error::RequiresPrivilege(format!(
+            "cannot decode the machine ProgramData folder: {error}"
+        ))
+    })?;
+    unsafe {
+        windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.0.cast()));
+    }
+    if path.is_empty() {
+        return Err(Error::RequiresPrivilege(
+            "the machine ProgramData folder resolved empty; refusing a per-user lock namespace"
+                .to_string(),
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_lock_dir_tests {
+    use super::windows_program_data;
+
+    #[test]
+    fn global_lock_root_ignores_programdata_and_localappdata() {
+        let original_programdata = std::env::var_os("PROGRAMDATA");
+        let original_local = std::env::var_os("LOCALAPPDATA");
+        // SAFETY: tests in this process serialize on this function; we restore
+        // the previous values before returning.
+        unsafe {
+            std::env::set_var("PROGRAMDATA", r"C:\osdns-test-programdata-not-real");
+            std::env::set_var("LOCALAPPDATA", r"C:\osdns-test-localappdata-not-real");
+        }
+        let resolved = windows_program_data();
+        unsafe {
+            match original_programdata {
+                Some(value) => std::env::set_var("PROGRAMDATA", value),
+                None => std::env::remove_var("PROGRAMDATA"),
+            }
+            match original_local {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+        }
+        let path = resolved.expect("machine ProgramData must be resolvable");
+        let text = path.to_string_lossy();
+        assert!(
+            !text.contains("osdns-test-programdata-not-real"),
+            "lock root followed PROGRAMDATA: {text}"
+        );
+        assert!(
+            !text.contains("osdns-test-localappdata-not-real"),
+            "lock root followed LOCALAPPDATA: {text}"
+        );
+    }
 }

@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capability::{BackendKind, Capabilities};
+use crate::capability::{BackendKind, Capabilities, MutationGuard};
 use crate::config::{DnsConfig, DnsScope, InterfaceSelector};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 /// The fake backend's representation of one resource's DNS state.
@@ -151,6 +151,8 @@ struct FakeInner {
     /// Pending mutate-then-fail applies (see
     /// [`FakeBackend::inject_partial_apply_failure`]).
     partial_apply_failures: u32,
+    before_guarded: Option<(ResourceId, FakeState)>,
+    after_guarded: Option<(ResourceId, FakeState)>,
 }
 
 /// Wire format of a fake snapshot: the managed state plus the generation
@@ -161,7 +163,7 @@ struct FakeSnapshotData {
     generation: u64,
 }
 
-type WatchSlot = Option<(Arc<AtomicBool>, WatchCallback)>;
+type WatchEntry = (Arc<AtomicBool>, WatchCallback);
 
 /// An in-memory backend modelling an operating system's DNS state.
 ///
@@ -172,10 +174,11 @@ pub(crate) struct FakeBackend {
     multi_resource: bool,
     caps: Capabilities,
     inner: Mutex<FakeInner>,
-    watch_slot: Arc<Mutex<WatchSlot>>,
+    watchers: Arc<Mutex<Vec<WatchEntry>>>,
     /// Ownership universe of this simulated OS instance, shared by every
     /// manager built around the same [`crate::testing::FakeDns`].
     namespace: String,
+    start_watch_block: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
 }
 
 impl FakeBackend {
@@ -189,12 +192,16 @@ impl FakeBackend {
                 .with_split_dns(true)
                 .with_default_route(true)
                 .with_watch(true)
-                .with_cache_flush(true),
+                .with_cache_flush(true)
+                .with_mutation_guard(MutationGuard::CompareAndMutate),
         )
     }
 
     pub(crate) fn with_capabilities(caps: Capabilities) -> Self {
-        Self::build(caps, false)
+        Self::build(
+            caps.with_mutation_guard(MutationGuard::CompareAndMutate),
+            false,
+        )
     }
 
     /// Enables split-resource resolution: interface scopes additionally
@@ -202,7 +209,10 @@ impl FakeBackend {
     /// mirroring the macOS backend shape. Used by the multi-resource engine
     /// tests.
     pub(crate) fn with_multi_resource(caps: Capabilities) -> Self {
-        Self::build(caps, true)
+        Self::build(
+            caps.with_mutation_guard(MutationGuard::CompareAndMutate),
+            true,
+        )
     }
 
     fn build(caps: Capabilities, multi_resource: bool) -> Self {
@@ -228,7 +238,7 @@ impl FakeBackend {
             states.insert(Self::interface_id(iface.index), FakeState::Empty);
         }
         Self {
-            caps,
+            caps: caps.with_mutation_guard(MutationGuard::CompareAndMutate),
             inner: Mutex::new(FakeInner {
                 interfaces,
                 states,
@@ -236,10 +246,13 @@ impl FakeBackend {
                 failures: Vec::new(),
                 readback_lie: None,
                 partial_apply_failures: 0,
+                before_guarded: None,
+                after_guarded: None,
             }),
-            watch_slot: Arc::new(Mutex::new(None)),
+            watchers: Arc::new(Mutex::new(Vec::new())),
             multi_resource,
             namespace: format!("osdns:fake:{}", uuid::Uuid::new_v4().simple()),
+            start_watch_block: Mutex::new(None),
         }
     }
 
@@ -280,6 +293,32 @@ impl FakeBackend {
     /// modelling a backend that partially mutates before returning `Err`.
     pub(crate) fn inject_partial_apply_failure(&self, times: u32) {
         self.lock_inner().partial_apply_failures += times;
+    }
+
+    pub(crate) fn inject_external_before_guarded(&self, resource: ResourceId, state: FakeState) {
+        self.lock_inner().before_guarded = Some((resource, state));
+    }
+
+    pub(crate) fn inject_external_after_guarded_mutation(
+        &self,
+        resource: ResourceId,
+        state: FakeState,
+    ) {
+        self.lock_inner().after_guarded = Some((resource, state));
+    }
+
+    /// Blocks the next [`Backend::start_watch`] until the returned release
+    /// function is called.
+    pub(crate) fn block_next_start_watch(&self) -> impl FnOnce() + Send {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *self
+            .start_watch_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(std::sync::Arc::clone(&barrier));
+        move || {
+            barrier.wait();
+        }
     }
 
     pub(crate) fn external_remove(&self, resource: &ResourceId) -> bool {
@@ -330,15 +369,51 @@ impl FakeBackend {
     }
 
     pub(crate) fn notify(&self, event: DnsEvent) {
-        let slot = self
-            .watch_slot
+        let watchers = self
+            .watchers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        if let Some((flag, callback)) = slot
-            && !flag.load(Ordering::Acquire)
-        {
-            callback(&event);
+        for (flag, callback) in watchers {
+            if !flag.load(Ordering::Acquire) {
+                callback(&event);
+            }
+        }
+    }
+
+    fn snapshot_from(inner: &FakeInner, resource: &ResourceId) -> Result<PlatformSnapshot> {
+        let state = inner.states.get(resource).cloned().ok_or_else(|| {
+            Error::BackendUnavailable(format!("resource {resource} is not present on this system"))
+        })?;
+        let generation = inner.generations.get(resource).copied().unwrap_or(0);
+        let data = serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
+            Error::platform(
+                BackendKind::Fake,
+                format_args!("fake state serialization failed: {e}"),
+            )
+        })?;
+        Ok(PlatformSnapshot::new(
+            BackendKind::Fake,
+            resource.clone(),
+            data,
+        ))
+    }
+
+    fn take_adversary(inner: &mut FakeInner, before: bool, resource: &ResourceId) {
+        let pending = if before {
+            inner.before_guarded.take()
+        } else {
+            inner.after_guarded.take()
+        };
+        if let Some((wanted, state)) = pending {
+            if wanted == *resource {
+                inner.states.insert(resource.clone(), state);
+                *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+            } else if before {
+                inner.before_guarded = Some((wanted, state));
+            } else {
+                inner.after_guarded = Some((wanted, state));
+            }
         }
     }
 
@@ -589,54 +664,84 @@ impl Backend for FakeBackend {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
-    ) -> Result<ApplyReceipt> {
-        self.check_failure(FakeOp::Apply)?;
-        let expected_full = self.interpret_full(expected)?;
-        let partial = {
-            let mut inner = self.lock_inner();
-            let live_state = inner.states.get(resource).cloned().ok_or_else(|| {
-                Error::BackendUnavailable(format!(
-                    "resource {resource} is not present on this system"
-                ))
-            })?;
-            let live_generation = inner.generations.get(resource).copied().unwrap_or(0);
-            if live_generation != expected_full.generation {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail:
-                        "the current state changed since ownership was verified (generation mismatch)"
-                            .to_string(),
-                });
+    ) -> MutationAttempt {
+        if let Err(error) = self.check_failure(FakeOp::Apply) {
+            return MutationAttempt::Indeterminate {
+                error,
+                produced: None,
+            };
+        }
+        let expected_full = match self.interpret_full(expected) {
+            Ok(full) => full,
+            Err(error) => {
+                return MutationAttempt::Indeterminate {
+                    error,
+                    produced: None,
+                };
             }
-            if live_state != expected_full.state {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail: "the current state is no longer the verified state".to_string(),
-                });
+        };
+        let (partial, produced) = {
+            let mut inner = self.lock_inner();
+            Self::take_adversary(&mut inner, true, resource);
+            let live_state = match inner.states.get(resource).cloned() {
+                Some(state) => state,
+                None => {
+                    return MutationAttempt::Indeterminate {
+                        error: Error::BackendUnavailable(format!(
+                            "resource {resource} is not present on this system"
+                        )),
+                        produced: None,
+                    };
+                }
+            };
+            let live_generation = inner.generations.get(resource).copied().unwrap_or(0);
+            if live_generation != expected_full.generation || live_state != expected_full.state {
+                return MutationAttempt::Rejected {
+                    error: Error::ExternalModification {
+                        resource: resource.clone(),
+                        detail: "the current state changed since ownership was verified"
+                            .to_string(),
+                    },
+                };
             }
             inner
                 .states
                 .insert(resource.clone(), merge_state(&live_state, plan));
             *inner.generations.entry(resource.clone()).or_insert(0) += 1;
-            if inner.partial_apply_failures > 0 {
+            let produced = match Self::snapshot_from(&inner, resource) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    };
+                }
+            };
+            let partial = if inner.partial_apply_failures > 0 {
                 inner.partial_apply_failures -= 1;
                 true
             } else {
                 false
-            }
+            };
+            Self::take_adversary(&mut inner, false, resource);
+            (partial, produced)
         };
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
         });
         if partial {
-            return Err(Error::platform(
-                BackendKind::Fake,
-                format_args!("injected partial mutation before failure"),
-            ));
+            MutationAttempt::Indeterminate {
+                error: Error::platform(
+                    BackendKind::Fake,
+                    format_args!("injected partial mutation before failure"),
+                ),
+                produced: Some(produced),
+            }
+        } else {
+            MutationAttempt::Performed {
+                produced: Some(produced),
+            }
         }
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
     }
 
     fn restore_guarded(
@@ -644,46 +749,77 @@ impl Backend for FakeBackend {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
-    ) -> Result<()> {
-        self.check_failure(FakeOp::Restore)?;
-        if expected.resource != *resource || target.resource != *resource {
-            return Err(Error::platform(
-                BackendKind::Fake,
-                format_args!("snapshot resource mismatch for {resource}"),
-            ));
+    ) -> MutationAttempt {
+        if let Err(error) = self.check_failure(FakeOp::Restore) {
+            return MutationAttempt::Indeterminate {
+                error,
+                produced: None,
+            };
         }
-        let expected_full = self.interpret_full(expected)?;
-        let target_state = self.interpret(target)?;
+        if expected.resource != *resource || target.resource != *resource {
+            return MutationAttempt::Indeterminate {
+                error: Error::platform(
+                    BackendKind::Fake,
+                    format_args!("snapshot resource mismatch for {resource}"),
+                ),
+                produced: None,
+            };
+        }
+        let expected_full = match self.interpret_full(expected) {
+            Ok(full) => full,
+            Err(error) => {
+                return MutationAttempt::Indeterminate {
+                    error,
+                    produced: None,
+                };
+            }
+        };
+        let target_state = match self.interpret(target) {
+            Ok(state) => state,
+            Err(error) => {
+                return MutationAttempt::Indeterminate {
+                    error,
+                    produced: None,
+                };
+            }
+        };
         {
             let mut inner = self.lock_inner();
+            Self::take_adversary(&mut inner, true, resource);
             if !inner.states.contains_key(resource) {
-                return Err(Error::BackendUnavailable(format!(
-                    "resource {resource} is not present on this system"
-                )));
+                return MutationAttempt::Indeterminate {
+                    error: Error::BackendUnavailable(format!(
+                        "resource {resource} is not present on this system"
+                    )),
+                    produced: None,
+                };
             }
             let live_generation = inner.generations.get(resource).copied().unwrap_or(0);
-            if live_generation != expected_full.generation {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail:
-                        "the current state changed since ownership was verified (generation mismatch)"
-                            .to_string(),
-                });
-            }
             let live_state = inner.states.get(resource).cloned().unwrap_or_default();
-            if live_state != expected_full.state {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail: "the current state is no longer the verified state".to_string(),
-                });
+            if live_generation != expected_full.generation || live_state != expected_full.state {
+                return MutationAttempt::Rejected {
+                    error: Error::ExternalModification {
+                        resource: resource.clone(),
+                        detail: "the current state changed since ownership was verified"
+                            .to_string(),
+                    },
+                };
             }
             inner.states.insert(resource.clone(), target_state);
             *inner.generations.entry(resource.clone()).or_insert(0) += 1;
+            Self::take_adversary(&mut inner, false, resource);
         }
         self.notify(DnsEvent::ResourceChanged {
             resource: resource.clone(),
         });
-        Ok(())
+        MutationAttempt::Performed { produced: None }
+    }
+
+    fn proves_current(&self, proof: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
+        match (self.interpret_full(proof), self.interpret_full(current)) {
+            (Ok(a), Ok(b)) => a.generation == b.generation && a.state == b.state,
+            _ => false,
+        }
     }
 
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
@@ -727,17 +863,29 @@ impl Backend for FakeBackend {
                 "watching is disabled for this fake backend",
             ));
         }
+        if let Some(barrier) = self
+            .start_watch_block
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            barrier.wait();
+        }
         let flag = Arc::new(AtomicBool::new(false));
         {
-            let mut slot = self
-                .watch_slot
+            let mut watchers = self
+                .watchers
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *slot = Some((Arc::clone(&flag), callback));
+            watchers.push((Arc::clone(&flag), callback));
         }
-        let slot = Arc::clone(&self.watch_slot);
+        let watchers = Arc::clone(&self.watchers);
+        let cancel_flag = Arc::clone(&flag);
         Ok(WatchHandle::new(flag, move || {
-            *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            watchers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|(existing, _)| !Arc::ptr_eq(existing, &cancel_flag));
         }))
     }
 }

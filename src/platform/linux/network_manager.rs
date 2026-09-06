@@ -357,6 +357,7 @@ fn capabilities(dns_mode: &str) -> Capabilities {
         .with_default_route(false)
         .with_watch(true)
         .with_cache_flush(false)
+        .with_mutation_guard(crate::capability::MutationGuard::CompareAndMutate)
 }
 
 fn u32_array(values: &[u32]) -> Array<'static> {
@@ -474,18 +475,44 @@ impl Backend for NetworkManager {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
-    ) -> Result<ApplyReceipt> {
+    ) -> crate::platform::MutationAttempt {
         let (device, live_settings, expected_version) =
-            self.guarded_baseline(resource, expected)?;
+            match self.guarded_baseline(resource, expected) {
+                Ok(baseline) => baseline,
+                Err(error) if error.is_external_modification() => {
+                    return crate::platform::MutationAttempt::Rejected { error };
+                }
+                Err(error) => {
+                    return crate::platform::MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    };
+                }
+            };
         let mut settings = to_owned_static(&live_settings);
         let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
         Self::with_dns_fields(&mut settings, &fields, false);
         match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => Ok(ApplyReceipt {
-                resource: resource.clone(),
-            }),
+            Ok(()) => match self.capture(resource) {
+                Ok(produced) => crate::platform::MutationAttempt::Performed {
+                    produced: Some(produced),
+                },
+                Err(error) => crate::platform::MutationAttempt::Indeterminate {
+                    error,
+                    produced: None,
+                },
+            },
             Err(error) => {
-                Err(self.map_reapply_error(resource, &device, expected_version, "apply", error))
+                let error =
+                    self.map_reapply_error(resource, &device, expected_version, "apply", error);
+                if error.is_external_modification() {
+                    crate::platform::MutationAttempt::Rejected { error }
+                } else {
+                    crate::platform::MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    }
+                }
             }
         }
     }
@@ -495,18 +522,58 @@ impl Backend for NetworkManager {
         resource: &ResourceId,
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
-    ) -> Result<()> {
-        let before = Self::fields_from_snapshot(target)?;
+    ) -> crate::platform::MutationAttempt {
+        let before = match Self::fields_from_snapshot(target) {
+            Ok(fields) => fields,
+            Err(error) => {
+                return crate::platform::MutationAttempt::Indeterminate {
+                    error,
+                    produced: None,
+                };
+            }
+        };
         let (device, live_settings, expected_version) =
-            self.guarded_baseline(resource, expected)?;
+            match self.guarded_baseline(resource, expected) {
+                Ok(baseline) => baseline,
+                Err(error) if error.is_external_modification() => {
+                    return crate::platform::MutationAttempt::Rejected { error };
+                }
+                Err(error) => {
+                    return crate::platform::MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    };
+                }
+            };
         let mut settings = to_owned_static(&live_settings);
         Self::with_dns_fields(&mut settings, &before, true);
         match self.reapply_versioned(&device, settings, expected_version) {
-            Ok(()) => Ok(()),
+            Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
             Err(error) => {
-                Err(self.map_reapply_error(resource, &device, expected_version, "restore", error))
+                let error =
+                    self.map_reapply_error(resource, &device, expected_version, "restore", error);
+                if error.is_external_modification() {
+                    crate::platform::MutationAttempt::Rejected { error }
+                } else {
+                    crate::platform::MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    }
+                }
             }
         }
+    }
+
+    fn proves_current(&self, proof: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
+        let Ok(proof_data) = Self::snapshot_data(proof) else {
+            return false;
+        };
+        let Ok(current_data) = Self::snapshot_data(current) else {
+            return false;
+        };
+        proof_data.fields == current_data.fields
+            && proof_data.version != 0
+            && proof_data.version == current_data.version
     }
 
     fn validate_plan(&self, _scope: &DnsScope, plan: &NormalizedConfig) -> Result<()> {

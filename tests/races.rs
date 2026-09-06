@@ -219,3 +219,61 @@ fn update_refuses_concurrent_external_change() {
     );
     lease.abandon().unwrap();
 }
+
+#[test]
+fn cas_rejection_does_not_rollback_over_external_state() {
+    let fixture = new_fixture("race-cas-reject");
+    fixture
+        .fake
+        .inject_external_before_guarded(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let err = fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap_err();
+    assert!(err.is_external_modification(), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9")),
+        "a CAS rejection must leave the external state untouched"
+    );
+}
+
+#[test]
+fn partial_mutation_then_external_change_is_not_rolled_over() {
+    let fixture = new_fixture("race-partial-then-external");
+    fixture.fake.inject_partial_apply_failure(1);
+    fixture
+        .fake
+        .inject_external_after_guarded_mutation(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let err = fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9")),
+        "rollback must not overwrite an external write that landed after our partial mutation"
+    );
+}
+
+#[test]
+fn indeterminate_apply_without_proof_does_not_rollback() {
+    let fixture = new_fixture("race-indeterminate-no-proof");
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Apply,
+        1,
+        "apply failed before mutating",
+    );
+    let err = fixture
+        .manager
+        .apply(&iface_config(1, "1.1.1.1"))
+        .unwrap_err();
+    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(FakeState::Empty)
+    );
+}

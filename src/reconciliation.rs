@@ -23,9 +23,9 @@
 //! capture the stable external base → persist/fsync `Prepared` with the new
 //! base → apply the overlay → read back and verify → persist `Applied`. On
 //! failure the pass rolls back to the new external base and defers. A
-//! `Prepared` record without a verified snapshot never authorizes recovery
-//! on its own: the live reconciler may finalize it via read-back while the
-//! lease is held, but orphaned crash recovery reports a conflict.
+//! `Prepared` record is finalized only from retained backend-issued proof,
+//! never because current DNS values happen to match `desired`. Orphaned crash
+//! recovery reports a conflict.
 //!
 //! A feedback-loop circuit breaker bounds rebase attempts per resource; while
 //! it is open, reconciliation is deferred (not dropped) until the cooldown
@@ -42,6 +42,7 @@ use crate::fault::TxPoint;
 use crate::journal::{JournalRecord, Phase};
 use crate::lease::LiveRecord;
 use crate::manager::{INITIAL_POINTS, Inner};
+use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::PlatformSnapshot;
 
@@ -128,6 +129,13 @@ impl Reconciler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(resource);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     fn breaker_gate(&self, resource: &ResourceId) -> Option<Duration> {
@@ -320,67 +328,49 @@ impl Inner {
         let mut guard = entry
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let record = &mut guard.record;
 
-        // A pending transaction whose overlay is now in place can be finalized.
-        if record.phase == Phase::Prepared && self.backend.matches_desired(&second, &record.desired)
-        {
-            record.applied = Some(second.clone());
-            record.phase = Phase::Applied;
-            match self.journal.write(record) {
-                Ok(()) => return ReconcileOutcome::StillOurs,
-                Err(error) => {
-                    osdns_warn!(
-                        resource = %resource,
-                        error = %error,
-                        "reconciliation could not finalize the pending transaction; deferring"
-                    );
-                    record.applied = None;
-                    record.phase = Phase::Prepared;
-                    return ReconcileOutcome::Deferred;
+        if guard.record.phase == Phase::Prepared {
+            if let Some(proof) = guard.verified.clone()
+                && self.backend.proves_current(&proof, &second)
+            {
+                guard.record.applied = Some(proof);
+                guard.record.phase = Phase::Applied;
+                match self.journal.write(&guard.record) {
+                    Ok(()) => {
+                        guard.verified = None;
+                        return ReconcileOutcome::StillOurs;
+                    }
+                    Err(error) => {
+                        osdns_warn!(
+                            resource = %resource,
+                            error = %error,
+                            "reconciliation could not finalize the pending transaction; deferring"
+                        );
+                        guard.record.applied = None;
+                        guard.record.phase = Phase::Prepared;
+                        return ReconcileOutcome::Deferred;
+                    }
                 }
+            }
+            if !self.backend.equivalent(&second, &guard.record.before) {
+                return ReconcileOutcome::Deferred;
             }
         }
 
-        if let Some(applied) = &record.applied
+        if let Some(applied) = &guard.record.applied
             && self.backend.equivalent(&second, applied)
         {
             return ReconcileOutcome::StillOurs;
         }
-        if self.backend.matches_desired(&second, &record.desired) {
-            return ReconcileOutcome::StillOurs;
+
+        if self.backend.equivalent(&second, &guard.record.before) {
+            let desired = guard.record.desired.clone();
+            let expected = second.clone();
+            drop(guard);
+            return self.apply_overlay(resource, entry, &expected, &desired, &expected);
         }
 
-        // Overlay missing but base intact: a plain reapply, no rebase needed.
-        if self.backend.equivalent(&second, &record.before) {
-            self.suppressions.suppress(resource);
-            match self.mutate_and_verify(
-                resource,
-                &second,
-                &record.desired,
-                Some(&second),
-                INITIAL_POINTS,
-            ) {
-                Ok(actual) => {
-                    record.applied = Some(actual);
-                    record.phase = Phase::Applied;
-                    match self.journal.write(record) {
-                        Ok(()) => return ReconcileOutcome::Rebased,
-                        Err(error) => {
-                            osdns_warn!(
-                                resource = %resource,
-                                error = %error,
-                                "reapply succeeded but the journal could not be updated; deferring"
-                            );
-                            return ReconcileOutcome::Deferred;
-                        }
-                    }
-                }
-                Err(_) => return ReconcileOutcome::Deferred,
-            }
-        }
-
-        // External modification of the base: full transactional rebase.
+        drop(guard);
         if let Some(cooldown) = reconciler.breaker_gate(resource) {
             osdns_warn!(
                 resource = %resource,
@@ -389,97 +379,108 @@ impl Inner {
             );
             return ReconcileOutcome::Deferred;
         }
-        self.rebase_transaction(resource, record, &second, reconciler)
+        self.rebase_transaction(resource, entry, &second)
     }
 
-    /// Adopts `external_base` as the new base and reapplies the desired
-    /// overlay as a full journal transaction:
-    ///
-    /// 1. persist/fsync `Prepared` with `before = external_base`;
-    /// 2. apply the overlay;
-    /// 3. read back and verify;
-    /// 4. persist `Applied` with the verified snapshot.
-    ///
-    /// On any failure the pass rolls back to `external_base` via a guarded
-    /// restore and defers, keeping the external base even when the rollback
-    /// itself fails. A crash between steps 1 and 4 leaves an unverified
-    /// `Prepared` record: the live pass finalizes it on its next read-back,
-    /// while orphaned crash recovery reports a conflict rather than
-    /// restoring on unproven ownership.
-    #[allow(unused_variables)]
-    fn rebase_transaction(
+    fn apply_overlay(
         &self,
         resource: &ResourceId,
-        record: &mut JournalRecord,
-        external_base: &PlatformSnapshot,
-        reconciler: &Reconciler,
+        entry: &Arc<Mutex<LiveRecord>>,
+        expected: &PlatformSnapshot,
+        desired: &NormalizedConfig,
+        rollback_to: &PlatformSnapshot,
     ) -> ReconcileOutcome {
-        self.suppressions.suppress(resource);
-        let old = record.clone();
-
-        record.before = external_base.clone();
-        record.applied = None;
-        record.phase = Phase::Prepared;
-        if let Err(error) = self.journal.write(record) {
-            osdns_warn!(
-                resource = %resource,
-                error = %error,
-                "rebase could not persist the Prepared record; keeping the previous journal state"
-            );
-            *record = old;
-            let _ = self.journal.write(record);
-            return ReconcileOutcome::Deferred;
-        }
-        if let Err(error) = self.fire(TxPoint::AfterPrepared) {
-            let _ = error;
-            return ReconcileOutcome::Deferred;
-        }
-
-        // `external_base` is the fresh stability read adopted as the new
-        // base: it is both the rollback target and the expectation for the
-        // guarded forward apply.
-        let expected = external_base.clone();
+        let mut leftover = None;
         match self.mutate_and_verify(
             resource,
-            &expected,
-            &record.desired,
-            Some(external_base),
+            expected,
+            desired,
+            Some(rollback_to),
             INITIAL_POINTS,
+            &mut leftover,
         ) {
-            Ok(actual) => {
-                record.applied = Some(actual);
-                record.phase = Phase::Applied;
-                match self.journal.write(record) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        // The OS has the overlay but the journal only
-                        // guarantees the external base: mark uncommitted so
-                        // the next pass finalizes via read-back.
-                        osdns_warn!(
-                            resource = %resource,
-                            error = %error,
-                            "rebase applied the overlay but could not persist Applied; deferring"
-                        );
-                        record.applied = None;
-                        record.phase = Phase::Prepared;
-                        reconciler.defer(resource, UNSTABLE_RETRY, false);
-                        return ReconcileOutcome::Deferred;
-                    }
-                }
-                if let Err(error) = self.fire(TxPoint::AfterApplied) {
-                    let _ = error;
-                }
-                ReconcileOutcome::Rebased
-            }
+            Ok(actual) => self.commit_applied(resource, entry, actual),
             Err(_) => {
-                // Prepared is already durable. Keep the external base even
-                // if rollback fails or its readback is unavailable. The OS
-                // may still contain our overlay; restoring the old journal
-                // would let recovery erase the newly adopted external base.
+                if leftover.is_some() {
+                    lock_live(entry).verified = leftover;
+                }
                 ReconcileOutcome::Deferred
             }
         }
     }
+
+    #[allow(unused_variables)]
+    fn commit_applied(
+        &self,
+        resource: &ResourceId,
+        entry: &Arc<Mutex<LiveRecord>>,
+        actual: PlatformSnapshot,
+    ) -> ReconcileOutcome {
+        let mut live = lock_live(entry);
+        live.record.applied = Some(actual.clone());
+        live.record.phase = Phase::Applied;
+        match self.journal.write(&live.record) {
+            Ok(()) => {
+                live.verified = None;
+                drop(live);
+                let _ = self.fire(TxPoint::AfterApplied);
+                ReconcileOutcome::Rebased
+            }
+            Err(error) => {
+                osdns_warn!(
+                    resource = %resource,
+                    error = %error,
+                    "mutation was verified but the Applied journal write failed; deferring"
+                );
+                live.verified = Some(actual);
+                live.record.applied = None;
+                live.record.phase = Phase::Prepared;
+                ReconcileOutcome::Deferred
+            }
+        }
+    }
+
+    #[allow(unused_variables)]
+    fn rebase_transaction(
+        &self,
+        resource: &ResourceId,
+        entry: &Arc<Mutex<LiveRecord>>,
+        external_base: &PlatformSnapshot,
+    ) -> ReconcileOutcome {
+        self.suppressions.suppress(resource);
+        {
+            let mut live = lock_live(entry);
+            let old = live.record.clone();
+            let old_verified = live.verified.clone();
+            live.record.before = external_base.clone();
+            live.record.applied = None;
+            live.record.phase = Phase::Prepared;
+            live.verified = None;
+            if let Err(error) = self.journal.write(&live.record) {
+                osdns_warn!(
+                    resource = %resource,
+                    error = %error,
+                    "rebase could not persist the Prepared record; keeping the previous journal state"
+                );
+                live.record = old;
+                live.verified = old_verified;
+                let _ = self.journal.write(&live.record);
+                return ReconcileOutcome::Deferred;
+            }
+        }
+        if self.fire(TxPoint::AfterPrepared).is_err() {
+            return ReconcileOutcome::Deferred;
+        }
+
+        let desired = lock_live(entry).record.desired.clone();
+        self.apply_overlay(resource, entry, external_base, &desired, external_base)
+    }
+}
+
+fn lock_live(entry: &Arc<Mutex<LiveRecord>>) -> std::sync::MutexGuard<'_, LiveRecord> {
+    entry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Spawns the reconciliation worker for an Enforce-policy manager and returns
@@ -529,6 +530,9 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<Resourc
                     continue;
                 }
                 for resource in due {
+                    if inner.enforce_parked() {
+                        continue;
+                    }
                     inner.reconcile_resource(&resource, &inner.reconciler);
                 }
             }

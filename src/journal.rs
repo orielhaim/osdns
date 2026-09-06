@@ -63,6 +63,8 @@ pub(crate) struct JournalStore {
     dir: PathBuf,
     #[cfg(feature = "test-util")]
     fail_writes: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-util")]
+    fail_writes_skip: std::sync::atomic::AtomicU32,
 }
 
 impl JournalStore {
@@ -72,6 +74,8 @@ impl JournalStore {
             dir,
             #[cfg(feature = "test-util")]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-util")]
+            fail_writes_skip: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -79,15 +83,35 @@ impl JournalStore {
     pub(crate) fn set_fail_writes(&self, fail: bool) {
         self.fail_writes
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+        if !fail {
+            self.fail_writes_skip
+                .store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_fail_writes_after(&self, skip: u32) {
+        self.fail_writes_skip
+            .store(skip, std::sync::atomic::Ordering::SeqCst);
+        self.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn write(&self, record: &JournalRecord) -> Result<()> {
         #[cfg(feature = "test-util")]
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(Error::platform(
-                record.backend,
-                format_args!("injected journal write failure"),
-            ));
+            let skip = self
+                .fail_writes_skip
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if skip > 0 {
+                self.fail_writes_skip
+                    .store(skip - 1, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                return Err(Error::platform(
+                    record.backend,
+                    format_args!("injected journal write failure"),
+                ));
+            }
         }
         let path = record_path(&self.dir, &record.lease_id, &record.resource);
         let bytes = serde_json::to_vec_pretty(record).map_err(|e| {

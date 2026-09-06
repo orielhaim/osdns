@@ -71,19 +71,16 @@
 //!
 //! # Safe restoration
 //!
-//! Restoration is guarded compare-and-restore per resource. The read-back
-//! used for the ownership decision is the expectation for the restore,
-//! so backends with native generation or
-//! version semantics (NetworkManager's applied-connection `version_id`,
-//! the test backend's generation counter) close the check/restore window
-//! atomically; other backends fail instead of overwriting on doubt. The
-//! current state is only overwritten when it still matches the verified
-//! applied snapshot (or the original state, in which case nothing needs to
-//! happen). A state that merely matches the desired configuration proves
-//! nothing by itself. Otherwise [`Error::ExternalModification`] is
-//! returned, nothing is mutated, and the lease remains usable so the caller
-//! can retry or call [`Lease::abandon`] to leave the external state
-//! untouched.
+//! Restoration overwrites a resource only while a backend-issued identity
+//! still names the state we applied (generation, version, or file
+//! identity). [`Capabilities::mutation_guard`] reports whether the active
+//! backend can compare-and-mutate atomically. Backends without that
+//! primitive restore with an ordinary write after a non-atomic comparison
+//! and do not advertise a stronger contract. A state that merely matches
+//! the desired configuration proves nothing by itself. Otherwise
+//! [`Error::ExternalModification`] is returned, nothing is mutated, and the
+//! lease remains usable so the caller can retry or call [`Lease::abandon`]
+//! to leave the external state untouched.
 //!
 //! # Crash recovery
 //!
@@ -247,7 +244,7 @@ mod journal;
 mod platform;
 mod reconciliation;
 
-pub use capability::{BackendKind, Capabilities};
+pub use capability::{BackendKind, Capabilities, MutationGuard};
 pub use config::{DnsConfig, DnsConfigBuilder, DnsScope, InterfaceSelector};
 pub use error::{ConflictReason, Error, Result};
 pub use interface::InterfaceInfo;

@@ -352,10 +352,13 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
             DebugReconcile::StillOurs
         );
         lease.restore().unwrap();
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(state_with("9.9.9.9")),
+            "retained mutation proof must be the only way to finalize, and restore returns to the external base"
+        );
+        return;
     } else {
-        // Orphaned crash recovery (no live lease) must not roll an
-        // unverified overlay back on proof-less matching: conflict, keep
-        // the journal, leave the OS untouched.
         drop(lease);
         drop(fixture.manager);
         let recovered = manager_for_testing(
@@ -376,13 +379,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
             "orphaned ambiguous state must be left untouched"
         );
         recovered.abandon_journal(&resource_id(IFACE1)).unwrap();
-        return;
     }
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("9.9.9.9"))
-    );
-    assert!(journal_files(&fixture.dir).is_empty());
 }
 
 #[test]
@@ -504,4 +501,90 @@ fn enforce_observation_balances_noop_lifetime() {
     assert_eq!(fixture.manager.debug_enforce_refs(), 0);
     assert!(!fixture.manager.debug_enforce_watching());
     assert!(journal_files(&fixture.dir).is_empty());
+}
+
+#[test]
+fn prepared_desired_match_from_external_actor_is_not_ours() {
+    let fixture = enforce_manager("enforce-prepared-desired");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    fixture
+        .fake
+        .inject_backend_failure(osdns::testing::FakeOp::Apply, 2, "rebase apply refused");
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    assert_eq!(journal_record_json(&fixture.dir)["phase"], "Prepared");
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("1.1.1.1"))
+        .unwrap();
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Prepared");
+    assert!(record["applied"].is_null());
+    lease.abandon().unwrap();
+}
+
+#[test]
+fn verified_mutation_finalizes_only_from_retained_proof() {
+    let fixture = enforce_manager("enforce-retained-proof");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    fixture.manager.set_journal_fail_writes_after(1);
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Deferred
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("1.1.1.1"))
+    );
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Prepared");
+    assert!(record["applied"].is_null());
+
+    fixture.manager.set_journal_fail_writes(false);
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::StillOurs
+    );
+    let record = journal_record_json(&fixture.dir);
+    assert_eq!(record["phase"], "Applied");
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
+fn enforce_rescan_sees_change_during_watcher_start() {
+    let fixture = enforce_manager("enforce-watch-gap");
+    let release = fixture.fake.block_next_start_watch();
+    let manager = fixture.manager.clone();
+    let fake = fixture.fake.clone();
+    let apply = std::thread::spawn(move || manager.apply(&iface_config(1, "1.1.1.1")));
+    wait_until(|| journal_files(&fixture.dir).len() == 1);
+    fake.external_change(IFACE1, state_with("9.9.9.9")).unwrap();
+    release();
+    let lease = apply.join().expect("apply thread").unwrap();
+    wait_until(|| fixture.fake.current_state(IFACE1).unwrap() == Some(state_with("1.1.1.1")));
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
 }

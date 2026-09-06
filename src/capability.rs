@@ -67,16 +67,12 @@ impl fmt::Display for BackendKind {
 ///
 /// Linux backends: systemd-resolved supports per-interface DNS, search
 /// domains, split DNS, explicit default-route control, watch, and cache
-/// flush; NetworkManager supports per-interface DNS with backend-dependent
-/// split DNS but no explicit default-route control; resolvconf/openresolv
-/// is global-only with limited split DNS and no default-route control;
-/// direct `/etc/resolv.conf` is global-only without split DNS or
-/// default-route control. Windows supports per-interface DNS, search
-/// domains, split DNS (NRPT), explicit default-route control via NRPT root
-/// namespaces, watch, and cache flush, but no global scope. macOS supports
-/// global and per-interface DNS, search domains, split DNS (scoped
-/// `/etc/resolver` files), explicit default-route control, and watch, but no
-/// cache flush.
+/// flush, but mutations are unconditional writes. NetworkManager supports
+/// per-interface DNS with backend-dependent split DNS, watch, and
+/// compare-and-mutate via applied-connection `version_id`. resolvconf and
+/// direct `/etc/resolv.conf` are unconditional. Windows and macOS
+/// mutations are unconditional: those platforms have no generation CAS
+/// for interface DNS. Check [`Capabilities::mutation_guard`].
 ///
 /// The struct is `#[non_exhaustive]`: construct with [`Capabilities::new`]
 /// plus `with_*` builders, never with a literal.
@@ -105,6 +101,8 @@ pub struct Capabilities {
     pub watch: bool,
     /// Whether the OS DNS cache can be flushed (best-effort only).
     pub cache_flush: bool,
+    /// How strongly this backend can condition a mutation on current state.
+    pub mutation_guard: MutationGuard,
 }
 
 impl Capabilities {
@@ -120,6 +118,7 @@ impl Capabilities {
             default_route: false,
             watch: false,
             cache_flush: false,
+            mutation_guard: MutationGuard::Unconditional,
         }
     }
 
@@ -170,4 +169,28 @@ impl Capabilities {
         self.cache_flush = enabled;
         self
     }
+
+    /// Sets [`Capabilities::mutation_guard`].
+    pub fn with_mutation_guard(mut self, guard: MutationGuard) -> Self {
+        self.mutation_guard = guard;
+        self
+    }
+}
+
+/// How a backend conditions mutations on observed state.
+///
+/// This is part of the public capability contract. A backend that cannot
+/// compare-and-mutate atomically reports [`MutationGuard::Unconditional`]
+/// rather than advertising a guarded apply it does not actually provide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub enum MutationGuard {
+    /// Native compare-and-mutate. A rejection means the backend did not
+    /// mutate. Ownership proof for a successful mutation is a generation,
+    /// version, or file identity issued by the backend.
+    CompareAndMutate,
+    /// The platform has no atomic conditional mutation. Applies and restores
+    /// are ordinary writes. A later read is not proof that osdns produced
+    /// the current state, and a compare-then-write sequence is not atomic.
+    Unconditional,
 }

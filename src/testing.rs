@@ -133,12 +133,53 @@ impl FakeDns {
     pub fn inject_partial_apply_failure(&self, times: u32) {
         self.backend.inject_partial_apply_failure(times);
     }
+
+    /// Applies an external write immediately before the next guarded
+    /// mutation of `resource`, modelling an adversarial writer between
+    /// verification and compare-and-mutate.
+    pub fn inject_external_before_guarded(&self, resource: &str, state: FakeState) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend.inject_external_before_guarded(id, state);
+        Ok(())
+    }
+
+    /// Applies an external write after the next guarded mutation of
+    /// `resource` has already changed the backend, and before the engine
+    /// observes the result. Models a partial mutation followed by an
+    /// external change before rollback.
+    pub fn inject_external_after_guarded_mutation(
+        &self,
+        resource: &str,
+        state: FakeState,
+    ) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend
+            .inject_external_after_guarded_mutation(id, state);
+        Ok(())
+    }
+
+    /// Blocks the next native watch installation until the returned function
+    /// is called. Used to inject an external change in the watcher-start
+    /// window.
+    pub fn block_next_start_watch(&self) -> impl FnOnce() + Send {
+        self.backend.block_next_start_watch()
+    }
 }
 
 impl Default for FakeDns {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Machine-wide lock directory used by production managers. Journal
+/// `state_dir` never feeds this path.
+pub fn production_lock_root() -> Result<std::path::PathBuf> {
+    crate::manager::global_lock_root()
 }
 
 /// Builds a [`DnsManager`] around an explicit fake backend and a temporary
