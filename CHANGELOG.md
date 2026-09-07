@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Windows backend rebuilt on Rust for Windows 0.100: committed focused
+  `windows-bindgen` sys bindings, `windows-registry`/`windows-link`/
+  `windows-result` 0.100, and removal of the `windows` 0.62 umbrella crate.
+- Raised the MSRV from Rust 1.89 to Rust 1.95.
 - Replaced the 0.1.3 journal format with schema 3 resource-incarnation
   records. This is intentionally incompatible with durable state written by
   0.1.3. Stop the old process and clear or reset its osdns state directory

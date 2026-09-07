@@ -42,6 +42,12 @@ jobs:
       - name: Validate lockfile
         run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
 
+      - name: Windows bindings drift
+        run: |
+          cargo run --manifest-path tools/win32-bindings/Cargo.toml
+          cargo run --manifest-path tools/win32-bindings/Cargo.toml
+          git diff --exit-code -- src/platform/windows/ffi/bindings.rs
+
   verify:
     name: Verify / ${{ matrix.os }}
     needs: preflight
@@ -75,6 +81,12 @@ jobs:
 
       - name: Clippy / all features
         run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+
+      - name: Clippy / test-util
+        run: cargo clippy --locked --all-targets --features test-util --no-deps -- -D warnings
+
+      - name: Clippy / tracing
+        run: cargo clippy --locked --all-targets --features tracing --no-deps -- -D warnings
 
       - name: Test / default
         run: cargo test --locked
@@ -173,6 +185,28 @@ jobs:
           CC: clang
           AR: llvm-ar
           CFLAGS: -ffreestanding
+
+      - name: Windows arch compile-check
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          rustup target add aarch64-pc-windows-msvc i686-pc-windows-msvc
+          cargo check --locked --target aarch64-pc-windows-msvc --all-features
+          cargo check --locked --target i686-pc-windows-msvc --all-features
+
+      - name: Windows dependency graph assertions
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $tree = cargo tree --locked --edges normal 2>&1 | Out-String
+          if ($tree -match 'windows v0\.62') { throw 'windows 0.62 still present' }
+          if ($tree -match 'windows-sys v0\.61') { throw 'windows-sys 0.61 still present in production graph' }
+          if ($tree -match 'windows-registry v0\.[0-9]\.') { throw 'old windows-registry still present' }
+          if ($tree -match '(^|\s)tokio v') { throw 'tokio must not appear' }
+          if ($tree -match 'rtnetlink') { throw 'rtnetlink must not appear on Windows' }
+          if ($tree -notmatch 'windows-registry v0\.100') { throw 'windows-registry 0.100 missing' }
+          if ($tree -notmatch 'windows-link v0\.100') { throw 'windows-link 0.100 missing' }
+          Write-Host 'dependency assertions ok'
   release-checks:
     name: Release checks
     needs: verify
@@ -206,17 +240,17 @@ jobs:
         run: cargo semver-checks check-release --manifest-path Cargo.toml
 
       - name: Feature powerset
-        run: cargo hack check --each-feature --no-dev-deps --locked
+        run: cargo hack check --each-feature --no-dev-deps --offline
 
       - name: Documentation
         run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.95.0
 
       - name: MSRV
-        run: cargo +1.89.0 check --locked --all-features --all-targets
+        run: cargo +1.95.0 check --locked --all-features --all-targets
 
       - name: Package / publish dry-run
         run: cargo publish --dry-run --locked

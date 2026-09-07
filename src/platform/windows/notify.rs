@@ -9,32 +9,26 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::thread;
 
-use windows::Win32::Foundation::{HANDLE, NO_ERROR, WAIT_OBJECT_0};
-use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, ConvertInterfaceLuidToGuid, MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
-    NotifyIpInterfaceChange,
-};
-use windows::Win32::Networking::WinSock::AF_UNSPEC;
-use windows::Win32::System::Registry::{
-    HKEY, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME, REG_NOTIFY_FILTER,
-    RegNotifyChangeKeyValue, RegOpenKeyExW,
-};
-use windows::Win32::System::Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects};
-use windows::core::GUID;
+use windows_registry::Key;
 
 use crate::capability::BackendKind;
 use crate::error::{Error, Result};
 use crate::ownership::ResourceId;
+use crate::platform::windows::error::{check_status, map_error};
+use crate::platform::windows::ffi::{
+    self, ADDRESS_FAMILY, AF_UNSPEC, BOOL, GUID, HANDLE, INFINITE, MIB_IPINTERFACE_ROW,
+    MIB_NOTIFICATION_TYPE, REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_CHANGE_NAME, WAIT_OBJECT_0,
+    open_hklm,
+};
 use crate::watch::DnsEvent;
 
-const NRPT_WATCH_KEY: &str = "SYSTEM\\CurrentControlSet\\Services\\Dnscache\\Parameters";
+const NRPT_WATCH_KEY: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters";
 
 fn resource_from_row(row: &MIB_IPINTERFACE_ROW) -> Option<ResourceId> {
-    let mut guid = GUID::zeroed();
-    // SAFETY: both pointers reference valid caller-owned memory for the
-    // duration of the call.
-    let result = unsafe { ConvertInterfaceLuidToGuid(&row.InterfaceLuid, &mut guid) };
-    if result.is_err() {
+    let mut guid = GUID::default();
+    // SAFETY: both pointers reference valid caller-owned memory for the call.
+    let status = unsafe { ffi::ConvertInterfaceLuidToGuid(&row.InterfaceLuid, &mut guid) };
+    if status != 0 {
         return None;
     }
     let text = crate::platform::windows::interface::guid_to_string(&guid);
@@ -50,15 +44,49 @@ unsafe extern "system" fn ip_interface_callback(
     row: *const MIB_IPINTERFACE_ROW,
     _notification_type: MIB_NOTIFICATION_TYPE,
 ) {
-    // SAFETY: the context pointer was created by Box::into_raw in
-    // start_ip_interface_watch and is only freed after the notification is
-    // cancelled on a thread other than this callback.
+    // SAFETY: context came from Box::into_raw and lives until cancel completes
+    // on a different thread.
     let context = unsafe { &*(caller_context as *const IpNotifyContext) };
-    // SAFETY: the OS passes a valid row pointer for the duration of the
-    // callback.
+    // SAFETY: the OS passes a valid row for the duration of the callback.
     let row = unsafe { &*row };
     if let Some(resource) = resource_from_row(row) {
         let _ = context.sender.send(resource);
+    }
+}
+
+struct OwnedHandle(HANDLE);
+
+// SAFETY: kernel HANDLEs may be moved between threads; exclusive ownership is
+// maintained by this wrapper.
+unsafe impl Send for OwnedHandle {}
+
+impl OwnedHandle {
+    fn from_create_event() -> Result<Self> {
+        // SAFETY: unnamed auto-reset event; NULL attributes / name.
+        let handle = unsafe { ffi::CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+        if handle.is_null() {
+            return Err(Error::Platform {
+                backend: BackendKind::WindowsIpHelper,
+                message: "CreateEventW returned NULL".to_string(),
+            });
+        }
+        Ok(Self(handle))
+    }
+
+    fn as_raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: we own the handle and close it exactly once.
+            unsafe {
+                let _ = ffi::CloseHandle(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
     }
 }
 
@@ -69,25 +97,20 @@ pub(crate) fn start_ip_interface_watch(
     let (tx, rx) = std::sync::mpsc::channel::<ResourceId>();
     let context = Box::into_raw(Box::new(IpNotifyContext { sender: tx }));
 
-    let mut notification: HANDLE = HANDLE::default();
-    let result = unsafe {
-        NotifyIpInterfaceChange(
-            AF_UNSPEC,
+    let mut notification: HANDLE = std::ptr::null_mut();
+    let status = unsafe {
+        ffi::NotifyIpInterfaceChange(
+            AF_UNSPEC as ADDRESS_FAMILY,
             Some(ip_interface_callback),
-            Some(context as *mut core::ffi::c_void),
+            context as *const core::ffi::c_void,
             false,
             &mut notification,
         )
     };
-    if result != NO_ERROR {
-        // SAFETY: the context was not yet handed to the OS, so reclaiming it
-        // here cannot race with the callback.
+    if let Err(error) = check_status(status, "NotifyIpInterfaceChange") {
+        // SAFETY: registration failed, so reclaim the context before the OS owns it.
         unsafe { drop(Box::from_raw(context)) };
-        return Err(crate::platform::windows::interface::win32_error(
-            BackendKind::WindowsIpHelper,
-            result,
-            "NotifyIpInterfaceChange",
-        ));
+        return Err(error);
     }
 
     let worker_flag = flag.clone();
@@ -107,7 +130,7 @@ pub(crate) fn start_ip_interface_watch(
         Ok(worker) => worker,
         Err(error) => {
             unsafe {
-                let _ = CancelMibChangeNotify2(notification);
+                let _ = ffi::CancelMibChangeNotify2(notification);
                 drop(Box::from_raw(context));
             }
             return Err(Error::Platform {
@@ -117,17 +140,14 @@ pub(crate) fn start_ip_interface_watch(
         }
     };
 
-    // SAFETY: the notification handle outlives every use of this wrapper: the
-    // OS guarantees the handle is valid until CancelMibChangeNotify2 runs,
-    // and cancellation happens exactly once, on the caller's thread, never
-    // from inside the callback.
+    // SAFETY: notification handle is valid until CancelMibChangeNotify2; cancel
+    // runs once on the caller thread, never inside the callback.
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
     impl SendHandle {
         fn cancel(self) {
-            // SAFETY: see the SendHandle safety contract above.
             unsafe {
-                let _ = CancelMibChangeNotify2(self.0);
+                let _ = ffi::CancelMibChangeNotify2(self.0);
             }
         }
     }
@@ -149,35 +169,21 @@ pub(crate) fn start_ip_interface_watch(
 }
 
 struct RegistryWatch {
-    notify_event: HANDLE,
+    notify_event: OwnedHandle,
     cancel_event: HANDLE,
-    key: HKEY,
+    key: Key,
 }
 
-// SAFETY: the worker thread takes exclusive ownership of the handle set; the
-// cancel path (SendEvent) touches only cancel_event and runs after the worker
-// has been woken by it, and the key handle is closed exactly once by the
-// worker on exit.
+// SAFETY: the worker takes exclusive ownership of the event handles and Key;
+// cancel only signals cancel_event after registration, and Key is Send.
 unsafe impl Send for RegistryWatch {}
 
 impl RegistryWatch {
     fn wait(&self) -> bool {
-        let handles = [self.notify_event, self.cancel_event];
+        let handles = [self.notify_event.as_raw(), self.cancel_event];
         // SAFETY: both handles are valid event handles owned by this watcher.
-        let waited = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-        waited == WAIT_OBJECT_0
-    }
-}
-
-impl Drop for RegistryWatch {
-    fn drop(&mut self) {
-        // SAFETY: the key handle was opened by RegOpenKeyExW and is closed
-        // exactly once, after the watch loop exits.
-        unsafe {
-            let _ = windows::Win32::System::Registry::RegCloseKey(self.key);
-            let _ = windows::Win32::Foundation::CloseHandle(self.notify_event);
-            let _ = windows::Win32::Foundation::CloseHandle(self.cancel_event);
-        }
+        let waited = unsafe { ffi::WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        waited == WAIT_OBJECT_0 as u32
     }
 }
 
@@ -185,64 +191,35 @@ pub(crate) fn start_nrpt_registry_watch(
     flag: Arc<std::sync::atomic::AtomicBool>,
     callback: Arc<dyn Fn(&DnsEvent) + Send + Sync>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    // SAFETY: CreateEventW with a null name creates a new unnamed event; the
-    // returned handles are closed on the stop path.
-    let notify_event =
-        unsafe { CreateEventW(None, false, false, None) }.map_err(|e| Error::Platform {
-            backend: BackendKind::WindowsIpHelper,
-            message: format!("CreateEventW failed: {e}"),
-        })?;
-    // SAFETY: as above; unnamed event.
-    let cancel_event = match unsafe { CreateEventW(None, false, false, None) } {
-        Ok(handle) => handle,
+    let notify_event = OwnedHandle::from_create_event()?;
+    let cancel_event = OwnedHandle::from_create_event()?;
+
+    let key = match open_hklm(NRPT_WATCH_KEY, false) {
+        Ok(key) => key,
         Err(error) => {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(notify_event);
-            }
-            return Err(Error::Platform {
-                backend: BackendKind::WindowsIpHelper,
-                message: format!("CreateEventW failed: {error}"),
-            });
+            return Err(map_error(error, "RegOpenKey (NRPT watch)"));
         }
     };
 
-    let mut key = HKEY::default();
-    let wide: Vec<u16> = NRPT_WATCH_KEY
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: wide is a valid NUL-terminated wide string for the duration of
-    // the call; key receives a valid HKEY that is closed on the stop path.
-    let open = unsafe {
-        RegOpenKeyExW(
-            windows::Win32::System::Registry::HKEY_LOCAL_MACHINE,
-            windows::core::PCWSTR(wide.as_ptr()),
-            None,
-            KEY_NOTIFY,
-            &mut key,
-        )
-    };
-    if open != windows::Win32::Foundation::ERROR_SUCCESS {
-        unsafe {
-            let _ = windows::Win32::Foundation::CloseHandle(notify_event);
-            let _ = windows::Win32::Foundation::CloseHandle(cancel_event);
-        }
-        return Err(crate::platform::windows::interface::win32_error(
-            BackendKind::WindowsIpHelper,
-            open,
-            "RegOpenKeyExW",
-        ));
-    }
-
+    let cancel_raw = cancel_event.as_raw();
     let watch = RegistryWatch {
         notify_event,
-        cancel_event,
+        cancel_event: cancel_raw,
         key,
     };
-    rearm_notify(&watch)?;
+    // Keep cancel_event alive via OwnedHandle moved into the cancel closure.
+    // The worker owns notify_event + Key; cancel_event is shared by raw handle
+    // until the worker exits after SetEvent.
+    let cancel_owner = cancel_event;
+
+    if let Err(error) = rearm_notify(&watch) {
+        drop(watch);
+        drop(cancel_owner);
+        return Err(error);
+    }
 
     let worker_flag = flag.clone();
-    let worker = thread::Builder::new()
+    let worker = match thread::Builder::new()
         .name("osdns-nrpt-watch".to_string())
         .spawn(move || {
             let watch = watch;
@@ -254,11 +231,6 @@ pub(crate) fn start_nrpt_registry_watch(
                 if worker_flag.load(Ordering::Acquire) {
                     break;
                 }
-                // The change notification cannot identify which subkey or
-                // value changed, so fingerprint the relevant rule values
-                // (namespaces, servers, options) and diff against the
-                // previously seen state: new/missing keys and in-place value
-                // mutations all emit resource events.
                 let current = snapshot_nrpt_rule_states();
                 for (key, removed) in diff_rule_states(&seen, &current) {
                     continue_with(&callback, &key, removed);
@@ -268,53 +240,50 @@ pub(crate) fn start_nrpt_registry_watch(
                     break;
                 }
             }
-        })
-        .map_err(|e| Error::Platform {
-            backend: BackendKind::WindowsIpHelper,
-            message: format!("cannot spawn registry watch thread: {e}"),
-        })?;
+            // Key + notify_event drop here after the wait loop exits.
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            // `watch` was moved into the closure and dropped when spawn failed.
+            drop(cancel_owner);
+            return Err(Error::Platform {
+                backend: BackendKind::WindowsIpHelper,
+                message: format!("cannot spawn registry watch thread: {error}"),
+            });
+        }
+    };
 
-    // SAFETY: the event handles outlive every use of this wrapper: the
-    // worker waits on them until SetEvent fires and CloseHandle runs after
-    // that, both from this caller thread.
     struct SendEvent(HANDLE);
     unsafe impl Send for SendEvent {}
     impl SendEvent {
         fn signal(self) {
-            // SAFETY: see the SendEvent safety contract above.
+            // SAFETY: cancel event remains open until the worker joins.
             unsafe {
-                let _ = SetEvent(self.0);
+                let _ = ffi::SetEvent(self.0);
             }
         }
     }
-    let wrapped = SendEvent(cancel_event);
+    let signal = SendEvent(cancel_raw);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        wrapped.signal();
+        signal.signal();
         let _ = worker.join();
+        drop(cancel_owner);
     }))
 }
 
 fn rearm_notify(watch: &RegistryWatch) -> Result<()> {
-    // SAFETY: key is a valid open HKEY and notify_event a valid event handle;
-    // re-arming after each fired notification is the documented pattern.
-    let result = unsafe {
-        RegNotifyChangeKeyValue(
-            watch.key,
-            true,
-            REG_NOTIFY_FILTER(REG_NOTIFY_CHANGE_NAME.0 | REG_NOTIFY_CHANGE_LAST_SET.0),
-            Some(watch.notify_event),
-            true,
+    // SAFETY: key.as_raw() is valid for the Key's lifetime; event is owned.
+    let status = unsafe {
+        ffi::RegNotifyChangeKeyValue(
+            watch.key.as_raw(),
+            1 as BOOL,
+            (REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET) as u32,
+            watch.notify_event.as_raw(),
+            1 as BOOL,
         )
     };
-    if result.is_err() {
-        return Err(crate::platform::windows::interface::win32_error(
-            BackendKind::WindowsIpHelper,
-            result,
-            "RegNotifyChangeKeyValue",
-        ));
-    }
-    Ok(())
+    check_status(status, "RegNotifyChangeKeyValue")
 }
 
 fn continue_with(callback: &Arc<dyn Fn(&DnsEvent) + Send + Sync>, key: &str, removed: bool) {
@@ -329,23 +298,19 @@ fn continue_with(callback: &Arc<dyn Fn(&DnsEvent) + Send + Sync>, key: &str, rem
     callback(&event);
 }
 
-/// Fingerprints the NRPT-relevant values of one rule key. Any change to
-/// namespaces, servers, options, or version produces a different string.
-fn rule_fingerprint(key: &windows_registry::Key) -> Option<String> {
+fn rule_fingerprint(key: &Key) -> Option<String> {
     let name = key.get_multi_string("Name").ok()?.join("\u{1}");
     let servers = key.get_string("GenericDNSServers").ok()?;
-    let config_options = key.get_u32("ConfigOptions").unwrap_or_default();
-    let version = key.get_u32("Version").unwrap_or_default();
+    let config_options = key.get_u32("ConfigOptions").ok()?;
+    let version = key.get_u32("Version").ok()?;
     Some(format!(
         "{name}\u{1}{servers}\u{1}{config_options}\u{1}{version}"
     ))
 }
 
-/// Snapshots every NRPT rule key with its value fingerprint.
 fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
     use super::nrpt::NRPT_BASE;
-    use windows_registry::LOCAL_MACHINE;
-    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
+    let base = match open_hklm(NRPT_BASE, false) {
         Ok(base) => base,
         Err(_) => return Default::default(),
     };
@@ -355,7 +320,7 @@ fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
         Err(_) => return out,
     };
     for key_name in key_names {
-        let Some(rule_key) = base.open(&key_name).ok() else {
+        let Ok(rule_key) = base.open(&key_name) else {
             continue;
         };
         if let Some(fingerprint) = rule_fingerprint(&rule_key) {
@@ -365,9 +330,6 @@ fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
     out
 }
 
-/// Diffs two rule-state snapshots: `(key, removed)` pairs where `removed`
-/// marks a disappearing key and `false` marks a new key or an in-place value
-/// change.
 fn diff_rule_states(
     previous: &std::collections::BTreeMap<String, String>,
     current: &std::collections::BTreeMap<String, String>,
@@ -443,5 +405,42 @@ mod tests {
 
         let _ = base.remove_tree("rule-x");
         let _ = windows_registry::CURRENT_USER.remove_tree("SOFTWARE/osdns-fingerprint-test");
+    }
+
+    #[test]
+    fn repeated_ip_watch_start_stop() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback: Arc<dyn Fn(&DnsEvent) + Send + Sync> = Arc::new(|_| {});
+        for _ in 0..8 {
+            flag.store(false, Ordering::Release);
+            let cancel = start_ip_interface_watch(flag.clone(), callback.clone()).unwrap();
+            cancel();
+        }
+    }
+
+    #[test]
+    fn no_callback_after_ip_watch_stop() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_cb = hits.clone();
+        let callback: Arc<dyn Fn(&DnsEvent) + Send + Sync> = Arc::new(move |_| {
+            hits_cb.fetch_add(1, Ordering::SeqCst);
+        });
+        let cancel = start_ip_interface_watch(flag, callback).unwrap();
+        cancel();
+        let after = hits.load(Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(hits.load(Ordering::SeqCst), after);
+    }
+
+    #[test]
+    fn repeated_nrpt_watch_start_stop() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback: Arc<dyn Fn(&DnsEvent) + Send + Sync> = Arc::new(|_| {});
+        for _ in 0..8 {
+            flag.store(false, Ordering::Release);
+            let cancel = start_nrpt_registry_watch(flag.clone(), callback.clone()).unwrap();
+            cancel();
+        }
     }
 }

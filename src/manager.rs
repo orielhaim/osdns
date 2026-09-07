@@ -1735,7 +1735,7 @@ fn validate_owner(owner: &str) -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn default_state_dir() -> Result<PathBuf> {
-    windows_program_data().map(|dir| dir.join("osdns"))
+    crate::platform::windows::programdata::program_data_dir().map(|dir| dir.join("osdns"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1754,39 +1754,9 @@ pub(crate) fn global_lock_root() -> Result<PathBuf> {
     default_state_dir()
 }
 
-#[cfg(target_os = "windows")]
-fn windows_program_data() -> Result<PathBuf> {
-    use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-    use windows::core::PWSTR;
-
-    let pwstr: PWSTR = unsafe {
-        SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None)
-    }
-    .map_err(|error| {
-        Error::RequiresPrivilege(format!(
-            "cannot resolve the machine ProgramData folder for the global lock namespace: {error}"
-        ))
-    })?;
-    let path = unsafe { pwstr.to_string() }.map_err(|error| {
-        Error::RequiresPrivilege(format!(
-            "cannot decode the machine ProgramData folder: {error}"
-        ))
-    })?;
-    unsafe {
-        windows::Win32::System::Com::CoTaskMemFree(Some(pwstr.0.cast()));
-    }
-    if path.is_empty() {
-        return Err(Error::RequiresPrivilege(
-            "the machine ProgramData folder resolved empty; refusing a per-user lock namespace"
-                .to_string(),
-        ));
-    }
-    Ok(PathBuf::from(path))
-}
-
 #[cfg(all(test, target_os = "windows"))]
 mod windows_lock_dir_tests {
-    use super::windows_program_data;
+    use super::global_lock_root;
 
     #[test]
     fn global_lock_root_ignores_programdata_and_localappdata() {
@@ -1798,7 +1768,7 @@ mod windows_lock_dir_tests {
             std::env::set_var("PROGRAMDATA", r"C:\osdns-test-programdata-not-real");
             std::env::set_var("LOCALAPPDATA", r"C:\osdns-test-localappdata-not-real");
         }
-        let resolved = windows_program_data();
+        let resolved = global_lock_root();
         unsafe {
             match original_programdata {
                 Some(value) => std::env::set_var("PROGRAMDATA", value),
@@ -1810,6 +1780,11 @@ mod windows_lock_dir_tests {
             }
         }
         let path = resolved.expect("machine ProgramData must be resolvable");
+        assert!(
+            path.ends_with("osdns"),
+            "lock root should be under ProgramData\\osdns: {}",
+            path.display()
+        );
         let text = path.to_string_lossy();
         assert!(
             !text.contains("osdns-test-programdata-not-real"),

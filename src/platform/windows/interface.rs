@@ -4,25 +4,20 @@
 
 use std::net::IpAddr;
 
-use windows::Win32::Foundation::WIN32_ERROR;
-use windows::Win32::NetworkManagement::IpHelper::{
-    DNS_INTERFACE_SETTINGS, DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6,
-    DNS_SETTING_NAMESERVER, DNS_SETTING_SEARCHLIST, FreeInterfaceDnsSettings,
-    GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-    GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, GetBestInterfaceEx, GetInterfaceDnsSettings,
-    IP_ADAPTER_ADDRESSES_LH, SetInterfaceDnsSettings,
-};
-use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN6_ADDR, IN6_ADDR_0, SOCKADDR_IN,
-    SOCKADDR_IN6, SOCKADDR_IN6_0,
-};
-use windows::core::{GUID, PWSTR};
+use uuid::Uuid;
 
 use crate::capability::BackendKind;
 use crate::config::InterfaceSelector;
 use crate::error::{Error, Result};
-use crate::interface::InterfaceInfo;
+use crate::platform::windows::error::{check_status, from_status, map_error, registry_not_found};
+use crate::platform::windows::ffi::{
+    self, ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, DNS_INTERFACE_SETTINGS,
+    DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
+    DNS_SETTING_SEARCHLIST, ERROR_BUFFER_OVERFLOW, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+    GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GUID, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0,
+    IN6_ADDR, IN6_ADDR_0, IP_ADAPTER_ADDRESSES_LH, IfOperStatusUp, PCHAR, PWSTR, SOCKADDR,
+    SOCKADDR_IN, SOCKADDR_IN6_LH, SOCKADDR_IN6_LH_0, open_hklm, wide_to_string,
+};
 
 pub(crate) struct AdapterInfo {
     #[allow(dead_code)]
@@ -34,20 +29,7 @@ pub(crate) struct AdapterInfo {
 }
 
 pub(crate) fn guid_to_string(guid: &GUID) -> String {
-    format!(
-        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        guid.data1,
-        guid.data2,
-        guid.data3,
-        guid.data4[0],
-        guid.data4[1],
-        guid.data4[2],
-        guid.data4[3],
-        guid.data4[4],
-        guid.data4[5],
-        guid.data4[6],
-        guid.data4[7]
-    )
+    Uuid::from_fields(guid.data1, guid.data2, guid.data3, &guid.data4).to_string()
 }
 
 pub(crate) fn parse_guid(text: &str) -> Result<GUID> {
@@ -57,7 +39,18 @@ pub(crate) fn parse_guid(text: &str) -> Result<GUID> {
         .collect();
     let value = u128::from_str_radix(&cleaned, 16)
         .map_err(|_| Error::invalid_config(format_args!("invalid interface GUID {text:?}")))?;
-    Ok(GUID::from_u128(value))
+    Ok(guid_from_u128(value))
+}
+
+pub(crate) fn guid_from_u128(value: u128) -> GUID {
+    let uuid = Uuid::from_u128(value);
+    let (data1, data2, data3, data4) = uuid.as_fields();
+    GUID {
+        data1,
+        data2,
+        data3,
+        data4: *data4,
+    }
 }
 
 pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
@@ -65,20 +58,20 @@ pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
     loop {
         let mut buffer = vec![0u8; size as usize];
         let result = unsafe {
-            GetAdaptersAddresses(
-                AF_UNSPEC.0 as u32,
-                GAA_FLAG_SKIP_UNICAST
+            ffi::GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                (GAA_FLAG_SKIP_UNICAST
                     | GAA_FLAG_SKIP_ANYCAST
                     | GAA_FLAG_SKIP_MULTICAST
-                    | GAA_FLAG_SKIP_DNS_SERVER,
-                None,
-                Some(buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+                    | GAA_FLAG_SKIP_DNS_SERVER) as u32,
+                std::ptr::null(),
+                buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>(),
                 &mut size,
             )
         };
         match result {
             0 => return unsafe { adapters_from_buffer(&buffer) },
-            111 => {
+            code if code == ERROR_BUFFER_OVERFLOW as u32 => {
                 if size > 64 * 1024 * 1024 {
                     return Err(Error::Platform {
                         backend: BackendKind::WindowsIpHelper,
@@ -88,11 +81,7 @@ pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
                 continue;
             }
             error => {
-                return Err(win32_error(
-                    BackendKind::WindowsIpHelper,
-                    WIN32_ERROR(error),
-                    "GetAdaptersAddresses",
-                ));
+                return Err(from_status(error as i32, "GetAdaptersAddresses"));
             }
         }
     }
@@ -100,17 +89,16 @@ pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
 
 unsafe fn adapters_from_buffer(buffer: &[u8]) -> Result<Vec<AdapterInfo>> {
     let mut adapters = Vec::new();
-    let mut current = buffer.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+    let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
     while !current.is_null() {
-        // SAFETY: the buffer was filled by GetAdaptersAddresses, which
-        // guarantees a valid, NUL-terminated linked list of
-        // IP_ADAPTER_ADDRESSES structures for the reported size.
+        // SAFETY: GetAdaptersAddresses filled a valid linked list within `buffer`.
         let adapter = unsafe { &*current };
-        let guid_string = unsafe { pcstr_to_string(adapter.AdapterName.0) };
-        let friendly_name = unsafe { pwstr_to_string(adapter.FriendlyName) };
-        // SAFETY: reading the IfIndex variant of the Anonymous1 union is the
-        // documented way to obtain the interface index from this structure.
-        let if_index = unsafe { adapter.Anonymous1.Anonymous.IfIndex };
+        // SAFETY: AdapterName is a NUL-terminated ANSI string owned by the buffer.
+        let guid_string = unsafe { pcstr_to_string(adapter.AdapterName) };
+        // SAFETY: FriendlyName is a NUL-terminated UTF-16 string owned by the buffer.
+        let friendly_name = unsafe { wide_to_string(adapter.FriendlyName) };
+        // SAFETY: IfIndex is the documented member of the Alignment/Anonymous union.
+        let if_index = unsafe { adapter.Anonymous.Anonymous.IfIndex };
         let guid = parse_guid(&guid_string)?;
         adapters.push(AdapterInfo {
             guid_string: guid_to_string(&guid),
@@ -124,41 +112,24 @@ unsafe fn adapters_from_buffer(buffer: &[u8]) -> Result<Vec<AdapterInfo>> {
     Ok(adapters)
 }
 
-unsafe fn pcstr_to_string(pointer: *const u8) -> String {
+unsafe fn pcstr_to_string(pointer: PCHAR) -> String {
     if pointer.is_null() {
         return String::new();
     }
-    // SAFETY: the pointer refers to a NUL-terminated ANSI string owned by the
-    // adapter list for the duration of the call.
     let mut len = 0usize;
+    // SAFETY: caller guarantees a valid NUL-terminated ANSI string.
     unsafe {
         while *pointer.add(len) != 0 {
             len += 1;
         }
-        std::str::from_utf8(std::slice::from_raw_parts(pointer, len))
+        std::str::from_utf8(std::slice::from_raw_parts(pointer.cast::<u8>(), len))
             .unwrap_or_default()
             .to_string()
     }
 }
 
-unsafe fn pwstr_to_string(pointer: PWSTR) -> String {
-    if pointer.is_null() {
-        return String::new();
-    }
-    // SAFETY: the pointer refers to a NUL-terminated wide string allocated by
-    // GetInterfaceDnsSettings; it is freed by FreeInterfaceDnsSettings after
-    // this conversion.
-    unsafe { pointer.to_string().unwrap_or_default() }
-}
-
-pub(crate) fn win32_error(backend: BackendKind, error: WIN32_ERROR, operation: &str) -> Error {
-    if error == windows::Win32::Foundation::ERROR_ACCESS_DENIED {
-        return Error::RequiresPrivilege(format!("{operation} requires administrator privileges"));
-    }
-    Error::Platform {
-        backend,
-        message: format!("{operation} failed with win32 error {}", error.0),
-    }
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -169,70 +140,56 @@ pub(crate) struct RawDnsSettings {
 
 pub(crate) fn get_dns_settings(guid: &GUID) -> Result<RawDnsSettings> {
     let mut settings = DNS_INTERFACE_SETTINGS {
-        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Version: DNS_INTERFACE_SETTINGS_VERSION1 as u32,
         Flags: 0,
-        Domain: PWSTR::null(),
-        NameServer: PWSTR::null(),
-        SearchList: PWSTR::null(),
+        Domain: std::ptr::null_mut(),
+        NameServer: std::ptr::null_mut(),
+        SearchList: std::ptr::null_mut(),
         RegistrationEnabled: 0,
         RegisterAdapterName: 0,
         EnableLLMNR: 0,
         QueryAdapterName: 0,
-        ProfileNameServer: PWSTR::null(),
+        ProfileNameServer: std::ptr::null_mut(),
     };
-    let result = unsafe { GetInterfaceDnsSettings(*guid, &mut settings) };
-    if result.0 != 0 {
-        return Err(win32_error(
-            BackendKind::WindowsIpHelper,
-            result,
-            "GetInterfaceDnsSettings",
-        ));
-    }
-    // Get populates the fields but does not set the Set operation's mask.
-    // SAFETY: these strings belong to settings until FreeInterfaceDnsSettings.
+    // SAFETY: settings is a valid VERSION1 structure with Flags == 0 as required.
+    let status = unsafe { ffi::GetInterfaceDnsSettings(*guid, &mut settings) };
+    check_status(status, "GetInterfaceDnsSettings")?;
+    // SAFETY: returned PWSTRs are owned by settings until FreeInterfaceDnsSettings.
     let raw = unsafe { read_returned_settings(&settings) };
-    unsafe { FreeInterfaceDnsSettings(&mut settings) };
+    unsafe { ffi::FreeInterfaceDnsSettings(&mut settings) };
     Ok(raw)
 }
 
 unsafe fn read_returned_settings(settings: &DNS_INTERFACE_SETTINGS) -> RawDnsSettings {
     RawDnsSettings {
-        // SAFETY: caller guarantees valid API-owned NUL-terminated strings.
+        // SAFETY: API-owned NUL-terminated strings valid until free.
         nameserver: (!settings.NameServer.is_null())
-            .then(|| unsafe { pwstr_to_string(settings.NameServer) }),
+            .then(|| unsafe { wide_to_string(settings.NameServer) }),
         searchlist: (!settings.SearchList.is_null())
-            .then(|| unsafe { pwstr_to_string(settings.SearchList) }),
+            .then(|| unsafe { wide_to_string(settings.SearchList) }),
     }
 }
 
-/// GetInterfaceDnsSettings exposes IPv4 settings and requires Flags = 0;
-/// it has no supported selector for reading the IPv6 stack. Read that
-/// stack's configured overrides, rather than effective DHCP DNS addresses.
+/// `GetInterfaceDnsSettings` requires `Flags = 0` and returns the IPv4 stack.
+/// There is no documented Get selector for IPv6, so configured IPv6 overrides
+/// are read from the Tcpip6 interface registry key.
 pub(crate) fn get_ipv6_dns_settings(guid: &GUID) -> Result<RawDnsSettings> {
     let path = format!(
         r"SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\{{{}}}",
         guid_to_string(guid)
     );
-    let key = match windows_registry::LOCAL_MACHINE.open(&path) {
+    let key = match open_hklm(&path, false) {
         Ok(key) => key,
-        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => {
-            return Ok(RawDnsSettings::default());
-        }
+        Err(error) if registry_not_found(&error) => return Ok(RawDnsSettings::default()),
         Err(error) => {
-            return Err(Error::platform(
-                BackendKind::WindowsIpHelper,
-                format_args!("cannot read IPv6 DNS configuration: {error}"),
-            ));
+            return Err(map_error(error, "cannot read IPv6 DNS configuration"));
         }
     };
     let read = |name: &str| -> Result<Option<String>> {
         match key.get_string(name) {
             Ok(value) => Ok(Some(value)),
-            Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => Ok(None),
-            Err(error) => Err(Error::platform(
-                BackendKind::WindowsIpHelper,
-                format_args!("cannot read IPv6 {name}: {error}"),
-            )),
+            Err(error) if registry_not_found(&error) => Ok(None),
+            Err(error) => Err(map_error(error, &format!("cannot read IPv6 {name}"))),
         }
     };
     Ok(RawDnsSettings {
@@ -249,41 +206,37 @@ pub(crate) fn set_dns_settings(
 ) -> Result<()> {
     let mut flags = 0u64;
     if ipv6_stack {
-        flags |= u64::from(DNS_SETTING_IPV6);
+        flags |= DNS_SETTING_IPV6 as u64;
     }
-    let mut nameserver_hstring = windows::core::HSTRING::new();
-    let mut searchlist_hstring = windows::core::HSTRING::new();
-    if let Some(value) = nameserver {
-        flags |= u64::from(DNS_SETTING_NAMESERVER);
-        nameserver_hstring = windows::core::HSTRING::from(value);
+    let nameserver_wide = nameserver.map(to_wide);
+    let searchlist_wide = searchlist.map(to_wide);
+    if nameserver_wide.is_some() {
+        flags |= DNS_SETTING_NAMESERVER as u64;
     }
-    if let Some(value) = searchlist {
-        flags |= u64::from(DNS_SETTING_SEARCHLIST);
-        searchlist_hstring = windows::core::HSTRING::from(value);
+    if searchlist_wide.is_some() {
+        flags |= DNS_SETTING_SEARCHLIST as u64;
     }
-    // SAFETY: the HSTRING pointers remain valid for the duration of the call
-    // and the API treats them as read-only NUL-terminated inputs.
+    // SAFETY: wide buffers outlive the call; the API treats them as read-only.
     let settings = DNS_INTERFACE_SETTINGS {
-        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Version: DNS_INTERFACE_SETTINGS_VERSION1 as u32,
         Flags: flags,
-        Domain: PWSTR::null(),
-        NameServer: PWSTR::from_raw(nameserver_hstring.as_ptr() as *mut u16),
-        SearchList: PWSTR::from_raw(searchlist_hstring.as_ptr() as *mut u16),
+        Domain: std::ptr::null_mut(),
+        NameServer: nameserver_wide
+            .as_ref()
+            .map(|v| v.as_ptr() as PWSTR)
+            .unwrap_or(std::ptr::null_mut()),
+        SearchList: searchlist_wide
+            .as_ref()
+            .map(|v| v.as_ptr() as PWSTR)
+            .unwrap_or(std::ptr::null_mut()),
         RegistrationEnabled: 0,
         RegisterAdapterName: 0,
         EnableLLMNR: 0,
         QueryAdapterName: 0,
-        ProfileNameServer: PWSTR::null(),
+        ProfileNameServer: std::ptr::null_mut(),
     };
-    let result = unsafe { SetInterfaceDnsSettings(*guid, &settings) };
-    if result.0 != 0 {
-        return Err(win32_error(
-            BackendKind::WindowsIpHelper,
-            result,
-            "SetInterfaceDnsSettings",
-        ));
-    }
-    Ok(())
+    let status = unsafe { ffi::SetInterfaceDnsSettings(*guid, &settings) };
+    check_status(status, "SetInterfaceDnsSettings")
 }
 
 pub(crate) fn parse_address_list(text: &str) -> Vec<IpAddr> {
@@ -296,11 +249,11 @@ pub(crate) fn parse_address_list(text: &str) -> Vec<IpAddr> {
 
 fn v4_sockaddr(bytes: [u8; 4]) -> SOCKADDR_IN {
     SOCKADDR_IN {
-        sin_family: AF_INET,
+        sin_family: AF_INET as ADDRESS_FAMILY,
         sin_port: 0,
         sin_addr: IN_ADDR {
             S_un: IN_ADDR_0 {
-                S_un_b: windows::Win32::Networking::WinSock::IN_ADDR_0_0 {
+                S_un_b: IN_ADDR_0_0 {
                     s_b1: bytes[0],
                     s_b2: bytes[1],
                     s_b3: bytes[2],
@@ -312,15 +265,15 @@ fn v4_sockaddr(bytes: [u8; 4]) -> SOCKADDR_IN {
     }
 }
 
-fn v6_sockaddr(bytes: [u8; 16]) -> SOCKADDR_IN6 {
-    SOCKADDR_IN6 {
-        sin6_family: AF_INET6,
+fn v6_sockaddr(bytes: [u8; 16]) -> SOCKADDR_IN6_LH {
+    SOCKADDR_IN6_LH {
+        sin6_family: AF_INET6 as ADDRESS_FAMILY,
         sin6_port: 0,
         sin6_flowinfo: 0,
         sin6_addr: IN6_ADDR {
             u: IN6_ADDR_0 { Byte: bytes },
         },
-        Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+        Anonymous: SOCKADDR_IN6_LH_0 { sin6_scope_id: 0 },
     }
 }
 
@@ -331,26 +284,27 @@ pub(crate) fn default_route_adapter() -> Result<AdapterInfo> {
     ];
     let adapters = list_adapters()?;
     let mut best_index: u32 = 0;
-    // SAFETY: both sockaddr variants are valid, fully initialized inputs;
-    // BestIfIndex receives the route lookup result.
+    let v4_addr = v4_sockaddr(PROBE_V4);
+    // SAFETY: sockaddr is fully initialized; best_index receives the result.
     let v4 = unsafe {
-        GetBestInterfaceEx(
-            &v4_sockaddr(PROBE_V4) as *const _ as *const _,
+        ffi::GetBestInterfaceEx(
+            (&v4_addr as *const SOCKADDR_IN).cast::<SOCKADDR>(),
             &mut best_index,
         )
     };
-    let v6 = if v4 != 0 {
-        // SAFETY: see above.
+    let status = if v4 != 0 {
+        let v6_addr = v6_sockaddr(PROBE_V6);
+        // SAFETY: as above for the IPv6 probe address.
         unsafe {
-            GetBestInterfaceEx(
-                &v6_sockaddr(PROBE_V6) as *const _ as *const _,
+            ffi::GetBestInterfaceEx(
+                (&v6_addr as *const SOCKADDR_IN6_LH).cast::<SOCKADDR>(),
                 &mut best_index,
             )
         }
     } else {
         v4
     };
-    if v6 == 0
+    if status == 0
         && let Some(adapter) = adapters.into_iter().find(|a| a.index == best_index)
     {
         return Ok(adapter);
@@ -382,54 +336,61 @@ pub(crate) fn adapter_for_selector(selector: &InterfaceSelector) -> Result<Adapt
     }
 }
 
-pub(crate) fn adapter_list() -> Result<Vec<InterfaceInfo>> {
-    Ok(list_adapters()?
-        .into_iter()
-        .map(|a| InterfaceInfo {
-            index: a.index,
-            name: a.friendly_name.clone().into(),
-            friendly_name: Some(a.friendly_name),
-            guid: Some(a.guid_string),
-            is_up: a.is_up,
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn returned_settings_do_not_use_the_write_mask() {
-        let servers = windows::core::HSTRING::from("192.0.2.53,2001:db8::53");
-        let search = windows::core::HSTRING::from("osdns.test");
+        let servers = to_wide("192.0.2.53,2001:db8::53");
+        let search = to_wide("osdns.test");
         let settings = DNS_INTERFACE_SETTINGS {
-            Version: DNS_INTERFACE_SETTINGS_VERSION1,
+            Version: DNS_INTERFACE_SETTINGS_VERSION1 as u32,
             Flags: 0,
-            NameServer: PWSTR::from_raw(servers.as_ptr().cast_mut()),
-            SearchList: PWSTR::from_raw(search.as_ptr().cast_mut()),
-            ..Default::default()
+            NameServer: servers.as_ptr() as PWSTR,
+            SearchList: search.as_ptr() as PWSTR,
+            Domain: std::ptr::null_mut(),
+            RegistrationEnabled: 0,
+            RegisterAdapterName: 0,
+            EnableLLMNR: 0,
+            QueryAdapterName: 0,
+            ProfileNameServer: std::ptr::null_mut(),
         };
-        // SAFETY: the HSTRING values outlive the read.
+        // SAFETY: the owned wide buffers outlive the read.
         let raw = unsafe { read_returned_settings(&settings) };
         assert_eq!(raw.nameserver.as_deref(), Some("192.0.2.53,2001:db8::53"));
         assert_eq!(raw.searchlist.as_deref(), Some("osdns.test"));
-        // SAFETY: all string pointers are null.
         assert_eq!(
-            unsafe { read_returned_settings(&DNS_INTERFACE_SETTINGS::default()) },
+            unsafe {
+                read_returned_settings(&DNS_INTERFACE_SETTINGS {
+                    Version: DNS_INTERFACE_SETTINGS_VERSION1 as u32,
+                    Flags: 0,
+                    Domain: std::ptr::null_mut(),
+                    NameServer: std::ptr::null_mut(),
+                    SearchList: std::ptr::null_mut(),
+                    RegistrationEnabled: 0,
+                    RegisterAdapterName: 0,
+                    EnableLLMNR: 0,
+                    QueryAdapterName: 0,
+                    ProfileNameServer: std::ptr::null_mut(),
+                })
+            },
             RawDnsSettings::default()
         );
     }
 
     #[test]
     fn guid_string_roundtrip() {
-        let guid = GUID::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
+        let guid = guid_from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788);
         let text = guid_to_string(&guid);
         assert_eq!(text, "12345678-9abc-def0-1122-334455667788");
         let parsed = parse_guid(&text).unwrap();
-        assert_eq!(guid, parsed);
+        assert_eq!(guid.data1, parsed.data1);
+        assert_eq!(guid.data2, parsed.data2);
+        assert_eq!(guid.data3, parsed.data3);
+        assert_eq!(guid.data4, parsed.data4);
         let braced = parse_guid("{12345678-9ABC-DEF0-1122-334455667788}").unwrap();
-        assert_eq!(guid, braced);
+        assert_eq!(guid.data1, braced.data1);
     }
 
     #[test]
@@ -465,12 +426,19 @@ mod tests {
     #[test]
     fn reading_settings_is_read_only() {
         let adapters = list_adapters().unwrap();
-        let target = adapters
-            .iter()
-            .find(|a| a.guid_string.starts_with("loopback"))
-            .or_else(|| adapters.first())
-            .unwrap();
-        let settings = get_dns_settings(&target.guid).unwrap();
-        let _ = settings;
+        let target = adapters.first().unwrap();
+        let _ = get_dns_settings(&target.guid).unwrap();
+        let _ = get_ipv6_dns_settings(&target.guid).unwrap();
+    }
+
+    #[test]
+    fn system_registry_opens_use_wow64_64() {
+        // open_hklm always pins wow64_64. A missing path must fail as NotFound.
+        let error = open_hklm(
+            r"SYSTEM\CurrentControlSet\Services\osdns-missing-key-for-test",
+            false,
+        )
+        .unwrap_err();
+        assert!(registry_not_found(&error));
     }
 }

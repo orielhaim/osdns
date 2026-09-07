@@ -2,26 +2,21 @@
 //! and DNS Client (Dnscache) service failures are reported separately from
 //! configuration failures.
 
-use crate::capability::BackendKind;
-use crate::error::{Error, Result};
+use crate::error::Result;
+use crate::platform::windows::error::check_status;
 
-// DnsFlushResolverCache is exported by dnsapi.dll but is not part of the
-// windows crate metadata, so it is declared here directly.
-#[link(name = "dnsapi")]
-unsafe extern "system" {
-    fn DnsFlushResolverCache() -> u32;
-}
+// DnsFlushResolverCache is exported by dnsapi.dll but is absent from the
+// public Win32 metadata consumed by windows-bindgen 0.100.
+windows_link::link!("dnsapi.dll" "system" fn DnsFlushResolverCache() -> u32);
 
 pub(crate) fn flush() -> Result<()> {
     // SAFETY: the function takes no parameters and touches no caller memory.
     let result = unsafe { DnsFlushResolverCache() };
-    if result != 0 {
-        return Err(Error::Platform {
-            backend: BackendKind::WindowsIpHelper,
-            message: format!(
-                "DnsFlushResolverCache failed with win32 error {result} (is the DNS Client service running?)"
-            ),
-        });
-    }
-    Ok(())
+    check_status(result as i32, "DnsFlushResolverCache").map_err(|error| match error {
+        crate::error::Error::Platform { backend, message } => crate::error::Error::Platform {
+            backend,
+            message: format!("{message} (is the DNS Client service running?)"),
+        },
+        other => other,
+    })
 }

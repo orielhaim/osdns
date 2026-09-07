@@ -1,0 +1,10 @@
+[package]
+name = "osdns-win32-bindings"
+version = "0.0.0"
+edition = "2024"
+publish = false
+rust-version = "1.95"
+description = "Regenerates committed Windows sys bindings for osdns"
+
+[dependencies]
+windows-bindgen = "0.100"

@@ -365,7 +365,7 @@ It is intended for tests, not production builds.
 The minimum supported Rust version is:
 
 ```text
-1.89
+1.95
 ```
 
 ## Safety

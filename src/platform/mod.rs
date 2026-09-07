@@ -52,7 +52,13 @@ impl ResourceIdentity {
 }
 
 /// Result of comparing durable incarnation evidence with the current OS.
+///
+/// `Gone` / `Replaced` / `Ambiguous` are constructed by backends that track
+/// native incarnation identity (Linux, and the `test-util` fake). Platforms
+/// that keep the default always-`Same` implementation still match on these
+/// variants in shared recovery/reconcile paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum ResourceStatus {
     Same,
     Gone,

@@ -30,7 +30,6 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::Arc;
-use windows::core::GUID;
 
 use crate::capability::{BackendKind, Capabilities};
 use crate::config::{DnsConfig, DnsScope};
@@ -38,24 +37,28 @@ use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
+use crate::platform::windows::ffi::GUID;
 use crate::platform::windows::interface::{
-    adapter_for_selector, adapter_list, get_dns_settings, get_ipv6_dns_settings,
+    adapter_for_selector, get_dns_settings, get_ipv6_dns_settings, list_adapters,
     parse_address_list, set_dns_settings,
 };
 use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod cache;
+pub(crate) mod error;
+pub(crate) mod ffi;
 pub(crate) mod interface;
 pub(crate) mod notify;
 pub(crate) mod nrpt;
+pub(crate) mod programdata;
 
 pub(crate) struct WindowsBackend {
     owner: String,
     caps: Capabilities,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum ResourceKind {
     Interface(GUID),
     Nrpt { key: String },
@@ -289,7 +292,16 @@ impl Backend for WindowsBackend {
     }
 
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>> {
-        adapter_list()
+        Ok(list_adapters()?
+            .into_iter()
+            .map(|a| InterfaceInfo {
+                index: a.index,
+                name: a.friendly_name.clone().into(),
+                friendly_name: Some(a.friendly_name),
+                guid: Some(a.guid_string),
+                is_up: a.is_up,
+            })
+            .collect())
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
