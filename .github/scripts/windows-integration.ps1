@@ -70,7 +70,7 @@ try {
     Set-DnsClientServerAddress -InterfaceAlias $adapterName -ResetServerAddresses
     $env:OSDNS_TEST_INTERFACE = $adapterName
     $env:OSDNS_ALLOW_SYSTEM_MUTATION = '1'
-    cargo +1.98.0 test --features test-util --test backend_matrix --test windows -- --nocapture --test-threads=1
+    cargo test --locked --all-features --test backend_matrix --test windows -- --nocapture --test-threads=1
     if ($LASTEXITCODE -ne 0) { throw "Windows integration tests failed ($LASTEXITCODE)" }
 } finally {
     pnputil /remove-device $deviceId

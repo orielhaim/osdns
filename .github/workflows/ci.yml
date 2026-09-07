@@ -2,161 +2,269 @@ name: CI
 
 on:
   push:
+    branches: [master]
   pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
   RUSTFLAGS: -D warnings
+  RUSTUP_TOOLCHAIN: "1.98.1"
 
 jobs:
-  fmt:
+  preflight:
+    name: Preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt
-      - run: cargo +1.98.0 fmt --all --check
+        with:
+          persist-credentials: false
 
-  clippy:
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Validate lockfile
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+  verify:
+    name: Verify / ${{ matrix.os }}
+    needs: preflight
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal --component clippy
-      - run: cargo +1.98.0 clippy --all-targets -- -D warnings
-      - run: cargo +1.98.0 clippy --all-targets --features test-util -- -D warnings
-      - run: cargo +1.98.0 clippy --all-targets --features tracing -- -D warnings
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
 
-  test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 test --features test-util --test backend_matrix --test macos --no-run
-        if: runner.os != 'Windows'
-      - name: Test systemd-resolved on a disposable interface
-        if: runner.os == 'Linux'
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ runner.os }}
+          cache-on-failure: true
+
+      - name: Clippy / default
+        run: cargo clippy --locked --all-targets --no-deps -- -D warnings
+
+      - name: Clippy / all features
+        run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
+
+      - name: Test / default
+        run: cargo test --locked
+
+      - name: Test / all features
+        run: cargo test --locked --all-features
+
+      - name: Integration / systemd-resolved
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
         run: |
+          set -euo pipefail
+
           sudo ip link add osdns-ci type dummy
           trap 'sudo ip link delete osdns-ci' EXIT
+
           sudo ip link set osdns-ci up
-          sudo env PATH="$PATH" RUSTFLAGS="$RUSTFLAGS" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 OSDNS_TEST_INTERFACE=osdns-ci cargo +1.98.0 test --features test-util --test backend_matrix matrix_systemd_resolved_lifecycle -- --exact --nocapture
-      - run: ./.github/scripts/windows-integration.ps1
-        if: runner.os == 'Windows'
-      - run: sudo env PATH="$PATH" RUSTFLAGS="$RUSTFLAGS" RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo" OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo +1.98.0 test --features test-util --test backend_matrix --test macos -- --test-threads=1
-        if: runner.os == 'macOS'
-      - run: cargo +1.98.0 test
-      - run: cargo +1.98.0 test --features test-util
-      - run: cargo +1.98.0 test --features tracing
 
-  openresolv:
-    runs-on: ubuntu-latest
-    container: debian:bookworm
-    steps:
-      - run: apt-get update && apt-get install -y ca-certificates curl build-essential git openresolv
-      - uses: actions/checkout@v7
-      - run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.98.0
-      # Docker bind-mounts /etc/resolv.conf. Keep openresolv's generated file
-      # inside this container and initialize its native state directory.
-      - run: |
-          echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
-          resolvconf -u
-      - run: $HOME/.cargo/bin/cargo +1.98.0 test --features test-util --test backend_matrix matrix_resolvconf_lifecycle -- --exact --nocapture
-        env:
-          OSDNS_ALLOW_SYSTEM_MUTATION: "1"
+          sudo env \
+            PATH="$PATH" \
+            RUSTFLAGS="$RUSTFLAGS" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 \
+            OSDNS_TEST_INTERFACE=osdns-ci \
+            cargo test \
+              --locked \
+              --all-features \
+              --test backend_matrix \
+              matrix_systemd_resolved_lifecycle \
+              -- \
+              --exact \
+              --nocapture
 
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.89.0 --profile minimal
-      - run: cargo +1.89.0 check --all-features --all-targets
+      - name: Integration / Windows
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: ./.github/scripts/windows-integration.ps1
 
-  doc:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - run: cargo +1.98.0 test --doc --all-features
+      - name: Integration / macOS
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          sudo env \
+            PATH="$PATH" \
+            RUSTFLAGS="$RUSTFLAGS" \
+            RUSTUP_HOME="$HOME/.rustup" \
+            CARGO_HOME="$HOME/.cargo" \
+            RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 \
+            cargo test \
+              --locked \
+              --all-features \
+              --test backend_matrix \
+              --test macos \
+              -- \
+              --nocapture \
+              --test-threads=1
 
-  package:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 package --list
-      - run: cargo +1.98.0 package
-      - run: cargo +1.98.0 publish --dry-run
+      - name: Prepare cross-check / Linux
+        if: ${{ runner.os == 'Linux' }}
+        shell: bash
+        run: |
+          rustup target add aarch64-apple-darwin
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm
 
-  semver:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install stable --profile minimal
-      - run: cargo install cargo-semver-checks --locked
-      - run: cargo +stable semver-checks check-release --manifest-path Cargo.toml
-
-  cross-check:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - host: windows-latest
-            target: aarch64-apple-darwin
-          - host: windows-latest
-            target: x86_64-unknown-linux-gnu
-          - host: ubuntu-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.host }}
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup target add ${{ matrix.target }}
-      - run: sudo apt-get update && sudo apt-get install -y clang llvm
-        if: runner.os == 'Linux'
-      - run: '"C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append'
-        if: runner.os == 'Windows'
-      # Criterion's alloca C shim needs only compiler-provided headers.
-      - run: cargo check --target ${{ matrix.target }} --all-targets --all-features
+      - name: Cross-check / Linux -> macOS ARM64
+        if: ${{ runner.os == 'Linux' }}
+        run: cargo check --locked --target aarch64-apple-darwin --all-targets --all-features
         env:
           CC: clang
           AR: llvm-ar
           CFLAGS: -ffreestanding
 
-  feature-powerset:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo install cargo-hack --locked
-      - run: cargo +1.98.0 hack check --each-feature --no-dev-deps
+      - name: Prepare cross-check / Windows
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          rustup target add aarch64-apple-darwin x86_64-unknown-linux-gnu
 
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install stable --profile minimal
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - name: Cross-check / Windows -> macOS ARM64
+        if: ${{ runner.os == 'Windows' }}
+        run: cargo check --locked --target aarch64-apple-darwin --all-targets --all-features
+        env:
+          CC: clang
+          AR: llvm-ar
+          CFLAGS: -ffreestanding
 
-  audit:
+      - name: Cross-check / Windows -> Linux x86_64
+        if: ${{ runner.os == 'Windows' }}
+        run: cargo check --locked --target x86_64-unknown-linux-gnu --all-targets --all-features
+        env:
+          CC: clang
+          AR: llvm-ar
+          CFLAGS: -ffreestanding
+  release-checks:
+    name: Release checks
+    needs: verify
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - run: rustup toolchain install stable --profile minimal
-      - run: cargo install cargo-audit --locked
-      - run: cargo +stable audit
+    timeout-minutes: 35
 
-  bench-compile:
-    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: rustup toolchain install 1.98.0 --profile minimal
-      - run: cargo +1.98.0 bench --features test-util --no-run
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-Linux
+          cache-on-failure: true
+
+      - uses: taiki-e/install-action@v2.87.7
+        with:
+          tool: |
+            cargo-hack
+            cargo-deny
+            cargo-semver-checks
+          fallback: none
+
+      - name: Dependency policy and advisories
+        run: cargo deny check
+
+      - name: SemVer
+        run: cargo semver-checks check-release --manifest-path Cargo.toml
+
+      - name: Feature powerset
+        run: cargo hack check --each-feature --no-dev-deps --locked
+
+      - name: Documentation
+        run: cargo doc --locked --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: MSRV
+        run: cargo +1.89.0 check --locked --all-features --all-targets
+
+      - name: Package / publish dry-run
+        run: cargo publish --dry-run --locked
+
+      - name: Compile benchmarks
+        run: cargo bench --locked --features test-util --no-run
+
+  openresolv:
+    name: Openresolv integration
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    container: debian:trixie
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            git \
+            openresolv
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@v2.87.7
+        with:
+          tool: rust@1.98.1
+          fallback: none
+
+      - name: Configure openresolv
+        run: |
+          echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
+          resolvconf -u
+
+      - name: Integration / openresolv
+        run: |
+          cargo test \
+            --locked \
+            --all-features \
+            --test backend_matrix \
+            matrix_resolvconf_lifecycle \
+            -- \
+            --exact \
+            --nocapture
+        env:
+          OSDNS_ALLOW_SYSTEM_MUTATION: "1"
