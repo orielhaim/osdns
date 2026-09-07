@@ -1170,12 +1170,15 @@ impl Inner {
 /// Entry point for reading, applying, watching, reconciling, and safely
 /// restoring host OS DNS configuration.
 ///
-/// The central invariant is: **never overwrite DNS state that is not
-/// demonstrably ours.** Every mutation belongs to an explicit owner and
-/// [`Lease`], is journaled before it happens, is verified by read-back, and
-/// can be undone - unless an external actor changed the state in the
-/// meantime, in which case [`Error::ExternalModification`] is returned and
-/// nothing is touched.
+/// Every mutation belongs to an explicit owner and [`Lease`], is journaled
+/// before it happens, and is verified by read-back. Before later mutation or
+/// restoration, osdns checks the strongest ownership and resource-incarnation
+/// evidence exposed by the backend and fails closed when that evidence is
+/// ambiguous. Exact guarantees are reported by [`Capabilities`]:
+/// backends with [`OwnershipIdentity::BestEffort`](crate::OwnershipIdentity)
+/// cannot prove every equivalent rewrite, while
+/// [`ResourceBinding::PreflightOnly`](crate::ResourceBinding) means the native
+/// API permits a final selector-reuse race after osdns's last identity check.
 ///
 /// A manager is cheap to clone: clones share the same owner, backend, locks,
 /// journal, and active-lease registry. It is `Send + Sync` and may be shared
@@ -1538,12 +1541,24 @@ impl DnsManager {
                 .reconcile_resource(&resource, &self.inner.reconciler)
             {
                 ReconcileOutcome::NoActiveLease => crate::testing::DebugReconcile::NotOwned,
+                ReconcileOutcome::IdentityAmbiguous => {
+                    crate::testing::DebugReconcile::IdentityAmbiguous
+                }
                 ReconcileOutcome::StillOurs => crate::testing::DebugReconcile::StillOurs,
                 ReconcileOutcome::Rebased => crate::testing::DebugReconcile::Rebased,
                 ReconcileOutcome::Deferred => crate::testing::DebugReconcile::Deferred,
                 ReconcileOutcome::Failed => crate::testing::DebugReconcile::Failed,
             },
         )
+    }
+
+    /// Whether Enforce still has `resource` scheduled for reconciliation.
+    #[cfg(feature = "test-util")]
+    pub fn debug_reconcile_pending(&self, resource: &str) -> Result<bool> {
+        let resource: ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        Ok(self.inner.reconciler.is_pending(&resource))
     }
 }
 

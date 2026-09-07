@@ -118,6 +118,44 @@ struct ResolvedIdentity {
     handle: uuid::Uuid,
 }
 
+#[derive(Debug, Clone)]
+struct ObservationContext {
+    boot_id: uuid::Uuid,
+    netns: String,
+}
+
+impl ObservationContext {
+    fn current() -> Result<Self> {
+        let context = Self {
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+                .trim()
+                .parse()
+                .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?,
+            netns: std::fs::read_link("/proc/self/ns/net")?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
+    fn validate(&self) -> Result<()> {
+        let netns_id = self
+            .netns
+            .strip_prefix("net:[")
+            .and_then(|value| value.strip_suffix(']'));
+        if !netns_id
+            .is_some_and(|value| !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(Error::platform(
+                BackendKind::SystemdResolved,
+                "cannot establish the current network namespace identity",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ResolvedIdentity {
     fn decode(identity: &ResourceIdentity) -> Result<Self> {
         if identity.backend != BackendKind::SystemdResolved {
@@ -156,19 +194,33 @@ impl ResolvedIdentity {
 
 fn classify_identity(
     recorded: &ResolvedIdentity,
+    context: &ObservationContext,
     current: Option<&ResolvedIdentity>,
     live_inodes: Option<(u64, u64)>,
 ) -> ResourceStatus {
-    let Some(current) = current else {
+    if let Some(status) = classify_observation_context(recorded, context) {
+        return status;
+    }
+    let Some(_current) = current else {
         return ResourceStatus::Gone;
     };
-    if current.boot_id != recorded.boot_id {
-        return ResourceStatus::Gone;
-    }
     match live_inodes {
         Some((old, now)) if old == now => ResourceStatus::Same,
         Some(_) => ResourceStatus::Replaced,
         None => ResourceStatus::Ambiguous,
+    }
+}
+
+fn classify_observation_context(
+    recorded: &ResolvedIdentity,
+    context: &ObservationContext,
+) -> Option<ResourceStatus> {
+    if context.boot_id != recorded.boot_id {
+        Some(ResourceStatus::Gone)
+    } else if context.netns != recorded.netns {
+        Some(ResourceStatus::Ambiguous)
+    } else {
+        None
     }
 }
 
@@ -258,7 +310,11 @@ impl SystemdResolved {
         Ok(index)
     }
 
-    fn identity_data(ifindex: u32, handle: uuid::Uuid) -> Result<Option<(ResolvedIdentity, File)>> {
+    fn identity_data(
+        context: &ObservationContext,
+        ifindex: u32,
+        handle: uuid::Uuid,
+    ) -> Result<Option<(ResolvedIdentity, File)>> {
         let entry = std::fs::read_dir("/sys/class/net")?
             .filter_map(std::result::Result::ok)
             .find(|entry| {
@@ -277,16 +333,10 @@ impl SystemdResolved {
                 .map(|s| s.trim().to_string())
         };
         let file = File::open(&path)?;
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-            .trim()
-            .parse()
-            .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?;
         Ok(Some((
             ResolvedIdentity {
-                boot_id,
-                netns: std::fs::read_link("/proc/self/ns/net")?
-                    .to_string_lossy()
-                    .into_owned(),
+                boot_id: context.boot_id,
+                netns: context.netns.clone(),
                 ifindex,
                 ifname: entry.file_name().to_string_lossy().into_owned(),
                 iflink: read("iflink").and_then(|value| value.parse().ok()),
@@ -369,7 +419,8 @@ impl Backend for SystemdResolved {
     fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
         let ifindex = Self::ifindex_of(resource)?;
         let handle = uuid::Uuid::new_v4();
-        let Some((data, file)) = Self::identity_data(ifindex, handle)? else {
+        let context = ObservationContext::current()?;
+        let Some((data, file)) = Self::identity_data(&context, ifindex, handle)? else {
             return Err(Error::ResourceGone {
                 backend: BackendKind::SystemdResolved,
                 resource: resource.clone(),
@@ -391,8 +442,13 @@ impl Backend for SystemdResolved {
 
     fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
         let old = ResolvedIdentity::decode(identity)?;
+        let context = ObservationContext::current()?;
+        if let Some(status) = classify_observation_context(&old, &context) {
+            return Ok(status);
+        }
         let current_handle = uuid::Uuid::new_v4();
-        let Some((current, current_file)) = Self::identity_data(old.ifindex, current_handle)?
+        let Some((current, current_file)) =
+            Self::identity_data(&context, old.ifindex, current_handle)?
         else {
             return Ok(ResourceStatus::Gone);
         };
@@ -402,7 +458,12 @@ impl Backend for SystemdResolved {
         } else {
             None
         };
-        Ok(classify_identity(&old, Some(&current), live_inodes))
+        Ok(classify_identity(
+            &old,
+            &context,
+            Some(&current),
+            live_inodes,
+        ))
     }
 
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
@@ -551,7 +612,10 @@ fn from_platform_snapshot(snapshot: &PlatformSnapshot) -> Result<ResolvedSnapsho
 
 #[cfg(test)]
 mod resource_identity_tests {
-    use super::{ResolvedIdentity, SystemdResolved, classify_identity, dbus_resource_error};
+    use super::{
+        ObservationContext, ResolvedIdentity, SystemdResolved, classify_identity,
+        dbus_resource_error,
+    };
     use crate::error::Error;
     use crate::platform::{Backend, ResourceStatus};
 
@@ -565,6 +629,13 @@ mod resource_identity_tests {
             address: Some("02:00:00:00:00:01".to_string()),
             uevent: Some("INTERFACE=tun0".to_string()),
             handle: uuid::Uuid::new_v4(),
+        }
+    }
+
+    fn context(identity: &ResolvedIdentity) -> ObservationContext {
+        ObservationContext {
+            boot_id: identity.boot_id,
+            netns: identity.netns.clone(),
         }
     }
 
@@ -604,7 +675,7 @@ mod resource_identity_tests {
         renamed.uevent = Some("INTERFACE=renamed0".to_string());
         renamed.iflink = Some(9);
         assert_eq!(
-            classify_identity(&old, Some(&renamed), Some((42, 42))),
+            classify_identity(&old, &context(&old), Some(&renamed), Some((42, 42))),
             ResourceStatus::Same
         );
     }
@@ -613,14 +684,14 @@ mod resource_identity_tests {
     fn restart_fingerprints_are_never_replacement_proof() {
         let old = identity();
         assert_eq!(
-            classify_identity(&old, Some(&old), None),
+            classify_identity(&old, &context(&old), Some(&old), None),
             ResourceStatus::Ambiguous
         );
         let mut changed = old.clone();
         changed.ifname = "renamed0".to_string();
         changed.address = None;
         assert_eq!(
-            classify_identity(&old, Some(&changed), None),
+            classify_identity(&old, &context(&old), Some(&changed), None),
             ResourceStatus::Ambiguous
         );
     }
@@ -629,7 +700,7 @@ mod resource_identity_tests {
     fn different_live_sysfs_object_proves_replacement() {
         let old = identity();
         assert_eq!(
-            classify_identity(&old, Some(&old), Some((42, 43))),
+            classify_identity(&old, &context(&old), Some(&old), Some((42, 43))),
             ResourceStatus::Replaced
         );
     }
@@ -653,6 +724,43 @@ mod resource_identity_tests {
             );
             assert!(ResolvedIdentity::decode(&identity).is_err());
         }
+    }
+
+    #[test]
+    fn absence_is_terminal_only_in_the_recorded_observation_context() {
+        let old = identity();
+        let same = ObservationContext {
+            boot_id: old.boot_id,
+            netns: old.netns.clone(),
+        };
+        assert_eq!(
+            classify_identity(&old, &same, None, None),
+            ResourceStatus::Gone
+        );
+
+        let other_namespace = ObservationContext {
+            boot_id: old.boot_id,
+            netns: "net:[4026531999]".to_string(),
+        };
+        assert_eq!(
+            classify_identity(&old, &other_namespace, None, None),
+            ResourceStatus::Ambiguous
+        );
+
+        let other_boot = ObservationContext {
+            boot_id: uuid::Uuid::new_v4(),
+            netns: old.netns.clone(),
+        };
+        assert_eq!(
+            classify_identity(&old, &other_boot, None, None),
+            ResourceStatus::Gone
+        );
+
+        let unverifiable = ObservationContext {
+            boot_id: old.boot_id,
+            netns: "unreadable".to_string(),
+        };
+        assert!(unverifiable.validate().is_err());
     }
 }
 

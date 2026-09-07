@@ -443,6 +443,30 @@ fn replacement_during_enforce_reapply_is_not_mutated() {
 }
 
 #[test]
+fn ambiguous_identity_remains_owned_and_scheduled_without_mutation() {
+    let fixture = enforce_manager("enforce-identity-ambiguous");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    let generation = fixture.fake.generation(IFACE1).unwrap();
+    fixture.fake.set_identity_ambiguous(IFACE1, true).unwrap();
+
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::IdentityAmbiguous
+    );
+    assert!(fixture.manager.debug_reconcile_pending(IFACE1).unwrap());
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+    assert!(journal_record_json(&fixture.dir).is_object());
+
+    fixture.fake.set_identity_ambiguous(IFACE1, false).unwrap();
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::StillOurs
+    );
+    lease.restore().unwrap();
+}
+
+#[test]
 fn enforce_reconciles_initial_noop_lease() {
     let fixture = enforce_manager("enforce-initial-noop");
     fixture

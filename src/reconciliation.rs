@@ -54,6 +54,9 @@ pub(crate) const STABLE_WINDOW: Duration = Duration::from_millis(100);
 pub(crate) const UNSTABLE_RETRY: Duration = Duration::from_millis(200);
 /// Retries after a backend error wait at least this long.
 pub(crate) const ERROR_RETRY: Duration = Duration::from_millis(250);
+/// Identity ambiguity is retried slowly so a transient native transition can
+/// recover without turning an active Enforce lease into a hot retry loop.
+pub(crate) const IDENTITY_RETRY: Duration = Duration::from_secs(5);
 /// Minimum spacing between two full rebase transactions on one resource.
 const BREAKER_WINDOW: Duration = Duration::from_secs(5);
 const BREAKER_THRESHOLD: usize = 6;
@@ -68,6 +71,7 @@ const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReconcileOutcome {
     NoActiveLease,
+    IdentityAmbiguous,
     StillOurs,
     Rebased,
     Deferred,
@@ -94,6 +98,13 @@ pub(crate) struct Reconciler {
 }
 
 impl Reconciler {
+    #[cfg(feature = "test-util")]
+    pub(crate) fn is_pending(&self, resource: &ResourceId) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(resource)
+    }
     /// Coalesces a watcher event into the pending set. An already-pending
     /// resource keeps its scheduled time: deferral windows (rate limit,
     /// circuit breaker, error backoff) are never bypassed by new events, and
@@ -280,8 +291,12 @@ impl Inner {
                 return ReconcileOutcome::Failed;
             }
             Ok(ResourceStatus::Ambiguous) => {
-                reconciler.remove(resource);
-                return ReconcileOutcome::NoActiveLease;
+                reconciler.defer(resource, IDENTITY_RETRY, false);
+                osdns_warn!(
+                    resource = %resource,
+                    "native resource identity is ambiguous; retaining the lease and journal without mutation"
+                );
+                return ReconcileOutcome::IdentityAmbiguous;
             }
             Ok(ResourceStatus::Same) => {}
             Err(_) => return ReconcileOutcome::Failed,
@@ -296,6 +311,10 @@ impl Inner {
             }
             ReconcileOutcome::Deferred => {
                 reconciler.defer(resource, UNSTABLE_RETRY, false);
+            }
+            ReconcileOutcome::IdentityAmbiguous => {
+                // The identity branch already scheduled its deliberately slow
+                // retry. Keep the lease registered and the journal intact.
             }
             ReconcileOutcome::Failed => {
                 let pending = self

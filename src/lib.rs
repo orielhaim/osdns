@@ -13,9 +13,10 @@
 //! configures the operating system's resolver; it does not implement DNS
 //! itself.
 //!
-//! # Ownership invariant
+//! # Ownership and incarnation safety
 //!
-//! > Never overwrite DNS state that is not demonstrably ours.
+//! > Refuse mutation when the backend's available ownership or incarnation
+//! > evidence no longer establishes a safe target.
 //!
 //! DNS configuration is shared mutable state. DHCP clients, NetworkManager,
 //! systemd-resolved, other VPN software, administrators, and device-management
@@ -29,6 +30,9 @@
 //! then write; another actor can win the gap between those steps.
 //! [`Capabilities::mutation_guard`] is separate: it is whether the write
 //! itself can be refused when the expected state has already changed.
+//! [`Capabilities::resource_binding`] reports whether resource identity is
+//! native-guarded or only checked immediately before a native API that still
+//! permits a final selector-reuse race.
 //!
 //! # Basic usage
 //!
@@ -121,8 +125,10 @@
 //!
 //! # Cooperative vs Enforce
 //!
-//! [`ConflictPolicy::Cooperative`] (the default) never overwrites externally
-//! changed state automatically; conflicts are surfaced to the lease owner.
+//! [`ConflictPolicy::Cooperative`] (the default) does not intentionally
+//! overwrite state that its backend can identify as externally changed;
+//! conflicts are surfaced to the lease owner. Detection strength and any
+//! remaining native race are described by [`Capabilities`].
 //!
 //! [`ConflictPolicy::Enforce`] is for active VPN, mesh, and tunnel agents
 //! and actually guarantees active reconciliation without requiring a public

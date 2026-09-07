@@ -13,10 +13,6 @@ It is intended for VPNs, mesh networks, local DNS proxies, tunnels, security age
 
 ## Principle
 
-The central invariant is:
-
-> Never overwrite DNS state that is not demonstrably ours.
-
 DNS configuration is shared mutable state. DHCP clients, NetworkManager, systemd-resolved, VPNs, administrators, MDM software, and other processes may modify it while an application is running.
 
 `osdns` therefore treats DNS changes as owned transactions rather than plain setter calls.
@@ -30,7 +26,7 @@ A mutation is:
 5. read back and verified;
 6. restored only while ownership can still be established.
 
-If another actor changes the resource, `osdns` does not blindly restore an old snapshot.
+If another actor changes the resource, `osdns` does not blindly restore an old snapshot. The exact proof and race guarantees are backend-specific: inspect `Capabilities::ownership_identity`, `mutation_guard`, and `resource_binding`. `BestEffort` ownership may not detect an equivalent rewrite, and `PreflightOnly` binding means the native API leaves a final selector-reuse race after the last identity check.
 
 ## Supported platforms
 

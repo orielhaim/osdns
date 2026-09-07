@@ -435,6 +435,20 @@ fn classify_nm_activation(
     }
 }
 
+fn classify_lifetime_result(
+    resource: &ResourceId,
+    result: Result<ResourceStatus>,
+) -> Result<ResourceStatus> {
+    match result {
+        Err(Error::ResourceGone {
+            backend: BackendKind::NetworkManager,
+            resource: gone,
+            ..
+        }) if gone == *resource => Ok(ResourceStatus::Gone),
+        other => other,
+    }
+}
+
 fn nm_resource_error(resource: &ResourceId, error: zbus::Error) -> Error {
     if matches!(&error, zbus::Error::MethodError(name, _, _) if name.as_str() == "org.freedesktop.DBus.Error.UnknownObject")
     {
@@ -574,41 +588,41 @@ impl Backend for NetworkManager {
     }
 
     fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
-        let recorded = NmResourceIdentity::decode(identity)?;
-        let service_owner = self.service_owner()?;
-        if recorded.service_owner != service_owner {
-            return Ok(ResourceStatus::Ambiguous);
-        }
-        let path =
-            OwnedObjectPath::try_from(recorded.device_path.as_str()).expect("validated path");
-        let device = self.device(path)?;
-        let active = device
-            .active_connection()
-            .map_err(|error| nm_resource_error(&identity.resource, error))?;
-        if active.as_str() != recorded.active_path {
-            return Ok(ResourceStatus::Replaced);
-        }
-        let (settings, _) = self.applied(&device).map_err(|error| match error {
-            Error::Platform { message, .. } => Error::ResourcePlatform {
-                backend: BackendKind::NetworkManager,
-                resource: identity.resource.clone(),
-                message,
-            },
-            other => other,
-        })?;
-        let current_uuid = extract_uuid(&to_owned_static(&settings))
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| Error::ResourcePlatform {
-                backend: BackendKind::NetworkManager,
-                resource: identity.resource.clone(),
-                message: "the applied connection has no valid UUID".to_string(),
-            })?;
-        Ok(classify_nm_activation(
-            &recorded,
-            &service_owner,
-            active.as_str(),
-            current_uuid,
-        ))
+        classify_lifetime_result(
+            &identity.resource,
+            (|| {
+                let recorded = NmResourceIdentity::decode(identity)?;
+                let service_owner = self.service_owner()?;
+                if recorded.service_owner != service_owner {
+                    return Ok(ResourceStatus::Ambiguous);
+                }
+                let path = OwnedObjectPath::try_from(recorded.device_path.as_str())
+                    .expect("validated path");
+                let device = self.device(path)?;
+                let active = device
+                    .active_connection()
+                    .map_err(|error| nm_resource_error(&identity.resource, error))?;
+                if active.as_str() != recorded.active_path {
+                    return Ok(ResourceStatus::Replaced);
+                }
+                let (settings, _) = device
+                    .get_applied_connection(0)
+                    .map_err(|error| nm_resource_error(&identity.resource, error))?;
+                let current_uuid = extract_uuid(&to_owned_static(&settings))
+                    .and_then(|value| value.parse().ok())
+                    .ok_or_else(|| Error::ResourcePlatform {
+                        backend: BackendKind::NetworkManager,
+                        resource: identity.resource.clone(),
+                        message: "the applied connection has no valid UUID".to_string(),
+                    })?;
+                Ok(classify_nm_activation(
+                    &recorded,
+                    &service_owner,
+                    active.as_str(),
+                    current_uuid,
+                ))
+            })(),
+        )
     }
 
     fn observe(&self, resource: &ResourceId) -> Result<crate::platform::BoundObservation> {
@@ -1137,7 +1151,9 @@ fn to_setting_value(owned: &OwnedValue) -> crate::platform::text_config::Setting
 
 #[cfg(test)]
 mod identity_tests {
-    use super::{NmResourceIdentity, classify_nm_activation, nm_resource_error};
+    use super::{
+        NmResourceIdentity, classify_lifetime_result, classify_nm_activation, nm_resource_error,
+    };
     use crate::Error;
     use crate::platform::ResourceIdentity;
     use crate::platform::ResourceStatus;
@@ -1205,6 +1221,23 @@ mod identity_tests {
         let error = nm_resource_error(&resource, zbus::Error::Failure("timeout".to_string()));
         assert!(
             matches!(error, Error::ResourcePlatform { resource: found, .. } if found == resource)
+        );
+    }
+
+    #[test]
+    fn structural_device_disappearance_is_a_terminal_status() {
+        let resource = "linux:network-manager:ifname:eth0".parse().unwrap();
+        assert_eq!(
+            classify_lifetime_result(
+                &resource,
+                Err(Error::ResourceGone {
+                    backend: crate::BackendKind::NetworkManager,
+                    resource: resource.clone(),
+                    message: "device object vanished".to_string(),
+                }),
+            )
+            .unwrap(),
+            ResourceStatus::Gone
         );
     }
 }

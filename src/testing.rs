@@ -336,6 +336,8 @@ pub fn manager_for_backend(
 pub enum DebugReconcile {
     /// No active lease owns the resource.
     NotOwned,
+    /// The lease remains active but its native identity cannot be proven.
+    IdentityAmbiguous,
     /// The state still matches the lease's applied overlay.
     StillOurs,
     /// The external base was adopted and the overlay reapplied.
