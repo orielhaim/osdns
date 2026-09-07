@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ const EVENT_MASK: WatchMask = WatchMask::CLOSE_WRITE
 pub(crate) fn watch_directory(
     kind: BackendKind,
     dir: &Path,
+    initial_resources: Vec<ResourceId>,
     to_resource: impl Fn(&str) -> Option<ResourceId> + Send + 'static,
     callback: WatchCallback,
 ) -> Result<WatchHandle> {
@@ -50,16 +51,58 @@ pub(crate) fn watch_directory(
     let flag = Arc::new(AtomicBool::new(false));
     let watch_flag = flag.clone();
     let thread_wake_dir = wake_dir.clone();
-    thread::Builder::new()
+    let watched_dir = dir.to_path_buf();
+    let worker = thread::Builder::new()
         .name("osdns-inotify-watch".to_string())
         .spawn(move || {
             let _ = dirs;
             let mut buffer = [0u8; 4096];
+            let seeds: HashSet<ResourceId> = initial_resources.into_iter().collect();
+            let mut known = seeds.clone();
+            if let Ok(entries) = fs::read_dir(&watched_dir) {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str()
+                        && let Some(resource) = to_resource(name)
+                    {
+                        known.insert(resource);
+                    }
+                }
+            }
             loop {
                 let Ok(events) = inotify.read_events_blocking(&mut buffer) else {
                     break;
                 };
                 for event in events {
+                    if event.mask.contains(EventMask::Q_OVERFLOW) {
+                        let current = fs::read_dir(&watched_dir).and_then(|entries| {
+                            let mut current = HashSet::new();
+                            for entry in entries {
+                                let entry = entry?;
+                                if let Some(name) = entry.file_name().to_str()
+                                    && let Some(resource) = to_resource(name)
+                                {
+                                    current.insert(resource);
+                                }
+                            }
+                            Ok(current)
+                        });
+                        match current {
+                            Ok(current) => {
+                                for event in resync_events(&known, &current) {
+                                    callback(&event);
+                                }
+                                known = seeds.union(&current).cloned().collect();
+                            }
+                            Err(_) => {
+                                for resource in &known {
+                                    callback(&DnsEvent::ResourceChanged {
+                                        resource: resource.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if event.wd == wake_wd {
                         if watch_flag.load(Ordering::Acquire) {
                             return;
@@ -77,6 +120,7 @@ pub(crate) fn watch_directory(
                     let removed = event
                         .mask
                         .intersects(EventMask::DELETE | EventMask::MOVED_FROM);
+                    known.insert(resource.clone());
                     let event = if removed {
                         DnsEvent::ResourceRemoved { resource }
                     } else {
@@ -97,13 +141,44 @@ pub(crate) fn watch_directory(
     Ok(WatchHandle::new(flag, move || {
         cancel_flag.store(true, Ordering::Release);
         let _ = fs::write(cancel_wake.join(wake_name), b"");
+        let _ = worker.join();
         let _ = fs::remove_dir_all(&cancel_wake);
     }))
+}
+
+fn resync_events(known: &HashSet<ResourceId>, current: &HashSet<ResourceId>) -> Vec<DnsEvent> {
+    known
+        .union(current)
+        .cloned()
+        .map(|resource| {
+            if current.contains(&resource) {
+                DnsEvent::ResourceChanged { resource }
+            } else {
+                DnsEvent::ResourceRemoved { resource }
+            }
+        })
+        .collect()
 }
 
 fn inotify_error(kind: BackendKind, error: std::io::Error) -> Error {
     Error::Platform {
         backend: kind,
         message: format!("inotify error: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overflow_resync_reports_current_and_disappeared_resources() {
+        let present = ResourceId::new("linux:test:present").unwrap();
+        let removed = ResourceId::new("linux:test:removed").unwrap();
+        let known = HashSet::from([present.clone(), removed.clone()]);
+        let current = HashSet::from([present.clone()]);
+        let events = resync_events(&known, &current);
+        assert!(events.contains(&DnsEvent::ResourceChanged { resource: present }));
+        assert!(events.contains(&DnsEvent::ResourceRemoved { resource: removed }));
     }
 }

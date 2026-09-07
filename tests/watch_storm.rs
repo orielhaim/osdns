@@ -156,3 +156,32 @@ fn stop_stops_delivery() {
         "no events after stop"
     );
 }
+
+#[test]
+fn stop_waits_for_an_in_flight_callback() {
+    let fixture = new_fixture("storm-stop-in-flight");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let handle = fixture
+        .manager
+        .watch(Arc::new(move |_| {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        }))
+        .unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+    let stopper = std::thread::spawn(move || {
+        handle.stop();
+        stopped_tx.send(()).unwrap();
+    });
+    assert!(stopped_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    release_tx.send(()).unwrap();
+    stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    stopper.join().unwrap();
+}

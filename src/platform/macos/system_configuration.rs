@@ -42,6 +42,12 @@ fn cf_to_sc(value: &CFType) -> Option<ScValue> {
         return Some(ScValue::Boolean(boolean == CFBoolean::true_value()));
     }
     if let Some(number) = value.clone().downcast_into::<CFNumber>() {
+        // SAFETY: number owns a valid CFNumberRef for the duration of the call.
+        if unsafe { core_foundation_sys::number::CFNumberIsFloatType(number.as_concrete_TypeRef()) }
+            != 0
+        {
+            return None;
+        }
         return number.to_i64().map(ScValue::Number);
     }
     if let Some(array) = value.clone().downcast_into::<UntypedArray>() {
@@ -55,12 +61,12 @@ fn cf_to_sc(value: &CFType) -> Option<ScValue> {
         return Some(ScValue::Array(out));
     }
     if let Some(dictionary) = value.clone().downcast_into::<UntypedDictionary>() {
-        return Some(untyped_dict_to_sc(&dictionary));
+        return untyped_dict_to_sc(&dictionary).ok();
     }
     None
 }
 
-fn untyped_dict_to_sc(dictionary: &UntypedDictionary) -> ScValue {
+fn untyped_dict_to_sc(dictionary: &UntypedDictionary) -> Result<ScValue> {
     let count = dictionary.len();
     let mut keys: Vec<*const c_void> = Vec::with_capacity(count);
     let mut values: Vec<*const c_void> = Vec::with_capacity(count);
@@ -82,10 +88,18 @@ fn untyped_dict_to_sc(dictionary: &UntypedDictionary) -> ScValue {
         // which outlives this conversion.
         let key = unsafe { CFString::wrap_under_get_rule(key as CFStringRef) };
         let value = unsafe { CFType::wrap_under_get_rule(value) };
-        let value = cf_to_sc(&value).unwrap_or(ScValue::Boolean(false));
+        let value = cf_to_sc(&value).ok_or_else(|| {
+            Error::platform(
+                crate::capability::BackendKind::MacosSystemConfiguration,
+                format_args!(
+                    "DNS dictionary field {:?} has an unsupported property-list value",
+                    key.to_string()
+                ),
+            )
+        })?;
         entries.push((key.to_string(), value));
     }
-    ScValue::Dictionary(entries)
+    Ok(ScValue::Dictionary(entries))
 }
 
 fn sc_to_cf(value: ScValue) -> Option<CFType> {
@@ -191,10 +205,16 @@ pub(crate) fn service_for_interface_name(store: &SCDynamicStore, name: &str) -> 
 
 /// The full `State:/Network/Service/<id>/DNS` dictionary, when present.
 pub(crate) fn read_service_dns(store: &SCDynamicStore, id: &str) -> Result<Option<ScValue>> {
-    Ok(store
-        .get(CFString::new(&format!("{SERVICE_DNS_PREFIX}{id}/DNS")))
-        .and_then(|plist| plist.downcast_into::<UntypedDictionary>())
-        .map(|dict| untyped_dict_to_sc(&dict)))
+    let Some(plist) = store.get(CFString::new(&format!("{SERVICE_DNS_PREFIX}{id}/DNS"))) else {
+        return Ok(None);
+    };
+    let Some(dictionary) = plist.downcast_into::<UntypedDictionary>() else {
+        return Err(Error::platform(
+            crate::capability::BackendKind::MacosSystemConfiguration,
+            "service DNS state is not a dictionary",
+        ));
+    };
+    untyped_dict_to_sc(&dictionary).map(Some)
 }
 
 fn dns_key(id: &str) -> CFString {
@@ -265,4 +285,17 @@ fn set_dict_field(entries: &mut Vec<(String, ScValue)>, key: &str, value: ScValu
 
 fn string_array(values: &[String]) -> ScValue {
     ScValue::Array(values.iter().cloned().map(ScValue::String).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_property_list_values_fail_instead_of_being_fabricated() {
+        let number = CFNumber::from(1.5_f64).into_CFType();
+        assert_eq!(cf_to_sc(&number), None);
+        let dictionary = CFDictionary::from_CFType_pairs(&[(CFString::new("unmanaged"), number)]);
+        assert!(untyped_dict_to_sc(&dictionary.to_untyped()).is_err());
+    }
 }

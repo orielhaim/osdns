@@ -57,10 +57,10 @@ pub(crate) fn start_store_watch(
 ) -> Result<Box<dyn FnOnce() + Send>> {
     let (tx, rx) = mpsc::channel::<ResourceId>();
     let shared: Arc<Mutex<Option<RunLoopHandle>>> = Arc::new(Mutex::new(None));
-    let (notify_ready, ready) = mpsc::channel::<()>();
+    let (notify_ready, ready) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
 
     let worker_flag = flag.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("osdns-sc-worker".to_string())
         .spawn(move || {
             for resource in rx {
@@ -77,7 +77,7 @@ pub(crate) fn start_store_watch(
 
     let thread_flag = flag.clone();
     let shared_for_thread = Arc::clone(&shared);
-    thread::Builder::new()
+    let watch = thread::Builder::new()
         .name("osdns-sc-watch".to_string())
         .spawn(move || {
             let state = WatchState { sender: tx };
@@ -89,6 +89,9 @@ pub(crate) fn start_store_watch(
                 .callback_context(context)
                 .build()
             else {
+                let _ = notify_ready.send(Err(
+                    "cannot open the SystemConfiguration dynamic store".to_string()
+                ));
                 return;
             };
             let patterns = CFArray::from_CFTypes(&[
@@ -97,9 +100,15 @@ pub(crate) fn start_store_watch(
             ]);
             let keys: CFArray<CFString> = CFArray::from_CFTypes(&[]);
             if !store.set_notification_keys(&keys, &patterns) {
+                let _ = notify_ready.send(Err(
+                    "cannot subscribe to SystemConfiguration DNS notifications".to_string(),
+                ));
                 return;
             }
             let Some(source) = store.create_run_loop_source() else {
+                let _ = notify_ready.send(Err(
+                    "cannot create the SystemConfiguration run-loop source".to_string(),
+                ));
                 return;
             };
             let run_loop = CFRunLoop::get_current();
@@ -109,7 +118,7 @@ pub(crate) fn start_store_watch(
             *shared_for_thread
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RunLoopHandle(run_loop));
-            let _ = notify_ready.send(());
+            let _ = notify_ready.send(Ok(()));
             if thread_flag.load(Ordering::Acquire) {
                 return;
             }
@@ -120,10 +129,32 @@ pub(crate) fn start_store_watch(
             message: format!("cannot spawn SC watch thread: {e}"),
         })?;
 
+    match ready.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            flag.store(true, Ordering::Release);
+            let _ = watch.join();
+            let _ = worker.join();
+            return Err(Error::Platform {
+                backend: crate::capability::BackendKind::MacosSystemConfiguration,
+                message,
+            });
+        }
+        Err(_) => {
+            flag.store(true, Ordering::Release);
+            let _ = watch.join();
+            let _ = worker.join();
+            return Err(Error::Platform {
+                backend: crate::capability::BackendKind::MacosSystemConfiguration,
+                message: "SystemConfiguration watch initialization terminated unexpectedly"
+                    .to_string(),
+            });
+        }
+    }
+
     let cancel_shared = Arc::clone(&shared);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        let _ = ready.recv_timeout(std::time::Duration::from_secs(2));
         let handle = cancel_shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -131,6 +162,8 @@ pub(crate) fn start_store_watch(
         if let Some(handle) = handle {
             handle.0.stop();
         }
+        let _ = watch.join();
+        let _ = worker.join();
     }))
 }
 
@@ -199,7 +232,7 @@ pub(crate) fn start_resolver_watch(
         })?;
 
     let worker_flag = flag.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("osdns-resolver-worker".to_string())
         .spawn(move || {
             for event in rx {
@@ -217,6 +250,7 @@ pub(crate) fn start_resolver_watch(
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
         drop(watcher);
+        let _ = worker.join();
     }))
 }
 #[cfg(test)]

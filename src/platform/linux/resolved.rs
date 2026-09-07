@@ -549,7 +549,7 @@ impl Backend for SystemdResolved {
         let flag = Arc::new(AtomicBool::new(false));
         let watch_flag = flag.clone();
         let thread_conn = conn.clone();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("osdns-resolved-watch".to_string())
             .spawn(move || {
                 for message in iterator {
@@ -584,6 +584,7 @@ impl Backend for SystemdResolved {
         Ok(WatchHandle::new(flag, move || {
             cancel_flag.store(true, Ordering::Release);
             let _ = cancel_conn.close();
+            let _ = worker.join();
         }))
     }
 }

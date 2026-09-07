@@ -389,7 +389,13 @@ impl Backend for MacosBackend {
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let store_cancel = watch::start_store_watch(flag.clone(), callback.clone())?;
-        let resolver_cancel = watch::start_resolver_watch(flag.clone(), callback)?;
+        let resolver_cancel = match watch::start_resolver_watch(flag.clone(), callback) {
+            Ok(cancel) => cancel,
+            Err(error) => {
+                store_cancel();
+                return Err(error);
+            }
+        };
         let cancels: Vec<Box<dyn FnOnce() + Send>> = vec![store_cancel, resolver_cancel];
         Ok(WatchHandle::new(flag, move || {
             for cancel in cancels {

@@ -463,7 +463,13 @@ impl Backend for WindowsBackend {
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ip_cancel = notify::start_ip_interface_watch(flag.clone(), callback.clone())?;
-        let nrpt_cancel = notify::start_nrpt_registry_watch(flag, callback)?;
+        let nrpt_cancel = match notify::start_nrpt_registry_watch(flag, callback) {
+            Ok(cancel) => cancel,
+            Err(error) => {
+                ip_cancel();
+                return Err(error);
+            }
+        };
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(WatchHandle::new(done, move || {
             ip_cancel();

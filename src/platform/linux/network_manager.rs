@@ -176,7 +176,7 @@ impl NetworkManager {
         Ok((settings, version))
     }
 
-    fn with_dns_fields(settings: &mut Settings, fields: &NmDnsFields, set_priority: bool) {
+    fn with_dns_fields(settings: &mut Settings, fields: &NmDnsFields) {
         let ipv4 = settings.entry("ipv4".to_string()).or_default();
         ipv4.insert("dns".to_string(), Value::Array(u32_array(&fields.ipv4_dns)));
         ipv4.insert(
@@ -187,16 +187,6 @@ impl NetworkManager {
             "ignore-auto-dns".to_string(),
             Value::Bool(fields.ipv4_ignore_auto_dns),
         );
-        if set_priority {
-            match fields.ipv4_dns_priority {
-                Some(priority) => {
-                    ipv4.insert("dns-priority".to_string(), Value::I32(priority));
-                }
-                None => {
-                    ipv4.remove("dns-priority");
-                }
-            }
-        }
         let ipv6 = settings.entry("ipv6".to_string()).or_default();
         ipv6.insert(
             "dns".to_string(),
@@ -210,16 +200,6 @@ impl NetworkManager {
             "ignore-auto-dns".to_string(),
             Value::Bool(fields.ipv6_ignore_auto_dns),
         );
-        if set_priority {
-            match fields.ipv6_dns_priority {
-                Some(priority) => {
-                    ipv6.insert("dns-priority".to_string(), Value::I32(priority));
-                }
-                None => {
-                    ipv6.remove("dns-priority");
-                }
-            }
-        }
     }
 
     fn reapply(&self, device: &NmDeviceProxyBlocking, settings: Settings) -> Result<()> {
@@ -687,7 +667,7 @@ impl Backend for NetworkManager {
         let (applied, _) = self.applied(&device)?;
         let mut settings = to_owned_static(&applied);
         let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
-        Self::with_dns_fields(&mut settings, &fields, false);
+        Self::with_dns_fields(&mut settings, &fields);
         self.reapply(&device, settings)?;
         Ok(ApplyReceipt {
             resource: resource.clone(),
@@ -706,7 +686,7 @@ impl Backend for NetworkManager {
         let (device, _name) = self.device_for_resource(resource)?;
         let (applied, _) = self.applied(&device)?;
         let mut settings = to_owned_static(&applied);
-        Self::with_dns_fields(&mut settings, &before, true);
+        Self::with_dns_fields(&mut settings, &before);
         self.reapply(&device, settings)?;
         Ok(())
     }
@@ -760,7 +740,6 @@ impl Backend for NetworkManager {
         Self::with_dns_fields(
             &mut settings,
             &NmDnsFields::from_plan(plan, self.caps.split_dns),
-            false,
         );
         match self.reapply_versioned(&device, settings, expected_version) {
             Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
@@ -829,7 +808,7 @@ impl Backend for NetworkManager {
             Err(error) => return crate::platform::MutationAttempt::Rejected { error },
         }
         let mut settings = to_owned_static(&live_settings);
-        Self::with_dns_fields(&mut settings, &before, true);
+        Self::with_dns_fields(&mut settings, &before);
         match self.reapply_versioned(&device, settings, expected_version) {
             Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
             Err(error) => crate::platform::MutationAttempt::Indeterminate {
@@ -866,7 +845,7 @@ impl Backend for NetworkManager {
             };
         let mut settings = to_owned_static(&live_settings);
         let fields = NmDnsFields::from_plan(plan, self.caps.split_dns);
-        Self::with_dns_fields(&mut settings, &fields, false);
+        Self::with_dns_fields(&mut settings, &fields);
         match self.reapply_versioned(&device, settings, expected_version) {
             Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
             Err(error) => {
@@ -913,7 +892,7 @@ impl Backend for NetworkManager {
                 }
             };
         let mut settings = to_owned_static(&live_settings);
-        Self::with_dns_fields(&mut settings, &before, true);
+        Self::with_dns_fields(&mut settings, &before);
         match self.reapply_versioned(&device, settings, expected_version) {
             Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
             Err(error) => {
@@ -1006,7 +985,7 @@ impl Backend for NetworkManager {
         let watch_flag = flag.clone();
         let thread_conn = conn.clone();
         let watch_conn = conn.clone();
-        thread::Builder::new()
+        let worker = thread::Builder::new()
             .name("osdns-nm-watch".to_string())
             .spawn(move || {
                 for message in iterator {
@@ -1049,6 +1028,7 @@ impl Backend for NetworkManager {
         Ok(WatchHandle::new(flag, move || {
             cancel_flag.store(true, Ordering::Release);
             let _ = cancel_conn.close();
+            let _ = worker.join();
         }))
     }
 }
@@ -1152,11 +1132,28 @@ fn to_setting_value(owned: &OwnedValue) -> crate::platform::text_config::Setting
 #[cfg(test)]
 mod identity_tests {
     use super::{
-        NmResourceIdentity, classify_lifetime_result, classify_nm_activation, nm_resource_error,
+        NetworkManager, NmResourceIdentity, Settings, classify_lifetime_result,
+        classify_nm_activation, nm_resource_error,
     };
     use crate::Error;
     use crate::platform::ResourceIdentity;
     use crate::platform::ResourceStatus;
+    use crate::platform::text_config::NmDnsFields;
+    use zbus::zvariant::Value;
+
+    #[test]
+    fn applying_owned_dns_fields_preserves_unmanaged_priority() {
+        let mut settings = Settings::new();
+        settings
+            .entry("ipv4".to_string())
+            .or_default()
+            .insert("dns-priority".to_string(), Value::I32(-50));
+        NetworkManager::with_dns_fields(&mut settings, &NmDnsFields::default());
+        assert!(matches!(
+            settings["ipv4"].get("dns-priority"),
+            Some(Value::I32(-50))
+        ));
+    }
 
     #[test]
     fn malformed_network_manager_identity_is_rejected() {

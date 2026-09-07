@@ -315,6 +315,7 @@ impl Backend for Resolvconf {
         crate::platform::linux::watch::watch_directory(
             BackendKind::Resolvconf,
             &self.state_dir,
+            Vec::new(),
             move |name| Self::resource_of(name).ok(),
             callback,
         )

@@ -59,9 +59,7 @@ impl DirectResolvConf {
             Err(e) => return Err(e.into()),
         };
         if metadata.is_symlink() {
-            let target = std::fs::read_link(path)
-                .map(|t| t.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let target = std::fs::read_link(path)?.to_string_lossy().to_string();
             if target.contains("systemd/resolve") {
                 return Err(Error::unsupported(
                     BackendKind::ResolvConfFile,
@@ -101,23 +99,35 @@ impl DirectResolvConf {
         Ok(())
     }
 
-    fn current_mode(path: &std::path::Path) -> Option<u32> {
+    fn current_mode(path: &std::path::Path) -> Result<Option<u32>> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(path).ok().map(|m| m.permissions().mode())
+            match std::fs::metadata(path) {
+                Ok(metadata) => Ok(Some(metadata.permissions().mode())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            }
         }
         #[cfg(not(unix))]
         {
             let _ = path;
-            None
+            Ok(None)
         }
     }
 
-    fn read_current(path: &std::path::Path) -> DirectSnapshot {
-        let content = std::fs::read(path).ok();
-        let mode = Self::current_mode(path);
-        DirectSnapshot { content, mode }
+    fn read_current(path: &std::path::Path) -> Result<DirectSnapshot> {
+        let content = match std::fs::read(path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        let mode = if content.is_some() {
+            Self::current_mode(path)?
+        } else {
+            None
+        };
+        Ok(DirectSnapshot { content, mode })
     }
 
     fn to_platform(resource: &ResourceId, snapshot: &DirectSnapshot) -> Result<PlatformSnapshot> {
@@ -176,14 +186,14 @@ impl Backend for DirectResolvConf {
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         let path = std::path::Path::new(RESOLV_CONF);
         Self::check_usable(path)?;
-        let snapshot = Self::read_current(path);
+        let snapshot = Self::read_current(path)?;
         Self::to_platform(resource, &snapshot)
     }
 
     fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
         let path = std::path::Path::new(RESOLV_CONF);
         Self::check_usable(path)?;
-        let existing_mode = Self::current_mode(path);
+        let existing_mode = Self::current_mode(path)?;
         Self::write_content(path, &build_resolv_conf_content(plan), existing_mode)?;
         Ok(ApplyReceipt {
             resource: resource.clone(),
@@ -191,7 +201,9 @@ impl Backend for DirectResolvConf {
     }
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let snapshot = Self::read_current(std::path::Path::new(RESOLV_CONF));
+        let path = std::path::Path::new(RESOLV_CONF);
+        Self::check_usable(path)?;
+        let snapshot = Self::read_current(path)?;
         Self::to_platform(resource, &snapshot)
     }
 
@@ -251,6 +263,7 @@ impl Backend for DirectResolvConf {
         crate::platform::linux::watch::watch_directory(
             BackendKind::ResolvConfFile,
             &parent,
+            vec![ResourceId::new("linux:resolv-conf").expect("valid resource")],
             |name| {
                 if name == "resolv.conf" {
                     ResourceId::new("linux:resolv-conf").ok()
@@ -260,5 +273,26 @@ impl Backend for DirectResolvConf {
             },
             callback,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_file_is_the_only_read_failure_treated_as_absent() {
+        let root = std::env::temp_dir().join(format!("osdns-direct-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let missing = root.join("missing");
+        assert_eq!(
+            DirectResolvConf::read_current(&missing).unwrap().content,
+            None
+        );
+        assert!(DirectResolvConf::read_current(&root).is_err());
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = std::path::Path::new(std::ffi::OsStr::from_bytes(b"invalid\0path"));
+        assert!(DirectResolvConf::current_mode(invalid).is_err());
+        std::fs::remove_dir(&root).unwrap();
     }
 }

@@ -107,19 +107,15 @@ pub(crate) fn resolved_domains_to_public(
     (search, routing)
 }
 
-/// The DNS-related fields of a NetworkManager applied connection, per
-/// address family. This is the exact set osdns reads, writes, and restores;
-/// every other field of the connection is passed through untouched.
+/// The DNS fields of a NetworkManager applied connection that osdns owns.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NmDnsFields {
     pub(crate) ipv4_dns: Vec<u32>,
     pub(crate) ipv4_dns_search: Vec<String>,
     pub(crate) ipv4_ignore_auto_dns: bool,
-    pub(crate) ipv4_dns_priority: Option<i32>,
     pub(crate) ipv6_dns: Vec<Vec<u8>>,
     pub(crate) ipv6_dns_search: Vec<String>,
     pub(crate) ipv6_ignore_auto_dns: bool,
-    pub(crate) ipv6_dns_priority: Option<i32>,
 }
 
 impl NmDnsFields {
@@ -207,13 +203,11 @@ pub(crate) fn parse_nm_dns_fields(
             .collect();
         fields.ipv4_dns_search = string_list(ipv4.get("dns-search"));
         fields.ipv4_ignore_auto_dns = bool_value(ipv4.get("ignore-auto-dns"));
-        fields.ipv4_dns_priority = int_value(ipv4.get("dns-priority"));
     }
     if let Some(ipv6) = settings.get("ipv6") {
         fields.ipv6_dns = byte_array_list(ipv6.get("dns"));
         fields.ipv6_dns_search = string_list(ipv6.get("dns-search"));
         fields.ipv6_ignore_auto_dns = bool_value(ipv6.get("ignore-auto-dns"));
-        fields.ipv6_dns_priority = int_value(ipv6.get("dns-priority"));
     }
     fields
 }
@@ -248,13 +242,6 @@ fn bool_value(value: Option<&SettingValue>) -> bool {
     match value {
         Some(SettingValue::Bool(b)) => *b,
         _ => false,
-    }
-}
-
-fn int_value(value: Option<&SettingValue>) -> Option<i32> {
-    match value {
-        Some(SettingValue::Int(i)) => Some(*i),
-        _ => None,
     }
 }
 
@@ -492,7 +479,7 @@ mod tests {
     }
 
     #[test]
-    fn nm_fields_parse_roundtrip() {
+    fn nm_fields_exclude_unmanaged_priority() {
         let mut ipv4 = HashMap::new();
         ipv4.insert(
             "dns".to_string(),
@@ -514,13 +501,16 @@ mod tests {
         settings.insert("ipv6".to_string(), ipv6);
 
         let fields = parse_nm_dns_fields(&settings);
+        settings
+            .get_mut("ipv4")
+            .unwrap()
+            .insert("dns-priority".to_string(), SettingValue::Int(200));
+        assert_eq!(fields, parse_nm_dns_fields(&settings));
         assert_eq!(fields.ipv4_dns, vec![u32::from_be_bytes([1, 2, 3, 4])]);
         assert_eq!(fields.ipv4_dns_search, vec!["a.example"]);
         assert!(fields.ipv4_ignore_auto_dns);
-        assert_eq!(fields.ipv4_dns_priority, Some(-5));
         assert_eq!(fields.ipv6_dns, vec![vec![0u8; 16]]);
         assert!(fields.ipv6_dns_search.is_empty());
-        assert_eq!(fields.ipv6_dns_priority, None);
     }
 
     #[test]

@@ -181,9 +181,9 @@ pub(crate) fn spawn_coalescer(
     kind: BackendKind,
     callback: WatchCallback,
     window: Duration,
-) -> Result<WatchCallback> {
+) -> Result<Coalescer> {
     let (tx, rx) = mpsc::channel::<DnsEvent>();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("osdns-watch-coalescer".to_string())
         .spawn(move || {
             let mut pending: HashMap<ResourceId, DnsEvent> = HashMap::new();
@@ -194,12 +194,8 @@ pub(crate) fn spawn_coalescer(
                 loop {
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                         Ok(event) => {
-                            let (resource, removed) = event.clone().into_owned();
-                            if removed {
-                                pending.insert(resource, event);
-                            } else {
-                                pending.entry(resource).or_insert(event);
-                            }
+                            let (resource, _) = event.clone().into_owned();
+                            pending.insert(resource, event);
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -215,9 +211,40 @@ pub(crate) fn spawn_coalescer(
             backend: kind,
             message: format!("cannot spawn coalescer thread: {e}"),
         })?;
-    Ok(Arc::new(move |event| {
+    let sender: WatchCallback = Arc::new(move |event| {
         let _ = tx.send(event.clone());
-    }))
+    });
+    Ok(Coalescer {
+        sender: Some(sender),
+        worker: Some(worker),
+    })
+}
+
+pub(crate) struct Coalescer {
+    sender: Option<WatchCallback>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Coalescer {
+    pub(crate) fn callback(&self) -> WatchCallback {
+        self.sender.as_ref().expect("active coalescer").clone()
+    }
+
+    pub(crate) fn stop(mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for Coalescer {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn flush(callback: &WatchCallback, pending: &mut HashMap<ResourceId, DnsEvent>) {
@@ -225,4 +252,33 @@ fn flush(callback: &WatchCallback, pending: &mut HashMap<ResourceId, DnsEvent>) 
         callback(event);
     }
     pending.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coalescer_delivers_the_last_observed_state() {
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&delivered);
+        let coalescer = spawn_coalescer(
+            BackendKind::Fake,
+            Arc::new(move |event| sink.lock().unwrap().push(event.clone())),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+        let callback = coalescer.callback();
+        let resource = ResourceId::new("fake:watch-state").unwrap();
+        callback(&DnsEvent::ResourceRemoved {
+            resource: resource.clone(),
+        });
+        callback(&DnsEvent::ResourceChanged { resource });
+        drop(callback);
+        coalescer.stop();
+        assert!(matches!(
+            delivered.lock().unwrap().as_slice(),
+            [DnsEvent::ResourceChanged { .. }]
+        ));
+    }
 }

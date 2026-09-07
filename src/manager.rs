@@ -1421,6 +1421,7 @@ impl DnsManager {
         };
         let coalescer =
             crate::watch::spawn_coalescer(self.inner.backend.kind(), callback, COALESCE_WINDOW)?;
+        let coalesced = coalescer.callback();
         let suppressions = Arc::clone(&self.inner.suppressions);
         let filtered: WatchCallback = Arc::new(move |event| {
             if let Some(feed) = &feed {
@@ -1429,9 +1430,14 @@ impl DnsManager {
             if suppressions.is_suppressed(event.resource()) {
                 return;
             }
-            coalescer(event);
+            coalesced(event);
         });
-        self.inner.backend.start_watch(filtered)
+        let native = self.inner.backend.start_watch(filtered)?;
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Ok(WatchHandle::new(flag, move || {
+            native.stop();
+            coalescer.stop();
+        }))
     }
     /// Flushes the OS DNS cache, when the backend supports it.
     ///

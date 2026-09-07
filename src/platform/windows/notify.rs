@@ -91,7 +91,7 @@ pub(crate) fn start_ip_interface_watch(
     }
 
     let worker_flag = flag.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("osdns-ipnotify-worker".to_string())
         .spawn(move || {
             while let Ok(resource) = rx.recv() {
@@ -123,10 +123,20 @@ pub(crate) fn start_ip_interface_watch(
             }
         }
     }
+    struct SendContext(*mut IpNotifyContext);
+    unsafe impl Send for SendContext {}
+    impl SendContext {
+        fn release(self) {
+            unsafe { drop(Box::from_raw(self.0)) };
+        }
+    }
     let wrapped = SendHandle(notification);
+    let context = SendContext(context);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
         wrapped.cancel();
+        context.release();
+        let _ = worker.join();
     }))
 }
 
@@ -155,6 +165,8 @@ impl RegistryWatch {
         // exactly once, after the watch loop exits.
         unsafe {
             let _ = windows::Win32::System::Registry::RegCloseKey(self.key);
+            let _ = windows::Win32::Foundation::CloseHandle(self.notify_event);
+            let _ = windows::Win32::Foundation::CloseHandle(self.cancel_event);
         }
     }
 }
@@ -209,7 +221,7 @@ pub(crate) fn start_nrpt_registry_watch(
     rearm_notify(&watch)?;
 
     let worker_flag = flag.clone();
-    thread::Builder::new()
+    let worker = thread::Builder::new()
         .name("osdns-nrpt-watch".to_string())
         .spawn(move || {
             let watch = watch;
@@ -248,18 +260,18 @@ pub(crate) fn start_nrpt_registry_watch(
     struct SendEvent(HANDLE);
     unsafe impl Send for SendEvent {}
     impl SendEvent {
-        fn cancel(self) {
+        fn signal(self) {
             // SAFETY: see the SendEvent safety contract above.
             unsafe {
                 let _ = SetEvent(self.0);
-                let _ = windows::Win32::Foundation::CloseHandle(self.0);
             }
         }
     }
     let wrapped = SendEvent(cancel_event);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        wrapped.cancel();
+        wrapped.signal();
+        let _ = worker.join();
     }))
 }
 
