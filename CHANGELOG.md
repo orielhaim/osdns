@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Replaced the 0.1.3 journal format with schema 3 resource-incarnation
+  records. This is intentionally incompatible with durable state written by
+  0.1.3. Stop the old process and clear or reset its osdns state directory
+  before upgrading.
+
 ## 0.1.3
 
 Correctness and API-contract hardening (breaking changes allowed at `0.1.x`):

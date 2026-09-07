@@ -104,8 +104,10 @@
 //! configuration proves nothing — the crash may predate the mutation while
 //! an external actor independently produced that state — so the resource is
 //! reported as [`RecoveryOutcome::ExternalConflict`] and left untouched.
-//! Unknown or corrupt journal formats fail closed with
-//! [`Error::JournalCorrupt`].
+//! Corrupt current-format journals fail closed with [`Error::JournalCorrupt`].
+//! Incompatible format versions fail with
+//! [`Error::UnsupportedJournalVersion`]. Pre-v1 journal state is not migrated;
+//! clear the old state directory before upgrading.
 //!
 //! # Validation guarantee
 //!

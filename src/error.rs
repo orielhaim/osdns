@@ -44,6 +44,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///   can finish the work. The lease remains usable.
 /// - [`Error::JournalCorrupt`]: no mutation was attempted. The call fails
 ///   closed; inspect or clear the state directory manually.
+/// - [`Error::UnsupportedJournalVersion`]: the durable state belongs to an
+///   incompatible osdns journal format. Clear the old state before upgrade.
 /// - [`Error::ResourceGone`]: the named native incarnation no longer exists;
 ///   its owned state cannot still affect the OS.
 /// - [`Error::ResourcePlatform`] / [`Error::ResourceIdentity`]: a native
@@ -180,7 +182,22 @@ pub enum Error {
         /// Detail about the mismatch.
         detail: String,
     },
-    /// A journal record could not be parsed or uses an unknown schema.
+    /// A journal record uses an intentionally incompatible format version.
+    ///
+    /// No mutation was attempted. osdns does not migrate pre-v1 durable
+    /// state; clear or reset the old state directory before upgrading.
+    #[error(
+        "unsupported journal schema version {found} in {path} (supported: {supported}); clear or reset old osdns state before upgrading"
+    )]
+    UnsupportedJournalVersion {
+        /// Journal file containing the incompatible record.
+        path: std::path::PathBuf,
+        /// Version found in the record envelope.
+        found: u32,
+        /// Version understood by this build.
+        supported: u32,
+    },
+    /// A current-schema journal record is malformed or internally inconsistent.
     ///
     /// This is always treated as fail-closed: no mutation is attempted.
     /// Inspect the state directory manually.

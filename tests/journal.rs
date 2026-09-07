@@ -93,7 +93,14 @@ fn unknown_schema_fails_closed() {
         .manager
         .apply(&iface_config(1, "1.1.1.1"))
         .unwrap_err();
-    assert!(matches!(err, Error::JournalCorrupt(_)));
+    assert!(matches!(
+        err,
+        Error::UnsupportedJournalVersion {
+            found: 99,
+            supported: 3,
+            ..
+        }
+    ));
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(osdns::testing::FakeState::Empty),
@@ -102,14 +109,44 @@ fn unknown_schema_fails_closed() {
 }
 
 #[test]
+fn published_schema_1_reports_an_intentional_incompatible_upgrade() {
+    let fixture = new_fixture("journal-schema-1");
+    std::fs::write(
+        fixture.dir.join("journal").join("published-v1.json"),
+        include_bytes!("fixtures/journal-schema-1.json"),
+    )
+    .unwrap();
+
+    let error = fixture.manager.recover_stale().unwrap_err();
+    assert!(matches!(
+        error,
+        Error::UnsupportedJournalVersion {
+            found: 1,
+            supported: 3,
+            ..
+        }
+    ));
+    let error = fixture.manager.recover_stale().unwrap_err();
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("unsupported journal schema version 1"));
+    assert!(diagnostic.contains("clear or reset"));
+    assert!(!diagnostic.contains("missing field `identity`"));
+}
+
+#[test]
 fn unknown_phase_fails_closed() {
     let fixture = new_fixture("journal-phase");
     let record = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "owner": "someone.else",
         "lease_id": "11111111-2222-3333-4444-555555555555",
         "resource": IFACE1,
         "backend": "fake",
+        "identity": {
+            "backend": "fake",
+            "resource": IFACE1,
+            "data": { "incarnation": 1 }
+        },
         "phase": "HalfDone",
         "before": { "backend": "fake", "resource": IFACE1, "data": {} },
         "desired": { "nameservers": ["1.1.1.1"], "search_domains": [], "routing_domains": [], "default_route": null },

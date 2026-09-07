@@ -346,7 +346,7 @@ pub(crate) struct PreparedLease {
 }
 
 enum RecoverBlock {
-    Corrupt(Error),
+    Journal(Error),
     Conflict(String),
 }
 
@@ -1089,7 +1089,7 @@ impl Inner {
         let records = self
             .journal
             .records_for(resource)
-            .map_err(RecoverBlock::Corrupt)?;
+            .map_err(RecoverBlock::Journal)?;
         let mut conflict = None;
         for record in records {
             match self.recover_record(record) {
@@ -1107,7 +1107,7 @@ impl Inner {
                 }
                 Ok(_) => {}
                 Err(error @ Error::JournalCorrupt(_)) => {
-                    return Err(RecoverBlock::Corrupt(error));
+                    return Err(RecoverBlock::Journal(error));
                 }
                 Err(error) => {
                     return Err(RecoverBlock::Conflict(error.to_string()));
@@ -1340,7 +1340,7 @@ impl DnsManager {
         for resource in &resources {
             match self.inner.recover_for_resource(resource) {
                 Ok(()) => {}
-                Err(RecoverBlock::Corrupt(error)) => return Err(error),
+                Err(RecoverBlock::Journal(error)) => return Err(error),
                 Err(RecoverBlock::Conflict(detail)) => {
                     return Err(Error::Conflict {
                         resource: resource.clone(),

@@ -16,6 +16,11 @@ use crate::platform::{PlatformSnapshot, ResourceIdentity};
 /// (fail-closed) rather than guessed at.
 pub(crate) const SCHEMA_VERSION: u32 = 3;
 
+#[derive(Deserialize)]
+struct JournalEnvelope {
+    schema_version: u32,
+}
+
 /// The phase a journal record reached before its writer stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Phase {
@@ -57,8 +62,8 @@ fn record_path(dir: &Path, lease_id: &Uuid, resource: &ResourceId) -> PathBuf {
 
 /// Durable store of journal records, one file per (lease, resource).
 ///
-/// Writes are atomic and fsynced. Any record that fails to parse, or that
-/// carries an unknown schema version, makes every reader fail closed.
+/// Writes are atomic and fsynced. Readers reject incompatible versions from
+/// the minimal envelope, then deserialize and validate the current schema.
 #[derive(Debug)]
 pub(crate) struct JournalStore {
     dir: PathBuf,
@@ -172,16 +177,17 @@ impl JournalStore {
                 continue;
             }
             let bytes = fs::read(&path)?;
+            let envelope: JournalEnvelope = serde_json::from_slice(&bytes)
+                .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
+            if envelope.schema_version != SCHEMA_VERSION {
+                return Err(Error::UnsupportedJournalVersion {
+                    path,
+                    found: envelope.schema_version,
+                    supported: SCHEMA_VERSION,
+                });
+            }
             let record: JournalRecord = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
-            if record.schema_version != SCHEMA_VERSION {
-                return Err(Error::JournalCorrupt(format!(
-                    "{}: unsupported journal schema version {} (supported: {})",
-                    path.display(),
-                    record.schema_version,
-                    SCHEMA_VERSION
-                )));
-            }
             if record.backend != record.before.backend
                 || record.backend != record.identity.backend
                 || record.resource != record.before.resource

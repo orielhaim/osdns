@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "owner": "io.osdns.prototype",
+  "lease_id": "11111111-2222-3333-4444-555555555555",
+  "resource": "fake:interface:1",
+  "backend": "fake",
+  "phase": "Prepared",
+  "before": {
+    "backend": "fake",
+    "resource": "fake:interface:1",
+    "data": {
+      "state": "Empty",
+      "generation": 0
+    }
+  },
+  "desired": {
+    "nameservers": ["1.1.1.1"],
+    "search_domains": [],
+    "routing_domains": [],
+    "default_route": null
+  },
+  "applied": null
+}
