@@ -317,6 +317,12 @@ impl Backend for MacosBackend {
                 "the root routing domain is not representable as a scoped resolver file; configure default_route instead",
             ));
         }
+        if plan.default_route == Some(false) && plan.routing_domains.is_empty() {
+            return Err(Error::unsupported(
+                BackendKind::MacosSystemConfiguration,
+                "default_route(false) requires at least one scoped routing domain on macOS",
+            ));
+        }
         // Search domains live in the service DNS state, which implies the
         // default route. A split-only lease (routing without the service)
         // cannot faithfully carry them.
@@ -457,6 +463,21 @@ mod tests {
             &DnsScope::Global,
             &plan(&[], None, &[])
         ));
+    }
+
+    #[test]
+    fn default_route_false_without_scoped_routing_is_rejected() {
+        let backend = MacosBackend::new("io.test");
+        assert!(
+            backend
+                .validate_plan(&iface_scope(), &plan(&[], Some(false), &[]))
+                .is_err()
+        );
+        assert!(
+            backend
+                .validate_plan(&iface_scope(), &plan(&["corp.example"], Some(false), &[]),)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -230,9 +230,35 @@ pub(crate) trait Backend: Send + Sync {
                 MutationGuard::CompareAndMutate => {
                     self.apply_guarded(&identity.resource, expected, plan)
                 }
-                MutationGuard::Unconditional => {
-                    MutationAttempt::from_apply_result(self.apply(&identity.resource, plan))
-                }
+                MutationGuard::Unconditional => match self.readback(&identity.resource) {
+                    Ok(current) if self.equivalent(expected, &current) => {
+                        match self.resource_status(identity) {
+                            Ok(ResourceStatus::Same) => MutationAttempt::from_apply_result(
+                                self.apply(&identity.resource, plan),
+                            ),
+                            Ok(status) => MutationAttempt::Rejected {
+                                error: Error::ResourceIdentity {
+                                    backend: self.kind(),
+                                    resource: identity.resource.clone(),
+                                    message: format!(
+                                        "resource incarnation became {status:?} before mutation"
+                                    ),
+                                },
+                            },
+                            Err(error) => MutationAttempt::Rejected { error },
+                        }
+                    }
+                    Ok(_) => MutationAttempt::Rejected {
+                        error: Error::ExternalModification {
+                            resource: identity.resource.clone(),
+                            detail: "the current state changed since it was captured".to_string(),
+                        },
+                    },
+                    Err(error) => MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    },
+                },
             },
             Ok(status) => MutationAttempt::Rejected {
                 error: Error::ResourceIdentity {

@@ -1,6 +1,6 @@
 [package]
 name = "osdns"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Safe, transactional control of operating-system DNS configuration"
@@ -30,7 +30,10 @@ tracing = { version = "0.1", optional = true }
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-inotify = "0.11"
+inotify = { version = "0.11", default-features = false }
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.33"
+netlink-sys = "0.8"
 zbus = "5"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -51,7 +54,9 @@ windows-registry = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10.1"
 core-foundation-sys = "0.8.7"
-notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8.2.0", default-features = false, features = [
+    "macos_fsevent",
+] }
 system-configuration = "0.8.0"
 
 [dev-dependencies]
@@ -75,4 +80,8 @@ required-features = ["test-util"]
 
 [package.metadata.docs.rs]
 all-features = true
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-apple-darwin"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]

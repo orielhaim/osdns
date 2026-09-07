@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::error::Result;
@@ -87,12 +87,14 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn Backend>> {
         return Ok(Arc::new(backend));
     }
 
-    let nm_conf = nm_conf_main();
-    let nm_available = NetworkManager::connect().is_ok();
-    let nm_rc_manager = nm_conf.rc_manager.unwrap_or_else(|| "symlink".to_string());
+    let network_manager = NetworkManager::connect().ok();
+    let (nm_mode, nm_rc_manager) = network_manager
+        .as_ref()
+        .map(NetworkManager::dns_configuration)
+        .unwrap_or(("", ""));
 
-    if nm_available
-        && nm_conf.dns.as_deref() == Some("systemd-resolved")
+    if network_manager.is_some()
+        && nm_mode == "systemd-resolved"
         && let Some(backend) = resolved
     {
         return Ok(Arc::new(backend));
@@ -104,12 +106,12 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn Backend>> {
         return Ok(Arc::new(Resolvconf::new(probe, owner)));
     }
 
-    let nm_owns_directly = nm_available
+    let nm_owns_directly = network_manager.is_some()
         && (file_owner == ResolvConfOwner::NetworkManager
-            || nm_conf.dns.as_deref() == Some("dnsmasq")
-            || matches!(nm_rc_manager.as_str(), "file" | "symlink" | "managed"));
+            || nm_mode == "dnsmasq"
+            || matches!(nm_rc_manager, "file" | "symlink" | "managed"));
     if nm_owns_directly {
-        return Ok(Arc::new(NetworkManager::connect()?));
+        return Ok(Arc::new(network_manager.expect("checked above")));
     }
 
     let resolvconf_owns = file_owner == ResolvConfOwner::Resolvconf || resolvconf_indicated();
@@ -122,34 +124,4 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn Backend>> {
     }
 
     Ok(Arc::new(DirectResolvConf::new()))
-}
-
-fn nm_conf_main() -> crate::platform::text_config::NmMainConf {
-    let mut conf = crate::platform::text_config::NmMainConf::default();
-    if let Ok(text) = std::fs::read_to_string("/etc/NetworkManager/NetworkManager.conf") {
-        conf = crate::platform::text_config::parse_nm_main_conf(&text);
-    }
-    if conf.dns.is_none()
-        && let Ok(entries) = std::fs::read_dir("/etc/NetworkManager/conf.d")
-    {
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "conf").unwrap_or(false))
-            .collect();
-        paths.sort();
-        for path in paths {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                let parsed = crate::platform::text_config::parse_nm_main_conf(&text);
-                if parsed.dns.is_some() {
-                    conf.dns = parsed.dns;
-                    break;
-                }
-                if conf.rc_manager.is_none() && parsed.rc_manager.is_some() {
-                    conf.rc_manager = parsed.rc_manager;
-                }
-            }
-        }
-    }
-    conf
 }

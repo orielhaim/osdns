@@ -42,18 +42,10 @@ pub(crate) fn probe() -> Option<Probe> {
 }
 
 fn find_binary(name: &str) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = SEARCH_PATH
+    SEARCH_PATH
         .iter()
         .map(|dir| PathBuf::from(dir).join(name))
-        .collect();
-    if let Some(path) = std::env::var_os("PATH") {
-        candidates.extend(
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(name))
-                .collect::<Vec<_>>(),
-        );
-    }
-    candidates.into_iter().find(|p| p.is_file())
+        .find(|path| path.is_file())
 }
 
 fn capabilities() -> Capabilities {
@@ -76,22 +68,11 @@ pub(crate) struct Resolvconf {
 
 impl Resolvconf {
     pub(crate) fn new(probe: Probe, owner: &str) -> Self {
-        let mut sanitized: String = owner
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        sanitized.truncate(64);
         Self {
             binary: probe.binary,
             state_dir: probe.state_dir,
             caps: capabilities(),
-            tag_prefix: format!("{sanitized}.osdns"),
+            tag_prefix: owner_tag(owner),
         }
     }
 
@@ -172,6 +153,41 @@ impl Resolvconf {
 
     fn delete(&self, tag: &str) -> Result<()> {
         self.run(&["-d", tag, "-f"], None).map(|_| ())
+    }
+}
+
+fn owner_tag(owner: &str) -> String {
+    const OWNER_TAG_NAMESPACE: u128 = 0x6f73_646e_7372_6573_6f6c_7600_0001;
+    let mut readable: String = owner
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(24)
+        .collect();
+    if readable.is_empty() {
+        readable.push_str("owner");
+    }
+    let namespace = uuid::Uuid::from_u128(OWNER_TAG_NAMESPACE);
+    let hash = uuid::Uuid::new_v5(&namespace, owner.as_bytes()).simple();
+    format!("{readable}-{hash}.osdns")
+}
+
+#[cfg(test)]
+mod owner_tag_tests {
+    use super::owner_tag;
+
+    #[test]
+    fn owner_tags_remain_distinct_after_sanitizing_and_truncation() {
+        assert_ne!(owner_tag("io.test/a"), owner_tag("io.test-a"));
+        assert_ne!(
+            owner_tag("io.example.abcdefghijklmnopqrstuvwx-one"),
+            owner_tag("io.example.abcdefghijklmnopqrstuvwx-two")
+        );
     }
 }
 

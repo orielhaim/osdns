@@ -252,42 +252,6 @@ fn byte_array_list(value: Option<&SettingValue>) -> Vec<Vec<u8>> {
     }
 }
 
-/// The DNS-relevant knobs of NetworkManager's main configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct NmMainConf {
-    pub(crate) dns: Option<String>,
-    pub(crate) rc_manager: Option<String>,
-}
-
-pub(crate) fn parse_nm_main_conf(text: &str) -> NmMainConf {
-    let mut conf = NmMainConf::default();
-    let mut in_main = false;
-    for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            let inner = line.trim_start_matches('[').trim_end_matches(']');
-            in_main = inner.eq_ignore_ascii_case("main");
-            continue;
-        }
-        if !in_main {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim().to_ascii_lowercase();
-            let value = value.trim().to_ascii_lowercase();
-            match key.as_str() {
-                "dns" => conf.dns = Some(value),
-                "rc-manager" => conf.rc_manager = Some(value),
-                _ => {}
-            }
-        }
-    }
-    conf
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,19 +475,5 @@ mod tests {
         assert!(fields.ipv4_ignore_auto_dns);
         assert_eq!(fields.ipv6_dns, vec![vec![0u8; 16]]);
         assert!(fields.ipv6_dns_search.is_empty());
-    }
-
-    #[test]
-    fn nm_conf_parsing() {
-        let conf =
-            parse_nm_main_conf("[main]\ndns=dnsmasq\nrc-manager=symlink\n[logging]\nlevel=DEBUG\n");
-        assert_eq!(conf.dns.as_deref(), Some("dnsmasq"));
-        assert_eq!(conf.rc_manager.as_deref(), Some("symlink"));
-
-        let conf = parse_nm_main_conf("# nothing here\n[other]\ndns=ignored\n");
-        assert_eq!(conf, NmMainConf::default());
-
-        let conf = parse_nm_main_conf("[main]\nDNS = SYSTEMD-RESOLVED\n");
-        assert_eq!(conf.dns.as_deref(), Some("systemd-resolved"));
     }
 }

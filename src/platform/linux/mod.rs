@@ -3,6 +3,7 @@ pub(crate) mod direct;
 pub(crate) mod network_manager;
 pub(crate) mod resolvconf;
 pub(crate) mod resolved;
+mod route;
 pub(crate) mod watch;
 
 use std::path::PathBuf;
@@ -12,7 +13,6 @@ use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 
 pub(crate) const SYS_CLASS_NET: &str = "/sys/class/net";
-pub(crate) const PROC_NET_ROUTE: &str = "/proc/net/route";
 pub(crate) const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
 pub(crate) fn interface_names() -> Result<Vec<String>> {
@@ -72,15 +72,7 @@ pub(crate) fn list_interfaces() -> Result<Vec<InterfaceInfo>> {
 }
 
 pub(crate) fn default_route_ifindex() -> Result<u32> {
-    let text = std::fs::read_to_string(PROC_NET_ROUTE)
-        .map_err(|_| Error::invalid_config("no default route is available"))?;
-    for line in text.lines().skip(1) {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() >= 8 && fields[1] == "00000000" {
-            return ifindex_for_name(fields[0]);
-        }
-    }
-    Err(Error::invalid_config("no default route is available"))
+    route::default_interface()
 }
 
 pub(crate) fn resolve_interface_selector(scope: &DnsScope) -> Result<(u32, String)> {
@@ -102,5 +94,17 @@ pub(crate) fn resolve_interface_selector(scope: &DnsScope) -> Result<(u32, Strin
                 Ok((index, name))
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_route_lookup_returns_a_live_interface() {
+        let index = default_route_ifindex().unwrap();
+        let name = name_for_ifindex(index).unwrap();
+        assert_eq!(ifindex_for_name(&name).unwrap(), index);
     }
 }

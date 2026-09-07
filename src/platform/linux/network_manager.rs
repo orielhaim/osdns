@@ -37,6 +37,19 @@ trait NmManager {
 }
 
 #[proxy(
+    interface = "org.freedesktop.NetworkManager.DnsManager",
+    default_service = "org.freedesktop.NetworkManager",
+    default_path = "/org/freedesktop/NetworkManager/DnsManager"
+)]
+trait NmDnsManager {
+    #[zbus(property)]
+    fn mode(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn rc_manager(&self) -> zbus::Result<String>;
+}
+
+#[proxy(
     interface = "org.freedesktop.NetworkManager.Device",
     default_service = "org.freedesktop.NetworkManager"
 )]
@@ -68,6 +81,8 @@ type Settings = HashMap<String, HashMap<String, Value<'static>>>;
 pub(crate) struct NetworkManager {
     conn: Connection,
     caps: Capabilities,
+    dns_mode: String,
+    rc_manager: String,
 }
 
 impl NetworkManager {
@@ -75,40 +90,21 @@ impl NetworkManager {
         let conn = Connection::system().map_err(|e| {
             Error::BackendUnavailable(format!("cannot connect to the system D-Bus: {e}"))
         })?;
+        let dns = NmDnsManagerProxyBlocking::builder(&conn)
+            .build()
+            .map_err(dbus_error)?;
+        let dns_mode = dns.mode().map_err(dbus_error)?;
+        let rc_manager = dns.rc_manager().map_err(dbus_error)?;
         Ok(Self {
-            caps: capabilities(&Self::read_dns_mode()),
+            caps: capabilities(&dns_mode),
             conn,
+            dns_mode,
+            rc_manager,
         })
     }
 
-    pub(crate) fn dns_mode() -> Result<String> {
-        let mut dns = None;
-        if let Ok(text) = std::fs::read_to_string("/etc/NetworkManager/NetworkManager.conf") {
-            dns = crate::platform::text_config::parse_nm_main_conf(&text).dns;
-        }
-        if dns.is_none()
-            && let Ok(entries) = std::fs::read_dir("/etc/NetworkManager/conf.d")
-        {
-            let mut paths: Vec<_> = entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().map(|e| e == "conf").unwrap_or(false))
-                .collect();
-            paths.sort();
-            for path in paths {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    dns = crate::platform::text_config::parse_nm_main_conf(&text).dns;
-                    if dns.is_some() {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(dns.unwrap_or_else(|| "default".to_string()))
-    }
-
-    fn read_dns_mode() -> String {
-        Self::dns_mode().unwrap_or_else(|_| "default".to_string())
+    pub(crate) fn dns_configuration(&self) -> (&str, &str) {
+        (&self.dns_mode, &self.rc_manager)
     }
 
     fn manager(&self) -> Result<NmManagerProxyBlocking<'_>> {

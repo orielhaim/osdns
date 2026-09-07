@@ -162,6 +162,7 @@ struct FakeInner {
     before_guarded: Option<(ResourceId, FakeState)>,
     after_guarded: Option<(ResourceId, FakeState)>,
     before_nth_guarded: Option<(u32, ResourceId, FakeState)>,
+    before_unconditional_readback: Option<(ResourceId, FakeState)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +213,17 @@ impl FakeBackend {
                 .with_ownership_identity(OwnershipIdentity::Durable)
                 .with_resource_binding(crate::capability::ResourceBinding::NativeGuarded),
         )
+    }
+
+    pub(crate) fn unconditional() -> Self {
+        let mut backend = Self::new();
+        backend.caps = backend
+            .caps
+            .clone()
+            .with_mutation_guard(MutationGuard::Unconditional)
+            .with_ownership_identity(OwnershipIdentity::BestEffort)
+            .with_resource_binding(crate::capability::ResourceBinding::PreflightOnly);
+        backend
     }
 
     pub(crate) fn with_capabilities(caps: Capabilities) -> Self {
@@ -275,6 +287,7 @@ impl FakeBackend {
                 before_guarded: None,
                 after_guarded: None,
                 before_nth_guarded: None,
+                before_unconditional_readback: None,
             }),
             watchers: Arc::new(Mutex::new(Vec::new())),
             multi_resource,
@@ -327,6 +340,14 @@ impl FakeBackend {
 
     pub(crate) fn inject_external_before_guarded(&self, resource: ResourceId, state: FakeState) {
         self.lock_inner().before_guarded = Some((resource, state));
+    }
+
+    pub(crate) fn inject_external_before_unconditional_readback(
+        &self,
+        resource: ResourceId,
+        state: FakeState,
+    ) {
+        self.lock_inner().before_unconditional_readback = Some((resource, state));
     }
 
     pub(crate) fn inject_external_after_guarded_mutation(
@@ -750,6 +771,13 @@ impl Backend for FakeBackend {
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         self.check_failure(FakeOp::Readback)?;
+        {
+            let mut inner = self.lock_inner();
+            if let Some((wanted, state)) = inner.before_unconditional_readback.take() {
+                inner.states.insert(wanted.clone(), state);
+                *inner.generations.entry(wanted).or_insert(0) += 1;
+            }
+        }
         let lie = self.lock_inner().readback_lie.take();
         match lie {
             Some(state) => {

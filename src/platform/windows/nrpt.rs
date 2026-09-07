@@ -13,7 +13,8 @@ use windows::core::GUID;
 use windows_registry::LOCAL_MACHINE;
 
 use crate::capability::BackendKind;
-use crate::error::{Error, Result};
+use crate::error::{ConflictReason, Error, Result};
+use crate::ownership::ResourceId;
 
 pub(super) const NRPT_BASE: &str =
     r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
@@ -24,8 +25,12 @@ const MARKER_PREFIX: &str = "osdns owner=";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct NrptRule {
     pub(crate) key: String,
+    pub(crate) version: u32,
+    pub(crate) config_options: u32,
     pub(crate) namespaces: Vec<String>,
     pub(crate) servers: Vec<IpAddr>,
+    pub(crate) display_name: String,
+    pub(crate) comment: String,
 }
 
 pub(crate) fn marker_for(owner: &str) -> String {
@@ -81,24 +86,31 @@ pub(crate) fn rules_from_plan(
             let key = rule_key(owner, &chunk);
             NrptRule {
                 key: key_to_string(&key),
+                version: 1,
+                config_options: CONFIG_OPTIONS_OVERRIDE,
                 namespaces: chunk,
                 servers: plan.nameservers.clone(),
+                display_name: "osdns".to_string(),
+                comment: marker_for(owner),
             }
         })
         .collect()
 }
 
-pub(crate) fn write_rule(rule: &NrptRule, owner: &str) -> Result<()> {
+pub(crate) fn write_rule(rule: &NrptRule, owner: &str, resource: &ResourceId) -> Result<()> {
+    reject_foreign_rule(&rule.key, owner, resource)?;
     let dnskey = LOCAL_MACHINE
         .create(format!(r"{NRPT_BASE}\{}", rule.key))
         .map_err(registry_error)?;
-    write_rule_values(&dnskey, rule, owner)
+    write_rule_values(&dnskey, rule)
 }
 
-fn write_rule_values(dnskey: &windows_registry::Key, rule: &NrptRule, owner: &str) -> Result<()> {
-    dnskey.set_u32("Version", 1).map_err(registry_error)?;
+fn write_rule_values(dnskey: &windows_registry::Key, rule: &NrptRule) -> Result<()> {
     dnskey
-        .set_u32("ConfigOptions", CONFIG_OPTIONS_OVERRIDE)
+        .set_u32("Version", rule.version)
+        .map_err(registry_error)?;
+    dnskey
+        .set_u32("ConfigOptions", rule.config_options)
         .map_err(registry_error)?;
     let namespace_refs: Vec<&str> = rule.namespaces.iter().map(|s| s.as_str()).collect();
     dnskey
@@ -114,15 +126,16 @@ fn write_rule_values(dnskey: &windows_registry::Key, rule: &NrptRule, owner: &st
         .set_string("GenericDNSServers", servers)
         .map_err(registry_error)?;
     dnskey
-        .set_string("DisplayName", "osdns")
+        .set_string("DisplayName", &rule.display_name)
         .map_err(registry_error)?;
     dnskey
-        .set_string("Comment", marker_for(owner))
+        .set_string("Comment", &rule.comment)
         .map_err(registry_error)?;
     Ok(())
 }
 
-pub(crate) fn delete_rule(key: &str) -> Result<()> {
+pub(crate) fn delete_rule(key: &str, owner: &str, resource: &ResourceId) -> Result<()> {
+    reject_foreign_rule(key, owner, resource)?;
     let base = match LOCAL_MACHINE
         .options()
         .read()
@@ -155,9 +168,11 @@ fn registry_error<E: std::fmt::Display>(error: E) -> Error {
     }
 }
 
-/// Reads one rule by its registry key regardless of marker, so a captured
-/// `before` rule can be restored even if the marker changed.
-pub(crate) fn read_rule_by_key(key: &str) -> Result<Option<NrptRule>> {
+pub(crate) fn read_owned_rule_by_key(
+    key: &str,
+    owner: &str,
+    resource: &ResourceId,
+) -> Result<Option<NrptRule>> {
     let base = match LOCAL_MACHINE.open(NRPT_BASE) {
         Ok(base) => base,
         Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(None),
@@ -168,32 +183,93 @@ pub(crate) fn read_rule_by_key(key: &str) -> Result<Option<NrptRule>> {
         Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(None),
         Err(error) => return Err(registry_error(error)),
     };
-    read_rule_values(&rule_key, key)
+    let comment = read_marker(&rule_key, resource)?;
+    verify_marker(&comment, owner, resource)?;
+    read_rule_values(&rule_key, key, comment).map(Some)
 }
 
-fn read_rule_values(rule_key: &windows_registry::Key, key: &str) -> Result<Option<NrptRule>> {
+fn reject_foreign_rule(key: &str, owner: &str, resource: &ResourceId) -> Result<()> {
+    let base = match LOCAL_MACHINE.open(NRPT_BASE) {
+        Ok(base) => base,
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(()),
+        Err(error) => return Err(registry_error(error)),
+    };
+    let rule_key = match base.open(key) {
+        Ok(rule_key) => rule_key,
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => return Ok(()),
+        Err(error) => return Err(registry_error(error)),
+    };
+    let marker = read_marker(&rule_key, resource)?;
+    verify_marker(&marker, owner, resource)
+}
+
+fn read_marker(rule_key: &windows_registry::Key, resource: &ResourceId) -> Result<String> {
+    match rule_key.get_string("Comment") {
+        Ok(marker) => Ok(marker),
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(2) => {
+            Err(occupied(resource, "<missing>"))
+        }
+        Err(error) => Err(registry_error(error)),
+    }
+}
+
+fn verify_marker(marker: &str, owner: &str, resource: &ResourceId) -> Result<()> {
+    (marker == marker_for(owner))
+        .then_some(())
+        .ok_or_else(|| occupied(resource, marker))
+}
+
+fn occupied(resource: &ResourceId, marker: &str) -> Error {
+    Error::Conflict {
+        resource: resource.clone(),
+        reason: ConflictReason::ResourceOccupied {
+            detail: format!("NRPT rule is not owned by this osdns owner (marker {marker:?})"),
+        },
+    }
+}
+
+fn read_rule_values(
+    rule_key: &windows_registry::Key,
+    key: &str,
+    comment: String,
+) -> Result<NrptRule> {
     // windows-registry exposes REG_MULTI_SZ's trailing NUL terminators as
     // empty strings. They terminate the list; they are not DNS namespaces.
     let namespaces: Vec<String> = rule_key
         .get_multi_string("Name")
-        .unwrap_or_default()
+        .map_err(registry_error)?
         .into_iter()
         .take_while(|name| !name.is_empty())
         .collect();
     if namespaces.is_empty() {
-        return Ok(None);
+        return Err(Error::platform(
+            BackendKind::WindowsIpHelper,
+            "owned NRPT rule has no namespaces",
+        ));
     }
-    let servers = rule_key
+    let raw_servers = rule_key
         .get_string("GenericDNSServers")
-        .unwrap_or_default()
+        .map_err(registry_error)?;
+    let servers = raw_servers
         .split([';', ','])
-        .filter_map(|entry| entry.trim().parse::<IpAddr>().ok())
-        .collect();
-    Ok(Some(NrptRule {
+        .map(|entry| entry.trim().parse::<IpAddr>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| Error::platform(BackendKind::WindowsIpHelper, error))?;
+    if servers.is_empty() {
+        return Err(Error::platform(
+            BackendKind::WindowsIpHelper,
+            "owned NRPT rule has no DNS servers",
+        ));
+    }
+    Ok(NrptRule {
         key: key.to_string(),
+        version: rule_key.get_u32("Version").map_err(registry_error)?,
+        config_options: rule_key.get_u32("ConfigOptions").map_err(registry_error)?,
         namespaces,
         servers,
-    }))
+        display_name: rule_key.get_string("DisplayName").map_err(registry_error)?,
+        comment,
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -214,14 +290,41 @@ mod tests {
         let rule =
             rules_from_plan(&plan(&["127.0.0.1", "::1"], &["matrix.test"]), "io.test").remove(0);
         let result = std::panic::catch_unwind(|| {
-            write_rule_values(&key, &rule, "io.test").unwrap();
-            assert_eq!(read_rule_values(&key, &rule.key).unwrap(), Some(rule));
+            write_rule_values(&key, &rule).unwrap();
+            assert_eq!(
+                read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap(),
+                rule
+            );
         });
         drop(key);
         windows_registry::CURRENT_USER.remove_tree(&path).unwrap();
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    #[test]
+    fn missing_marker_is_rejected_as_occupied() {
+        let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
+        let key = windows_registry::CURRENT_USER
+            .options()
+            .read()
+            .write()
+            .create()
+            .volatile()
+            .open(&path)
+            .unwrap();
+        let resource = ResourceId::new("windows:nrpt:test").unwrap();
+        let error = read_marker(&key, &resource).unwrap_err();
+        drop(key);
+        windows_registry::CURRENT_USER.remove_tree(&path).unwrap();
+        assert!(matches!(
+            error,
+            Error::Conflict {
+                reason: ConflictReason::ResourceOccupied { .. },
+                ..
+            }
+        ));
     }
 
     fn plan(ns: &[&str], routing: &[&str]) -> NormalizedConfig {
@@ -288,5 +391,18 @@ mod tests {
     #[test]
     fn marker_includes_owner() {
         assert_eq!(marker_for("io.tunnet.agent"), "osdns owner=io.tunnet.agent");
+    }
+
+    #[test]
+    fn foreign_marker_is_rejected_as_occupied() {
+        let resource = ResourceId::new("windows:nrpt:test").unwrap();
+        let error = verify_marker(&marker_for("io.foreign"), "io.test", &resource).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Conflict {
+                reason: ConflictReason::ResourceOccupied { .. },
+                ..
+            }
+        ));
     }
 }

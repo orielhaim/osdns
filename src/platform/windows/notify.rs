@@ -91,7 +91,7 @@ pub(crate) fn start_ip_interface_watch(
     }
 
     let worker_flag = flag.clone();
-    let worker = thread::Builder::new()
+    let worker = match thread::Builder::new()
         .name("osdns-ipnotify-worker".to_string())
         .spawn(move || {
             while let Ok(resource) = rx.recv() {
@@ -103,11 +103,19 @@ pub(crate) fn start_ip_interface_watch(
                     break;
                 }
             }
-        })
-        .map_err(|e| Error::Platform {
-            backend: BackendKind::WindowsIpHelper,
-            message: format!("cannot spawn notification worker: {e}"),
-        })?;
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            unsafe {
+                let _ = CancelMibChangeNotify2(notification);
+                drop(Box::from_raw(context));
+            }
+            return Err(Error::Platform {
+                backend: BackendKind::WindowsIpHelper,
+                message: format!("cannot spawn notification worker: {error}"),
+            });
+        }
+    };
 
     // SAFETY: the notification handle outlives every use of this wrapper: the
     // OS guarantees the handle is valid until CancelMibChangeNotify2 runs,
@@ -159,8 +167,10 @@ impl RegistryWatch {
         let waited = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
         waited == WAIT_OBJECT_0
     }
+}
 
-    fn close(self) {
+impl Drop for RegistryWatch {
+    fn drop(&mut self) {
         // SAFETY: the key handle was opened by RegOpenKeyExW and is closed
         // exactly once, after the watch loop exits.
         unsafe {
@@ -183,11 +193,18 @@ pub(crate) fn start_nrpt_registry_watch(
             message: format!("CreateEventW failed: {e}"),
         })?;
     // SAFETY: as above; unnamed event.
-    let cancel_event =
-        unsafe { CreateEventW(None, false, false, None) }.map_err(|e| Error::Platform {
-            backend: BackendKind::WindowsIpHelper,
-            message: format!("CreateEventW failed: {e}"),
-        })?;
+    let cancel_event = match unsafe { CreateEventW(None, false, false, None) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(notify_event);
+            }
+            return Err(Error::Platform {
+                backend: BackendKind::WindowsIpHelper,
+                message: format!("CreateEventW failed: {error}"),
+            });
+        }
+    };
 
     let mut key = HKEY::default();
     let wide: Vec<u16> = NRPT_WATCH_KEY
@@ -206,6 +223,10 @@ pub(crate) fn start_nrpt_registry_watch(
         )
     };
     if open != windows::Win32::Foundation::ERROR_SUCCESS {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(notify_event);
+            let _ = windows::Win32::Foundation::CloseHandle(cancel_event);
+        }
         return Err(crate::platform::windows::interface::win32_error(
             BackendKind::WindowsIpHelper,
             open,
@@ -247,7 +268,6 @@ pub(crate) fn start_nrpt_registry_watch(
                     break;
                 }
             }
-            watch.close();
         })
         .map_err(|e| Error::Platform {
             backend: BackendKind::WindowsIpHelper,

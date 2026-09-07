@@ -56,6 +56,14 @@ impl FakeDns {
         }
     }
 
+    /// Creates a fake backend that models platforms without native
+    /// compare-and-mutate support.
+    pub fn unconditional() -> Self {
+        Self {
+            backend: Arc::new(FakeBackend::unconditional()),
+        }
+    }
+
     /// Creates a fake backend with exactly the given capabilities.
     pub fn with_capabilities(caps: crate::capability::Capabilities) -> Self {
         Self {
@@ -179,6 +187,21 @@ impl FakeDns {
             Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
         })?;
         self.backend.inject_external_before_guarded(id, state);
+        Ok(())
+    }
+
+    /// Applies an external write immediately before the generic
+    /// compare-before-mutate read of an unconditional backend.
+    pub fn inject_external_before_unconditional_readback(
+        &self,
+        resource: &str,
+        state: FakeState,
+    ) -> Result<()> {
+        let id: crate::ResourceId = resource.parse().map_err(|e| {
+            Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
+        })?;
+        self.backend
+            .inject_external_before_unconditional_readback(id, state);
         Ok(())
     }
 

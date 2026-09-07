@@ -33,6 +33,30 @@ fn external_change_during_capture_window_fails_transaction() {
 }
 
 #[test]
+fn unconditional_backend_rechecks_state_before_mutation() {
+    let dir = temp_dir("race-unconditional-preflight");
+    let fake = FakeDns::unconditional();
+    let manager = manager_for_testing(
+        "io.osdns.test",
+        &dir,
+        &fake,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap();
+    fake.inject_external_before_unconditional_readback(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+
+    assert!(matches!(
+        manager.apply(&iface_config(1, "1.1.1.1")).unwrap_err(),
+        Error::ExternalModification { .. }
+    ));
+    assert_eq!(
+        fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
 fn external_change_between_apply_and_readback_is_rolled_back() {
     let fixture = new_fixture("race-apply");
     let injector = FaultInjector::new();

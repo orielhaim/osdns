@@ -301,7 +301,7 @@ impl Backend for WindowsBackend {
                 self.to_platform(resource, &snapshot)
             }
             ResourceKind::Nrpt { key } => {
-                let rule = nrpt::read_rule_by_key(&key)?;
+                let rule = nrpt::read_owned_rule_by_key(&key, &self.owner, resource)?;
                 let snapshot = WindowsSnapshot::Nrpt(NrptSnapshot { rule });
                 self.to_platform(resource, &snapshot)
             }
@@ -324,7 +324,7 @@ impl Backend for WindowsBackend {
                         "resource {resource} is not part of the desired configuration"
                     )));
                 };
-                nrpt::write_rule(rule, &self.owner)?;
+                nrpt::write_rule(rule, &self.owner, resource)?;
             }
         }
         Ok(ApplyReceipt {
@@ -345,8 +345,8 @@ impl Backend for WindowsBackend {
                 self.restore_interface(&guid, &before.interface)?;
             }
             (ResourceKind::Nrpt { key }, WindowsSnapshot::Nrpt(before)) => match before.rule {
-                Some(rule) => nrpt::write_rule(&rule, &self.owner)?,
-                None => nrpt::delete_rule(&key)?,
+                Some(rule) => nrpt::write_rule(&rule, &self.owner, resource)?,
+                None => nrpt::delete_rule(&key, &self.owner, resource)?,
             },
             _ => {
                 return Err(Error::platform(
@@ -402,10 +402,10 @@ impl Backend for WindowsBackend {
                 let Some(expected_rule) = expected.iter().find(|rule| rule.key == key) else {
                     return false;
                 };
-                current.rule.as_ref().is_some_and(|rule| {
-                    rule.namespaces == expected_rule.namespaces
-                        && rule.servers == expected_rule.servers
-                })
+                current
+                    .rule
+                    .as_ref()
+                    .is_some_and(|rule| rule == expected_rule)
             }
             Err(_) => false,
         }
