@@ -24,9 +24,21 @@ fn mutation_gate_open() -> bool {
 fn pinned_manager(
     tag: &str,
     kind: BackendKind,
-) -> std::result::Result<osdns::DnsManager, osdns::Error> {
+) -> std::result::Result<(osdns::DnsManager, TestDir), osdns::Error> {
     let dir = temp_dir(tag);
-    manager_for_backend("io.osdns.matrix", &dir, kind, Duration::from_secs(30))
+    let manager = manager_for_backend("io.osdns.matrix", &dir, kind, Duration::from_secs(30))?;
+    Ok((manager, dir))
+}
+
+#[test]
+fn pinned_manager_retains_its_state_directory() {
+    let (manager, state_dir) = pinned_manager("matrix-state-dir", BackendKind::Fake).unwrap();
+    assert!(state_dir.is_dir());
+    let config = DnsConfig::builder(DnsScope::Global)
+        .nameserver(ip("127.0.0.1"))
+        .build()
+        .unwrap();
+    manager.apply(&config).unwrap().restore().unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -46,13 +58,14 @@ fn matrix_systemd_resolved_lifecycle() {
     if !mutation_gate_open() {
         return;
     }
-    let manager = match pinned_manager("matrix-resolved", BackendKind::SystemdResolved) {
-        Ok(manager) => manager,
-        Err(Error::BackendUnavailable(_)) => {
-            panic!("gate is open: systemd-resolved must be available on this VM")
-        }
-        Err(error) => panic!("unexpected error: {error}"),
-    };
+    let (manager, _state_dir) =
+        match pinned_manager("matrix-resolved", BackendKind::SystemdResolved) {
+            Ok(pair) => pair,
+            Err(Error::BackendUnavailable(_)) => {
+                panic!("gate is open: systemd-resolved must be available on this VM")
+            }
+            Err(error) => panic!("unexpected error: {error}"),
+        };
     assert_eq!(
         manager.capabilities().unwrap().backend,
         BackendKind::SystemdResolved
@@ -86,8 +99,8 @@ fn matrix_network_manager_lifecycle() {
     if !mutation_gate_open() {
         return;
     }
-    let manager = match pinned_manager("matrix-nm", BackendKind::NetworkManager) {
-        Ok(manager) => manager,
+    let (manager, _state_dir) = match pinned_manager("matrix-nm", BackendKind::NetworkManager) {
+        Ok(pair) => pair,
         Err(Error::BackendUnavailable(_)) => {
             // NM not running on this VM: the availability check is the point.
             return;
@@ -121,8 +134,8 @@ fn matrix_resolvconf_lifecycle() {
     if !mutation_gate_open() {
         return;
     }
-    let manager = match pinned_manager("matrix-resolvconf", BackendKind::Resolvconf) {
-        Ok(manager) => manager,
+    let (manager, _state_dir) = match pinned_manager("matrix-resolvconf", BackendKind::Resolvconf) {
+        Ok(pair) => pair,
         Err(Error::BackendUnavailable(_)) => {
             panic!("gate is open: openresolv must be installed on this VM")
         }
@@ -159,8 +172,8 @@ fn matrix_direct_resolv_conf_lifecycle() {
     let Ok(original) = std::fs::read("/etc/resolv.conf") else {
         return;
     };
-    let manager = match pinned_manager("matrix-direct", BackendKind::ResolvConfFile) {
-        Ok(manager) => manager,
+    let (manager, _state_dir) = match pinned_manager("matrix-direct", BackendKind::ResolvConfFile) {
+        Ok(pair) => pair,
         Err(error) => panic!("unexpected error: {error}"),
     };
     assert_eq!(
@@ -200,8 +213,8 @@ fn matrix_windows_ip_helper_and_nrpt_lifecycle(#[case] servers: &[&str]) {
     if !mutation_gate_open() {
         return;
     }
-    let manager = match pinned_manager("matrix-win", BackendKind::WindowsIpHelper) {
-        Ok(manager) => manager,
+    let (manager, _state_dir) = match pinned_manager("matrix-win", BackendKind::WindowsIpHelper) {
+        Ok(pair) => pair,
         Err(error) => panic!("unexpected error: {error}"),
     };
     let target = windows_test_interface(&manager);
@@ -238,10 +251,11 @@ fn matrix_macos_system_configuration_and_resolver_files() {
     if !mutation_gate_open() {
         return;
     }
-    let manager = match pinned_manager("matrix-macos", BackendKind::MacosSystemConfiguration) {
-        Ok(manager) => manager,
-        Err(error) => panic!("unexpected error: {error}"),
-    };
+    let (manager, _state_dir) =
+        match pinned_manager("matrix-macos", BackendKind::MacosSystemConfiguration) {
+            Ok(pair) => pair,
+            Err(error) => panic!("unexpected error: {error}"),
+        };
     let scope = DnsScope::Interface(InterfaceSelector::Default);
     let config = DnsConfig::builder(scope.clone())
         .nameserver(ip("127.0.0.1"))
