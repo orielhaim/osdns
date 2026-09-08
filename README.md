@@ -47,7 +47,7 @@ Platform capabilities are exposed at runtime through `DnsManager::capabilities()
 
 ```toml
 [dependencies]
-osdns = "0.1"
+osdns = "0.2"
 ```
 
 Create a manager with an application-specific owner identifier:
@@ -347,7 +347,7 @@ The `resolvconf` / `openresolv` fallback invokes the corresponding utility direc
 The default feature set is empty.
 
 ```toml
-osdns = { version = "0.1", features = ["tracing"] }
+osdns = { version = "0.2", features = ["tracing"] }
 ```
 
 ### `tracing`

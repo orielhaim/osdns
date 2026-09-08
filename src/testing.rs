@@ -14,7 +14,9 @@
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -29,6 +31,34 @@ use crate::watch::{DnsEvent, SuppressionRegistry};
 
 pub use crate::fault::TxPoint;
 pub use crate::platform::fake::{FakeOp, FakeState};
+
+/// Exercises journal decoding without reading or mutating operating-system state.
+pub fn decode_journal_for_fuzzing(bytes: &[u8]) -> Result<()> {
+    crate::journal::decode_for_fuzzing(bytes)
+}
+
+/// Exercises resolv.conf parsing without platform I/O.
+pub fn parse_resolv_conf_for_fuzzing(bytes: &[u8]) -> Result<()> {
+    crate::platform::text_config::parse_resolv_conf_content(bytes).map(|_| ())
+}
+
+/// Exercises systemd-resolved and NetworkManager domain conversion.
+pub fn parse_linux_domains_for_fuzzing(entries: &[String]) {
+    let resolved: Vec<(String, bool)> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.clone(), index % 2 == 0))
+        .collect();
+    let _ = crate::platform::text_config::resolved_domains_to_public(&resolved);
+    let _ = crate::platform::text_config::parse_nm_search_entries(entries);
+}
+
+/// Exercises pure Windows GUID and address-list parsing on Windows.
+#[cfg(target_os = "windows")]
+pub fn parse_windows_strings_for_fuzzing(text: &str) {
+    let _ = crate::platform::windows::interface::parse_guid(text);
+    let _ = crate::platform::windows::interface::parse_address_list(text);
+}
 
 /// Handle for driving the in-memory fake backend from tests.
 ///
@@ -315,7 +345,7 @@ pub fn manager_for_testing_with_policy(
         suppressions: std::sync::Arc::new(SuppressionRegistry::new()),
         active: Mutex::new(HashMap::new()),
         lease_tokens: Mutex::new(HashMap::new()),
-        reconciler: crate::reconciliation::Reconciler::default(),
+        reconciler: Arc::new(crate::reconciliation::Reconciler::default()),
         enforce: Mutex::new(crate::manager::EnforceState::default()),
     })))
 }
@@ -349,7 +379,7 @@ pub fn manager_for_backend(
         suppressions: std::sync::Arc::new(SuppressionRegistry::new()),
         active: Mutex::new(HashMap::new()),
         lease_tokens: Mutex::new(HashMap::new()),
-        reconciler: crate::reconciliation::Reconciler::default(),
+        reconciler: Arc::new(crate::reconciliation::Reconciler::default()),
         enforce: Mutex::new(crate::manager::EnforceState::default()),
     })))
 }
@@ -398,10 +428,7 @@ impl FaultInjector {
 
     /// Simulates abrupt process death when the transaction reaches `point`.
     pub fn crash_at(&self, point: TxPoint) -> &Self {
-        self.actions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(point, FaultSpec::Crash);
+        self.actions.lock().insert(point, FaultSpec::Crash);
         self
     }
 
@@ -410,36 +437,24 @@ impl FaultInjector {
     pub fn fail_at(&self, point: TxPoint, message: impl Into<String>) -> &Self {
         self.actions
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(point, FaultSpec::Fail(message.into()));
         self
     }
 
     /// Removes the action armed at `point`.
     pub fn disarm(&self, point: TxPoint) {
-        self.actions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&point);
+        self.actions.lock().remove(&point);
     }
 
     /// Removes all armed actions.
     pub fn clear(&self) {
-        self.actions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.actions.lock().clear();
     }
 }
 
 impl FaultHook for FaultInjector {
     fn on_point(&self, point: TxPoint) -> FaultAction {
-        match self
-            .actions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&point)
-        {
+        match self.actions.lock().get(&point) {
             Some(FaultSpec::Crash) => FaultAction::Crash,
             Some(FaultSpec::Fail(message)) => FaultAction::Fail(message.clone()),
             None => FaultAction::Continue,

@@ -18,8 +18,10 @@ use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{NmDnsFields, parse_nm_dns_fields};
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
-use crate::platform::{ResourceIdentity, ResourceStatus};
+use crate::platform::{
+    ApplyReceipt, Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    SnapshotData,
+};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
@@ -230,15 +232,13 @@ impl NetworkManager {
         fields: &NmDnsFields,
         version: u64,
     ) -> Result<PlatformSnapshot> {
-        let data = serde_json::to_value(&NmSnapshotData {
-            fields: fields.clone(),
-            version,
-        })
-        .map_err(|e| Error::platform(BackendKind::NetworkManager, format_args!("{e}")))?;
         Ok(PlatformSnapshot::new(
             BackendKind::NetworkManager,
             resource.clone(),
-            data,
+            SnapshotData::NetworkManager(NmSnapshotData {
+                fields: fields.clone(),
+                version,
+            }),
         ))
     }
 
@@ -247,12 +247,12 @@ impl NetworkManager {
     }
 
     fn snapshot_data(snapshot: &PlatformSnapshot) -> Result<NmSnapshotData> {
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::NetworkManager,
-                format_args!("snapshot data cannot be interpreted: {e}"),
-            )
-        })
+        match &snapshot.data {
+            SnapshotData::NetworkManager(data) => Ok(data.clone()),
+            _ => Err(Error::JournalCorrupt(
+                "NetworkManager snapshot has the wrong backend data".to_string(),
+            )),
+        }
     }
 
     fn version_from_snapshot(snapshot: &PlatformSnapshot) -> u64 {
@@ -344,8 +344,8 @@ fn dbus_error(error: zbus::Error) -> Error {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct NmSnapshotData {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct NmSnapshotData {
     fields: crate::platform::text_config::NmDnsFields,
     /// `version_id` from `GetAppliedConnection` at capture time. `0`
     /// carries no compare-and-swap token, so guarded operations using it
@@ -353,9 +353,9 @@ struct NmSnapshotData {
     version: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NmResourceIdentity {
+pub(crate) struct NmResourceIdentity {
     ifname: String,
     device_path: String,
     active_path: String,
@@ -373,9 +373,12 @@ impl NmResourceIdentity {
         let selector_name = NetworkManager::ifname_of(&identity.resource).map_err(|_| {
             Error::JournalCorrupt("invalid NetworkManager resource selector".to_string())
         })?;
-        let decoded: Self = serde_json::from_value(identity.data.clone()).map_err(|error| {
-            Error::JournalCorrupt(format!("invalid NetworkManager resource identity: {error}"))
-        })?;
+        let IdentityData::NetworkManager(decoded) = &identity.data else {
+            return Err(Error::JournalCorrupt(
+                "NetworkManager identity has the wrong backend data".to_string(),
+            ));
+        };
+        let decoded = decoded.clone();
         if decoded.ifname != selector_name
             || zbus::names::UniqueName::try_from(decoded.service_owner.as_str()).is_err()
             || OwnedObjectPath::try_from(decoded.device_path.as_str()).is_err()
@@ -558,8 +561,7 @@ impl Backend for NetworkManager {
         Ok(ResourceIdentity::new(
             BackendKind::NetworkManager,
             resource.clone(),
-            serde_json::to_value(data)
-                .map_err(|error| Error::platform(BackendKind::NetworkManager, error))?,
+            IdentityData::NetworkManager(data),
         ))
     }
 
@@ -643,8 +645,7 @@ impl Backend for NetworkManager {
         let identity = ResourceIdentity::new(
             BackendKind::NetworkManager,
             resource.clone(),
-            serde_json::to_value(data)
-                .map_err(|error| Error::platform(BackendKind::NetworkManager, error))?,
+            IdentityData::NetworkManager(data),
         );
         let fields = parse_nm_dns_fields(&convert_settings(&settings));
         let snapshot = Self::to_platform_snapshot(resource, &fields, version)?;
@@ -1156,26 +1157,28 @@ mod identity_tests {
         let resource: crate::ResourceId = "linux:network-manager:ifname:eth0".parse().unwrap();
         let valid_uuid = uuid::Uuid::new_v4();
         for data in [
-            serde_json::json!({}),
-            serde_json::json!({
-                "ifname": "renamed0", "device_path": "/org/freedesktop/NetworkManager/Devices/1",
-                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/1",
-                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            crate::platform::IdentityData::Untracked,
+            crate::platform::IdentityData::NetworkManager(NmResourceIdentity {
+                ifname: "renamed0".to_string(),
+                device_path: "/org/freedesktop/NetworkManager/Devices/1".to_string(),
+                active_path: "/org/freedesktop/NetworkManager/ActiveConnection/1".to_string(),
+                connection_uuid: valid_uuid,
+                service_owner: ":1.42".to_string(),
             }),
-            serde_json::json!({
-                "ifname": "eth0", "device_path": "not/a/path",
-                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/1",
-                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            crate::platform::IdentityData::NetworkManager(NmResourceIdentity {
+                ifname: "eth0".to_string(),
+                device_path: "not/a/path".to_string(),
+                active_path: "/org/freedesktop/NetworkManager/ActiveConnection/1".to_string(),
+                connection_uuid: valid_uuid,
+                service_owner: ":1.42".to_string(),
             }),
-            serde_json::json!({
-                "ifname": "eth0", "device_path": "/org/freedesktop/NetworkManager/Devices/1",
-                "active_path": "/", "connection_uuid": "not-a-uuid",
-                "service_owner": "org.freedesktop.NetworkManager"
-            }),
-            serde_json::json!({
-                "ifname": "eth0", "device_path": "/unrelated/Devices/1",
-                "active_path": "/org/freedesktop/NetworkManager/ActiveConnection/not_numeric",
-                "connection_uuid": valid_uuid, "service_owner": ":1.42"
+            crate::platform::IdentityData::NetworkManager(NmResourceIdentity {
+                ifname: "eth0".to_string(),
+                device_path: "/unrelated/Devices/1".to_string(),
+                active_path: "/org/freedesktop/NetworkManager/ActiveConnection/not_numeric"
+                    .to_string(),
+                connection_uuid: valid_uuid,
+                service_owner: ":1.42".to_string(),
             }),
         ] {
             let identity =

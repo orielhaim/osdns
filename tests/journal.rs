@@ -202,10 +202,9 @@ fn malformed_backend_identity_cannot_trigger_destructive_recovery() {
     record["identity"]["data"] = json!({ "incarnation": "not-a-number" });
     std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 
-    let outcomes = fixture.manager.recover_stale().unwrap();
     assert!(matches!(
-        &outcomes[..],
-        [osdns::RecoveryOutcome::Failed { .. }]
+        fixture.manager.recover_stale(),
+        Err(Error::JournalCorrupt(_))
     ));
     assert_eq!(journal_files(&fixture.dir).len(), 1);
     assert_eq!(

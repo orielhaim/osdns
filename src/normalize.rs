@@ -76,7 +76,7 @@ impl std::str::FromStr for DnsSuffix {
 
 impl Serialize for DnsSuffix {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        serializer.serialize_str(if self.is_root() { "." } else { self.as_str() })
     }
 }
 
@@ -93,7 +93,7 @@ fn normalize_domain(input: &str) -> Result<String> {
     if core.is_empty() {
         return Ok(String::new());
     }
-    let ascii = idna::domain_to_ascii(core)
+    let ascii = idna::domain_to_ascii_cow(core.as_bytes(), idna::AsciiDenyList::EMPTY)
         .map_err(|_| Error::invalid_config(format_args!("invalid DNS domain {input:?}")))?;
     let mut total = 0usize;
     for label in ascii.split('.') {
@@ -127,7 +127,7 @@ fn normalize_domain(input: &str) -> Result<String> {
             "domain {input:?} exceeds the maximum DNS name length"
         )));
     }
-    Ok(ascii)
+    Ok(ascii.into_owned())
 }
 
 /// The canonical, validated form of a [`crate::DnsConfig`] handed to a

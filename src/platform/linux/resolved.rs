@@ -1,9 +1,9 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fs::File;
 use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
@@ -24,7 +24,10 @@ use crate::platform::text_config::{
     resolved_dns_from_plan, resolved_dns_to_nameservers, resolved_domains_from_plan,
     resolved_domains_to_public,
 };
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, ResourceIdentity, ResourceStatus};
+use crate::platform::{
+    ApplyReceipt, Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    SnapshotData,
+};
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const RESOLVED_SERVICE: &str = "org.freedesktop.resolve1";
@@ -105,9 +108,9 @@ pub(crate) struct SystemdResolved {
     live_links: Mutex<HashMap<String, File>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ResolvedIdentity {
+pub(crate) struct ResolvedIdentity {
     boot_id: uuid::Uuid,
     netns: String,
     ifindex: u32,
@@ -163,9 +166,12 @@ impl ResolvedIdentity {
                 "resolved identity has the wrong backend".to_string(),
             ));
         }
-        let decoded: Self = serde_json::from_value(identity.data.clone()).map_err(|error| {
-            Error::JournalCorrupt(format!("invalid resolved identity: {error}"))
-        })?;
+        let IdentityData::SystemdResolved(decoded) = &identity.data else {
+            return Err(Error::JournalCorrupt(
+                "resolved identity has the wrong backend data".to_string(),
+            ));
+        };
+        let decoded = decoded.clone();
         decoded.validate(&identity.resource)?;
         Ok(decoded)
     }
@@ -430,13 +436,11 @@ impl Backend for SystemdResolved {
         data.validate(resource)?;
         self.live_links
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
             .insert(handle.simple().to_string(), file);
         Ok(ResourceIdentity::new(
             BackendKind::SystemdResolved,
             resource.clone(),
-            serde_json::to_value(data)
-                .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?,
+            IdentityData::SystemdResolved(data),
         ))
     }
 
@@ -452,7 +456,7 @@ impl Backend for SystemdResolved {
         else {
             return Ok(ResourceStatus::Gone);
         };
-        let handles = self.live_links.lock().unwrap_or_else(|p| p.into_inner());
+        let handles = self.live_links.lock();
         let live_inodes = if let Some(original) = handles.get(&old.handle.simple().to_string()) {
             Some((original.metadata()?.ino(), current_file.metadata()?.ino()))
         } else {
@@ -593,22 +597,20 @@ fn to_platform_snapshot(
     resource: &ResourceId,
     snapshot: ResolvedSnapshot,
 ) -> Result<PlatformSnapshot> {
-    let data = serde_json::to_value(&snapshot)
-        .map_err(|e| Error::platform(BackendKind::SystemdResolved, format_args!("{e}")))?;
     Ok(PlatformSnapshot::new(
         BackendKind::SystemdResolved,
         resource.clone(),
-        data,
+        SnapshotData::SystemdResolved(snapshot),
     ))
 }
 
 fn from_platform_snapshot(snapshot: &PlatformSnapshot) -> Result<ResolvedSnapshot> {
-    serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-        Error::platform(
-            BackendKind::SystemdResolved,
-            format_args!("snapshot data cannot be interpreted: {e}"),
-        )
-    })
+    match &snapshot.data {
+        SnapshotData::SystemdResolved(data) => Ok(data.clone()),
+        _ => Err(Error::JournalCorrupt(
+            "resolved snapshot has the wrong backend data".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -709,14 +711,11 @@ mod resource_identity_tests {
     #[test]
     fn malformed_persisted_resolved_identity_is_rejected() {
         let resource: crate::ResourceId = "linux:resolved:ifindex:8".parse().unwrap();
+        let mut mismatched = identity();
+        mismatched.ifindex = 9;
         for data in [
-            serde_json::json!({}),
-            serde_json::json!({ "boot_id": 7 }),
-            serde_json::json!({
-                "boot_id": uuid::Uuid::new_v4(), "netns": "net:[]", "ifindex": 9,
-                "ifname": "tun0", "iflink": 8, "address": null, "uevent": null,
-                "handle": uuid::Uuid::new_v4()
-            }),
+            crate::platform::IdentityData::Untracked,
+            crate::platform::IdentityData::SystemdResolved(mismatched),
         ] {
             let identity = crate::platform::ResourceIdentity::new(
                 crate::BackendKind::SystemdResolved,

@@ -42,7 +42,7 @@ use crate::platform::windows::interface::{
     adapter_for_selector, get_dns_settings, get_ipv6_dns_settings, list_adapters,
     parse_address_list, set_dns_settings,
 };
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod cache;
@@ -181,22 +181,26 @@ impl WindowsBackend {
         resource: &ResourceId,
         snapshot: &WindowsSnapshot,
     ) -> Result<PlatformSnapshot> {
-        let data = serde_json::to_value(snapshot)
-            .map_err(|e| Error::platform(BackendKind::WindowsIpHelper, format_args!("{e}")))?;
         Ok(PlatformSnapshot::new(
             BackendKind::WindowsIpHelper,
             resource.clone(),
-            data,
+            SnapshotData::WindowsIpHelper(snapshot.clone()),
         ))
     }
 
     fn parse_snapshot(&self, snapshot: &PlatformSnapshot) -> Result<WindowsSnapshot> {
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::WindowsIpHelper,
-                format_args!("snapshot data cannot be interpreted: {e}"),
-            )
-        })
+        #[cfg(not(feature = "test-util"))]
+        {
+            let SnapshotData::WindowsIpHelper(data) = &snapshot.data;
+            Ok(data.clone())
+        }
+        #[cfg(feature = "test-util")]
+        match &snapshot.data {
+            SnapshotData::WindowsIpHelper(data) => Ok(data.clone()),
+            _ => Err(Error::JournalCorrupt(
+                "Windows snapshot has the wrong backend data".to_string(),
+            )),
+        }
     }
 }
 
@@ -503,7 +507,7 @@ mod tests {
         let mut builder = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Index(1)))
             .nameservers(ns.iter().map(|s| s.parse().unwrap()));
         for domain in routing {
-            builder = builder.routing_domain(domain);
+            builder = builder.routing_domain(*domain);
         }
         crate::config::validate_against(
             &builder.build().unwrap(),

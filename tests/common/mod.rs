@@ -3,30 +3,41 @@
 
 use std::fs;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::Path;
 use std::time::Duration;
 
 pub use osdns::testing::{FakeDns, manager_for_testing};
 use osdns::{BackendKind, Capabilities, DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 
-static COUNTER: AtomicUsize = AtomicUsize::new(0);
+pub struct TestDir(tempfile::TempDir);
 
-pub fn temp_dir(tag: &str) -> PathBuf {
-    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("osdns-{tag}-{}-{nanos}-{id}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
+impl std::ops::Deref for TestDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.path()
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for TestDir {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.path().as_os_str()
+    }
+}
+
+pub fn temp_dir(tag: &str) -> TestDir {
+    TestDir(
+        tempfile::Builder::new()
+            .prefix(&format!("osdns-{tag}-"))
+            .tempdir()
+            .unwrap(),
+    )
 }
 
 pub struct Fixture {
     pub manager: DnsManager,
     pub fake: FakeDns,
-    pub dir: PathBuf,
+    pub dir: TestDir,
 }
 
 pub fn new_fixture(tag: &str) -> Fixture {
@@ -122,7 +133,7 @@ pub fn new_multi_fixture(tag: &str) -> Fixture {
 pub fn routing_config(domains: &[&str]) -> DnsConfig {
     let mut builder = DnsConfig::builder(iface_scope(1)).nameserver(ip("1.1.1.1"));
     for domain in domains {
-        builder = builder.routing_domain(domain);
+        builder = builder.routing_domain(*domain);
     }
     builder.build().unwrap()
 }

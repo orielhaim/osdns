@@ -9,8 +9,6 @@ pub(crate) mod text_config;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
-use serde::{Deserialize, Serialize};
-
 use crate::capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope};
 use crate::error::{Error, Result};
@@ -24,25 +22,54 @@ use crate::watch::{WatchCallback, WatchHandle};
 /// Only the backend that produced a snapshot can interpret it. Snapshots are
 /// serialized into journals so restoration works after crashes and reboots.
 /// They must retain enough native state for lossless restoration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlatformSnapshot {
     pub(crate) backend: BackendKind,
     pub(crate) resource: ResourceId,
-    pub(crate) data: serde_json::Value,
+    pub(crate) data: SnapshotData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SnapshotData {
+    #[cfg(feature = "test-util")]
+    Fake(fake::FakeSnapshotData),
+    #[cfg(target_os = "linux")]
+    SystemdResolved(linux::resolved::ResolvedSnapshot),
+    #[cfg(target_os = "linux")]
+    NetworkManager(linux::network_manager::NmSnapshotData),
+    #[cfg(target_os = "linux")]
+    Resolvconf(linux::resolvconf::ResolvconfSnapshot),
+    #[cfg(target_os = "linux")]
+    ResolvConfFile(linux::direct::DirectSnapshot),
+    #[cfg(target_os = "macos")]
+    MacosSystemConfiguration(macos::MacosSnapshot),
+    #[cfg(target_os = "windows")]
+    WindowsIpHelper(windows::WindowsSnapshot),
 }
 
 /// Backend-defined evidence naming the native resource incarnation that a
 /// journal record was created against.  This is deliberately separate from
 /// [`ResourceId`], which is only the current mutation/locking target.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResourceIdentity {
     pub(crate) backend: BackendKind,
     pub(crate) resource: ResourceId,
-    pub(crate) data: serde_json::Value,
+    pub(crate) data: IdentityData,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum IdentityData {
+    Untracked,
+    #[cfg(feature = "test-util")]
+    Fake(fake::FakeIdentity),
+    #[cfg(target_os = "linux")]
+    SystemdResolved(linux::resolved::ResolvedIdentity),
+    #[cfg(target_os = "linux")]
+    NetworkManager(linux::network_manager::NmResourceIdentity),
 }
 
 impl ResourceIdentity {
-    pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: serde_json::Value) -> Self {
+    pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: IdentityData) -> Self {
         Self {
             backend,
             resource,
@@ -76,7 +103,7 @@ pub(crate) struct BoundObservation {
 
 impl PlatformSnapshot {
     #[allow(dead_code)]
-    pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: serde_json::Value) -> Self {
+    pub(crate) fn new(backend: BackendKind, resource: ResourceId, data: SnapshotData) -> Self {
         Self {
             backend,
             resource,
@@ -195,7 +222,7 @@ pub(crate) trait Backend: Send + Sync {
         Ok(ResourceIdentity::new(
             self.kind(),
             resource.clone(),
-            serde_json::Value::Null,
+            IdentityData::Untracked,
         ))
     }
 

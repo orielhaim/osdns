@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
 
+use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
 use crate::capability::{BackendKind, Capabilities, MutationGuard, OwnershipIdentity};
@@ -13,7 +14,8 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::{
-    ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    ApplyReceipt, Backend, IdentityData, MutationAttempt, PlatformSnapshot, ResourceIdentity,
+    ResourceStatus, SnapshotData,
 };
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
@@ -165,16 +167,16 @@ struct FakeInner {
     before_unconditional_readback: Option<(ResourceId, FakeState)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct FakeIdentity {
+pub(crate) struct FakeIdentity {
     incarnation: u64,
 }
 
 /// Wire format of a fake snapshot: the managed state plus the generation
 /// the snapshot was captured at.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FakeSnapshotData {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FakeSnapshotData {
     state: FakeState,
     generation: u64,
 }
@@ -313,9 +315,7 @@ impl FakeBackend {
     }
 
     fn lock_inner(&self) -> MutexGuard<'_, FakeInner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock()
     }
 
     pub(crate) fn external_change(&self, resource: &ResourceId, state: FakeState) {
@@ -371,11 +371,7 @@ impl FakeBackend {
     /// function is called.
     pub(crate) fn block_next_start_watch(&self) -> impl FnOnce() + Send {
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        *self
-            .start_watch_block
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            Some(std::sync::Arc::clone(&barrier));
+        *self.start_watch_block.lock() = Some(std::sync::Arc::clone(&barrier));
         move || {
             barrier.wait();
         }
@@ -450,11 +446,7 @@ impl FakeBackend {
     }
 
     pub(crate) fn notify(&self, event: DnsEvent) {
-        let watchers = self
-            .watchers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let watchers = self.watchers.lock().clone();
         for (flag, callback) in watchers {
             if !flag.load(Ordering::Acquire) {
                 callback(&event);
@@ -467,16 +459,10 @@ impl FakeBackend {
             Error::BackendUnavailable(format!("resource {resource} is not present on this system"))
         })?;
         let generation = inner.generations.get(resource).copied().unwrap_or(0);
-        let data = serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
-            Error::platform(
-                BackendKind::Fake,
-                format_args!("fake state serialization failed: {e}"),
-            )
-        })?;
         Ok(PlatformSnapshot::new(
             BackendKind::Fake,
             resource.clone(),
-            data,
+            SnapshotData::Fake(FakeSnapshotData { state, generation }),
         ))
     }
 
@@ -527,16 +513,10 @@ impl FakeBackend {
             Error::BackendUnavailable(format!("resource {resource} is not present on this system"))
         })?;
         let generation = inner.generations.get(resource).copied().unwrap_or(0);
-        let data = serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
-            Error::platform(
-                BackendKind::Fake,
-                format_args!("fake state serialization failed: {e}"),
-            )
-        })?;
         Ok(PlatformSnapshot::new(
             BackendKind::Fake,
             resource.clone(),
-            data,
+            SnapshotData::Fake(FakeSnapshotData { state, generation }),
         ))
     }
 
@@ -554,12 +534,12 @@ impl FakeBackend {
                 ),
             ));
         }
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::Fake,
-                format_args!("snapshot data cannot be interpreted by this backend: {e}"),
-            )
-        })
+        match &snapshot.data {
+            SnapshotData::Fake(data) => Ok(data.clone()),
+            _ => Err(Error::JournalCorrupt(
+                "fake snapshot has the wrong backend data".to_string(),
+            )),
+        }
     }
 }
 
@@ -651,10 +631,9 @@ impl Backend for FakeBackend {
         Ok(ResourceIdentity::new(
             BackendKind::Fake,
             resource.clone(),
-            serde_json::to_value(FakeIdentity {
+            IdentityData::Fake(FakeIdentity {
                 incarnation: inner.incarnations.get(resource).copied().unwrap_or(0),
-            })
-            .map_err(|error| Error::platform(BackendKind::Fake, error))?,
+            }),
         ))
     }
 
@@ -671,19 +650,19 @@ impl Backend for FakeBackend {
         let identity = ResourceIdentity::new(
             BackendKind::Fake,
             resource.clone(),
-            serde_json::to_value(FakeIdentity {
+            IdentityData::Fake(FakeIdentity {
                 incarnation: inner.incarnations.get(resource).copied().unwrap_or(0),
-            })
-            .map_err(|error| Error::platform(BackendKind::Fake, error))?,
+            }),
         );
         if let Some((wanted, state)) = inner.replace_during_observe.take() {
             inner.states.insert(wanted.clone(), state);
             *inner.incarnations.entry(wanted.clone()).or_insert(0) += 1;
             *inner.generations.entry(wanted).or_insert(0) += 1;
         }
-        let observed_incarnation = serde_json::from_value::<FakeIdentity>(identity.data.clone())
-            .expect("fresh fake identity")
-            .incarnation;
+        let IdentityData::Fake(data) = &identity.data else {
+            unreachable!("fresh fake identity")
+        };
+        let observed_incarnation = data.incarnation;
         if inner.incarnations.get(resource).copied().unwrap_or(0) != observed_incarnation {
             return Err(Error::ResourceIdentity {
                 backend: BackendKind::Fake,
@@ -702,10 +681,11 @@ impl Backend for FakeBackend {
                 "fake identity has the wrong backend".to_string(),
             ));
         }
-        let decoded: FakeIdentity =
-            serde_json::from_value(identity.data.clone()).map_err(|error| {
-                Error::JournalCorrupt(format!("invalid fake resource identity: {error}"))
-            })?;
+        let IdentityData::Fake(decoded) = &identity.data else {
+            return Err(Error::JournalCorrupt(
+                "fake identity has the wrong backend data".to_string(),
+            ));
+        };
         let inner = self.lock_inner();
         if inner.ambiguous.contains(&identity.resource) {
             return Ok(ResourceStatus::Ambiguous);
@@ -787,17 +767,10 @@ impl Backend for FakeBackend {
                     .get(resource)
                     .copied()
                     .unwrap_or(0);
-                let data =
-                    serde_json::to_value(&FakeSnapshotData { state, generation }).map_err(|e| {
-                        Error::platform(
-                            BackendKind::Fake,
-                            format_args!("fake state serialization failed: {e}"),
-                        )
-                    })?;
                 Ok(PlatformSnapshot::new(
                     BackendKind::Fake,
                     resource.clone(),
-                    data,
+                    SnapshotData::Fake(FakeSnapshotData { state, generation }),
                 ))
             }
             None => self.snapshot_of(resource),
@@ -1068,20 +1041,12 @@ impl Backend for FakeBackend {
                 "watching is disabled for this fake backend",
             ));
         }
-        if let Some(barrier) = self
-            .start_watch_block
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(barrier) = self.start_watch_block.lock().take() {
             barrier.wait();
         }
         let flag = Arc::new(AtomicBool::new(false));
         {
-            let mut watchers = self
-                .watchers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut watchers = self.watchers.lock();
             watchers.push((Arc::clone(&flag), callback));
         }
         let watchers = Arc::clone(&self.watchers);
@@ -1089,7 +1054,6 @@ impl Backend for FakeBackend {
         Ok(WatchHandle::new(flag, move || {
             watchers
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .retain(|(existing, _)| !Arc::ptr_eq(existing, &cancel_flag));
         }))
     }

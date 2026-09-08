@@ -12,7 +12,7 @@ use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 // openresolv uses interfaces (3.x) or keys (4.x); Debian resolvconf
@@ -210,27 +210,23 @@ fn snapshot_to_platform(
     resource: &ResourceId,
     content: Option<Vec<u8>>,
 ) -> Result<PlatformSnapshot> {
-    let data = serde_json::to_value(ResolvconfSnapshot { content })
-        .map_err(|e| Error::platform(BackendKind::Resolvconf, format_args!("{e}")))?;
     Ok(PlatformSnapshot::new(
         BackendKind::Resolvconf,
         resource.clone(),
-        data,
+        SnapshotData::Resolvconf(ResolvconfSnapshot { content }),
     ))
 }
 
 fn snapshot_from_platform(snapshot: &PlatformSnapshot) -> Result<Option<Vec<u8>>> {
-    let parsed: ResolvconfSnapshot =
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::Resolvconf,
-                format_args!("snapshot data cannot be interpreted: {e}"),
-            )
-        })?;
-    Ok(parsed.content)
+    match &snapshot.data {
+        SnapshotData::Resolvconf(data) => Ok(data.content.clone()),
+        _ => Err(Error::JournalCorrupt(
+            "resolvconf snapshot has the wrong backend data".to_string(),
+        )),
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ResolvconfSnapshot {
     pub(crate) content: Option<Vec<u8>>,
 }

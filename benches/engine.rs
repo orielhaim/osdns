@@ -27,20 +27,19 @@ fn config(ns: &str) -> DnsConfig {
 }
 
 fn bench_snapshot(c: &mut Criterion) {
-    let dir = std::env::temp_dir().join(format!("osdns-bench-snapshot-{}", std::process::id()));
-    let manager = bench_manager(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let manager = bench_manager(dir.path());
     c.bench_function("snapshot", |b| {
         b.iter(|| {
             let state = manager.snapshot(&DnsScope::Interface(InterfaceSelector::Index(1)));
             black_box(state).unwrap();
         })
     });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn bench_noop_apply(c: &mut Criterion) {
-    let dir = std::env::temp_dir().join(format!("osdns-bench-noop-{}", std::process::id()));
-    let manager = bench_manager(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let manager = bench_manager(dir.path());
     let config = config("1.1.1.1");
     {
         let lease = manager.apply(&config).unwrap();
@@ -52,12 +51,11 @@ fn bench_noop_apply(c: &mut Criterion) {
             black_box(lease.is_noop());
         })
     });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn bench_apply_verify_restore(c: &mut Criterion) {
-    let dir = std::env::temp_dir().join(format!("osdns-bench-cycle-{}", std::process::id()));
-    let manager = bench_manager(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let manager = bench_manager(dir.path());
     c.bench_function("apply_verify_restore", |b| {
         b.iter(|| {
             let lease = manager.apply(black_box(&config("1.1.1.1"))).unwrap();
@@ -65,12 +63,11 @@ fn bench_apply_verify_restore(c: &mut Criterion) {
             lease.restore().unwrap();
         })
     });
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn bench_alternating_updates(c: &mut Criterion) {
-    let dir = std::env::temp_dir().join(format!("osdns-bench-update-{}", std::process::id()));
-    let manager = bench_manager(&dir);
+    let dir = tempfile::tempdir().unwrap();
+    let manager = bench_manager(dir.path());
     let lease = manager.apply(&config("1.1.1.1")).unwrap();
     let mut toggle = false;
     c.bench_function("alternating_update", |b| {
@@ -81,7 +78,6 @@ fn bench_alternating_updates(c: &mut Criterion) {
         })
     });
     lease.restore().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 criterion_group!(

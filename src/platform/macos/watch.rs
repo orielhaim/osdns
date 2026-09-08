@@ -8,11 +8,12 @@
 //! stopped from the cancel closures on another thread, never from inside a
 //! callback.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::thread;
 
+use parking_lot::Mutex;
 use system_configuration::core_foundation::array::CFArray;
 use system_configuration::core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
 use system_configuration::core_foundation::string::CFString;
@@ -25,7 +26,7 @@ use crate::ownership::ResourceId;
 use crate::watch::{DnsEvent, WatchCallback};
 
 struct WatchState {
-    sender: mpsc::Sender<ResourceId>,
+    callback: WatchCallback,
 }
 
 fn sc_callout(_store: SCDynamicStore, changed_keys: CFArray<CFString>, info: &mut WatchState) {
@@ -40,7 +41,7 @@ fn sc_callout(_store: SCDynamicStore, changed_keys: CFArray<CFString>, info: &mu
             None
         };
         if let Some(resource) = resource {
-            let _ = info.sender.send(resource);
+            (info.callback)(&DnsEvent::ResourceChanged { resource });
         }
     }
 }
@@ -55,32 +56,15 @@ pub(crate) fn start_store_watch(
     flag: Arc<std::sync::atomic::AtomicBool>,
     callback: WatchCallback,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    let (tx, rx) = mpsc::channel::<ResourceId>();
     let shared: Arc<Mutex<Option<RunLoopHandle>>> = Arc::new(Mutex::new(None));
     let (notify_ready, ready) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
-
-    let worker_flag = flag.clone();
-    let worker = thread::Builder::new()
-        .name("osdns-sc-worker".to_string())
-        .spawn(move || {
-            for resource in rx {
-                if worker_flag.load(Ordering::Acquire) {
-                    break;
-                }
-                callback(&DnsEvent::ResourceChanged { resource });
-            }
-        })
-        .map_err(|e| Error::Platform {
-            backend: crate::capability::BackendKind::MacosSystemConfiguration,
-            message: format!("cannot spawn SC worker thread: {e}"),
-        })?;
 
     let thread_flag = flag.clone();
     let shared_for_thread = Arc::clone(&shared);
     let watch = thread::Builder::new()
         .name("osdns-sc-watch".to_string())
         .spawn(move || {
-            let state = WatchState { sender: tx };
+            let state = WatchState { callback };
             let context = SCDynamicStoreCallBackContext {
                 callout: sc_callout,
                 info: state,
@@ -115,9 +99,7 @@ pub(crate) fn start_store_watch(
             // SAFETY: kCFRunLoopCommonModes is a valid mode for the current
             // run loop.
             run_loop.add_source(&source, unsafe { kCFRunLoopCommonModes });
-            *shared_for_thread
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RunLoopHandle(run_loop));
+            *shared_for_thread.lock() = Some(RunLoopHandle(run_loop));
             let _ = notify_ready.send(Ok(()));
             if thread_flag.load(Ordering::Acquire) {
                 return;
@@ -134,7 +116,6 @@ pub(crate) fn start_store_watch(
         Ok(Err(message)) => {
             flag.store(true, Ordering::Release);
             let _ = watch.join();
-            let _ = worker.join();
             return Err(Error::Platform {
                 backend: crate::capability::BackendKind::MacosSystemConfiguration,
                 message,
@@ -143,7 +124,6 @@ pub(crate) fn start_store_watch(
         Err(_) => {
             flag.store(true, Ordering::Release);
             let _ = watch.join();
-            let _ = worker.join();
             return Err(Error::Platform {
                 backend: crate::capability::BackendKind::MacosSystemConfiguration,
                 message: "SystemConfiguration watch initialization terminated unexpectedly"
@@ -155,15 +135,11 @@ pub(crate) fn start_store_watch(
     let cancel_shared = Arc::clone(&shared);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        let handle = cancel_shared
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
+        let handle = cancel_shared.lock().take();
         if let Some(handle) = handle {
             handle.0.stop();
         }
         let _ = watch.join();
-        let _ = worker.join();
     }))
 }
 
@@ -191,8 +167,8 @@ pub(crate) fn start_resolver_watch(
 ) -> Result<Box<dyn FnOnce() + Send>> {
     use notify::Watcher;
 
-    let (tx, rx) = mpsc::channel::<DnsEvent>();
     let handler_flag = flag.clone();
+    let handler_callback = callback;
     let mut watcher = notify::recommended_watcher(
         move |event: std::result::Result<notify::Event, notify::Error>| {
             if handler_flag.load(Ordering::Acquire) {
@@ -209,7 +185,7 @@ pub(crate) fn start_resolver_watch(
                 } else {
                     DnsEvent::ResourceChanged { resource }
                 };
-                let _ = tx.send(event);
+                handler_callback(&event);
             }
         },
     )
@@ -231,26 +207,9 @@ pub(crate) fn start_resolver_watch(
             ),
         })?;
 
-    let worker_flag = flag.clone();
-    let worker = thread::Builder::new()
-        .name("osdns-resolver-worker".to_string())
-        .spawn(move || {
-            for event in rx {
-                if worker_flag.load(Ordering::Acquire) {
-                    break;
-                }
-                callback(&event);
-            }
-        })
-        .map_err(|e| Error::Platform {
-            backend: crate::capability::BackendKind::MacosSystemConfiguration,
-            message: format!("cannot spawn resolver worker thread: {e}"),
-        })?;
-
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
         drop(watcher);
-        let _ = worker.join();
     }))
 }
 #[cfg(test)]

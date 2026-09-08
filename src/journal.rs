@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::fsutil::{ensure_private_dir, fsync_dir};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
-use crate::platform::{PlatformSnapshot, ResourceIdentity};
+use crate::platform::{IdentityData, PlatformSnapshot, ResourceIdentity, SnapshotData};
 
 /// Current journal schema. Records with any other version are rejected
 /// (fail-closed) rather than guessed at.
@@ -33,9 +32,8 @@ pub(crate) enum Phase {
 
 /// One durable transaction record: what the resource looked like before, what
 /// we intended to apply, and (once known) what we actually applied.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct JournalRecord {
-    pub(crate) schema_version: u32,
     pub(crate) owner: String,
     pub(crate) lease_id: Uuid,
     pub(crate) resource: ResourceId,
@@ -45,6 +43,235 @@ pub(crate) struct JournalRecord {
     pub(crate) before: PlatformSnapshot,
     pub(crate) desired: NormalizedConfig,
     pub(crate) applied: Option<PlatformSnapshot>,
+}
+
+#[derive(Deserialize)]
+struct JournalRecordV3 {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    owner: String,
+    lease_id: Uuid,
+    resource: ResourceId,
+    backend: BackendKind,
+    identity: ResourceIdentityV3,
+    phase: Phase,
+    before: PlatformSnapshotV3,
+    desired: NormalizedConfig,
+    applied: Option<PlatformSnapshotV3>,
+}
+
+#[derive(Deserialize)]
+struct PlatformSnapshotV3 {
+    backend: BackendKind,
+    resource: ResourceId,
+    data: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ResourceIdentityV3 {
+    backend: BackendKind,
+    resource: ResourceId,
+    data: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct JournalRecordV3Ref<'a> {
+    schema_version: u32,
+    owner: &'a str,
+    lease_id: Uuid,
+    resource: &'a ResourceId,
+    backend: BackendKind,
+    identity: ResourceIdentityV3Ref<'a>,
+    phase: Phase,
+    before: PlatformSnapshotV3Ref<'a>,
+    desired: &'a NormalizedConfig,
+    applied: Option<PlatformSnapshotV3Ref<'a>>,
+}
+
+#[derive(Serialize)]
+struct PlatformSnapshotV3Ref<'a> {
+    backend: BackendKind,
+    resource: &'a ResourceId,
+    data: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct ResourceIdentityV3Ref<'a> {
+    backend: BackendKind,
+    resource: &'a ResourceId,
+    data: serde_json::Value,
+}
+
+impl<'a> TryFrom<&'a JournalRecord> for JournalRecordV3Ref<'a> {
+    type Error = String;
+
+    fn try_from(record: &'a JournalRecord) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            schema_version: SCHEMA_VERSION,
+            owner: &record.owner,
+            lease_id: record.lease_id,
+            resource: &record.resource,
+            backend: record.backend,
+            identity: ResourceIdentityV3Ref {
+                backend: record.identity.backend,
+                resource: &record.identity.resource,
+                data: encode_identity(&record.identity.data)?,
+            },
+            phase: record.phase,
+            before: PlatformSnapshotV3Ref::try_from(&record.before)?,
+            desired: &record.desired,
+            applied: record
+                .applied
+                .as_ref()
+                .map(PlatformSnapshotV3Ref::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+impl<'a> TryFrom<&'a PlatformSnapshot> for PlatformSnapshotV3Ref<'a> {
+    type Error = String;
+
+    fn try_from(snapshot: &'a PlatformSnapshot) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            backend: snapshot.backend,
+            resource: &snapshot.resource,
+            data: encode_snapshot(&snapshot.data)?,
+        })
+    }
+}
+
+impl TryFrom<JournalRecordV3> for JournalRecord {
+    type Error = String;
+
+    fn try_from(record: JournalRecordV3) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            owner: record.owner,
+            lease_id: record.lease_id,
+            resource: record.resource,
+            backend: record.backend,
+            identity: ResourceIdentity {
+                backend: record.identity.backend,
+                resource: record.identity.resource,
+                data: decode_identity(record.identity.backend, record.identity.data)?,
+            },
+            phase: record.phase,
+            before: record.before.try_into()?,
+            desired: record.desired,
+            applied: record.applied.map(TryInto::try_into).transpose()?,
+        })
+    }
+}
+
+impl TryFrom<PlatformSnapshotV3> for PlatformSnapshot {
+    type Error = String;
+
+    fn try_from(snapshot: PlatformSnapshotV3) -> std::result::Result<Self, Self::Error> {
+        Ok(Self {
+            backend: snapshot.backend,
+            resource: snapshot.resource,
+            data: decode_snapshot(snapshot.backend, snapshot.data)?,
+        })
+    }
+}
+
+fn encode_snapshot(data: &SnapshotData) -> std::result::Result<serde_json::Value, String> {
+    match data {
+        #[cfg(feature = "test-util")]
+        SnapshotData::Fake(value) => serde_json::to_value(value),
+        #[cfg(target_os = "linux")]
+        SnapshotData::SystemdResolved(value) => serde_json::to_value(value),
+        #[cfg(target_os = "linux")]
+        SnapshotData::NetworkManager(value) => serde_json::to_value(value),
+        #[cfg(target_os = "linux")]
+        SnapshotData::Resolvconf(value) => serde_json::to_value(value),
+        #[cfg(target_os = "linux")]
+        SnapshotData::ResolvConfFile(value) => serde_json::to_value(value),
+        #[cfg(target_os = "macos")]
+        SnapshotData::MacosSystemConfiguration(value) => serde_json::to_value(value),
+        #[cfg(target_os = "windows")]
+        SnapshotData::WindowsIpHelper(value) => serde_json::to_value(value),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn decode_snapshot(
+    backend: BackendKind,
+    data: serde_json::Value,
+) -> std::result::Result<SnapshotData, String> {
+    match backend {
+        #[cfg(feature = "test-util")]
+        BackendKind::Fake => serde_json::from_value(data).map(SnapshotData::Fake),
+        #[cfg(target_os = "linux")]
+        BackendKind::SystemdResolved => {
+            serde_json::from_value(data).map(SnapshotData::SystemdResolved)
+        }
+        #[cfg(target_os = "linux")]
+        BackendKind::NetworkManager => {
+            serde_json::from_value(data).map(SnapshotData::NetworkManager)
+        }
+        #[cfg(target_os = "linux")]
+        BackendKind::Resolvconf => serde_json::from_value(data).map(SnapshotData::Resolvconf),
+        #[cfg(target_os = "linux")]
+        BackendKind::ResolvConfFile => {
+            serde_json::from_value(data).map(SnapshotData::ResolvConfFile)
+        }
+        #[cfg(target_os = "macos")]
+        BackendKind::MacosSystemConfiguration => {
+            serde_json::from_value(data).map(SnapshotData::MacosSystemConfiguration)
+        }
+        #[cfg(target_os = "windows")]
+        BackendKind::WindowsIpHelper => {
+            serde_json::from_value(data).map(SnapshotData::WindowsIpHelper)
+        }
+        _ => return Err(format!("backend {backend} is unavailable on this platform")),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn encode_identity(data: &IdentityData) -> std::result::Result<serde_json::Value, String> {
+    match data {
+        IdentityData::Untracked => Ok(serde_json::Value::Null),
+        #[cfg(feature = "test-util")]
+        IdentityData::Fake(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+        #[cfg(target_os = "linux")]
+        IdentityData::SystemdResolved(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
+        #[cfg(target_os = "linux")]
+        IdentityData::NetworkManager(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn decode_identity(
+    backend: BackendKind,
+    data: serde_json::Value,
+) -> std::result::Result<IdentityData, String> {
+    match backend {
+        #[cfg(feature = "test-util")]
+        BackendKind::Fake => serde_json::from_value(data)
+            .map(IdentityData::Fake)
+            .map_err(|error| error.to_string()),
+        #[cfg(target_os = "linux")]
+        BackendKind::SystemdResolved => serde_json::from_value(data)
+            .map(IdentityData::SystemdResolved)
+            .map_err(|error| error.to_string()),
+        #[cfg(target_os = "linux")]
+        BackendKind::NetworkManager => serde_json::from_value(data)
+            .map(IdentityData::NetworkManager)
+            .map_err(|error| error.to_string()),
+        BackendKind::Resolvconf
+        | BackendKind::ResolvConfFile
+        | BackendKind::WindowsIpHelper
+        | BackendKind::MacosSystemConfiguration
+            if data.is_null() =>
+        {
+            Ok(IdentityData::Untracked)
+        }
+        _ => Err(format!("invalid identity data for backend {backend}")),
+    }
 }
 
 fn record_file_name(lease_id: &Uuid, resource: &ResourceId) -> String {
@@ -130,14 +357,19 @@ impl JournalStore {
             }
         }
         let path = record_path(&self.dir, &record.lease_id, &record.resource);
-        let bytes = serde_json::to_vec_pretty(record).map_err(|e| {
+        let durable = JournalRecordV3Ref::try_from(record).map_err(|e| {
+            Error::platform(
+                record.backend,
+                format_args!("journal record conversion failed: {e}"),
+            )
+        })?;
+        let mut file = atomic_write_file::AtomicWriteFile::open(&path)?;
+        serde_json::to_writer_pretty(&mut file, &durable).map_err(|e| {
             Error::platform(
                 record.backend,
                 format_args!("journal record serialization failed: {e}"),
             )
         })?;
-        let mut file = atomic_write_file::AtomicWriteFile::open(&path)?;
-        file.write_all(&bytes)?;
         file.sync_all()?;
         file.commit()?;
         fsync_dir(&self.dir)?;
@@ -177,17 +409,7 @@ impl JournalStore {
                 continue;
             }
             let bytes = fs::read(&path)?;
-            let envelope: JournalEnvelope = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
-            if envelope.schema_version != SCHEMA_VERSION {
-                return Err(Error::UnsupportedJournalVersion {
-                    path,
-                    found: envelope.schema_version,
-                    supported: SCHEMA_VERSION,
-                });
-            }
-            let record: JournalRecord = serde_json::from_slice(&bytes)
-                .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
+            let record = decode_record(&path, &bytes)?;
             if record.backend != record.before.backend
                 || record.backend != record.identity.backend
                 || record.resource != record.before.resource
@@ -213,4 +435,25 @@ impl JournalStore {
             .filter(|record| &record.resource == resource)
             .collect())
     }
+}
+
+fn decode_record(path: &Path, bytes: &[u8]) -> Result<JournalRecord> {
+    let envelope: JournalEnvelope = serde_json::from_slice(bytes)
+        .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
+    if envelope.schema_version != SCHEMA_VERSION {
+        return Err(Error::UnsupportedJournalVersion {
+            path: path.to_path_buf(),
+            found: envelope.schema_version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+    let durable: JournalRecordV3 = serde_json::from_slice(bytes)
+        .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
+    JournalRecord::try_from(durable)
+        .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))
+}
+
+#[cfg(feature = "test-util")]
+pub(crate) fn decode_for_fuzzing(bytes: &[u8]) -> Result<()> {
+    decode_record(Path::new("fuzz-journal.json"), bytes).map(|_| ())
 }

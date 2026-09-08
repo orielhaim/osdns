@@ -1,0 +1,11 @@
+examine_globs = [
+    "src/journal.rs",
+    "src/lease.rs",
+    "src/manager.rs",
+    "src/normalize.rs",
+    "src/ownership.rs",
+    "src/reconciliation.rs",
+]
+exclude_globs = ["src/platform/windows/ffi/**"]
+all_features = true
+additional_cargo_args = ["--locked"]

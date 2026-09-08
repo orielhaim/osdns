@@ -1,10 +1,11 @@
+use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashSet;
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,13 +25,13 @@ use crate::fsutil::ensure_private_dir;
 /// Obtain them from [`Lease::resources`](crate::Lease::resources) or [`RecoveryOutcome`](crate::RecoveryOutcome);
 /// parse with `"<id>".parse::<ResourceId>()`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceId(String);
+pub struct ResourceId(Arc<str>);
 
 impl ResourceId {
     pub(crate) fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         validate_resource_id(&value)?;
-        Ok(Self(value))
+        Ok(Self(value.into()))
     }
 
     /// The canonical string form, e.g. `linux:resolved:ifindex:7`.
@@ -113,7 +114,7 @@ impl<'de> Deserialize<'de> for ResourceId {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let raw = String::deserialize(deserializer)?;
         validate_resource_id(&raw).map_err(serde::de::Error::custom)?;
-        Ok(Self(raw))
+        Ok(Self(raw.into()))
     }
 }
 
@@ -134,9 +135,7 @@ pub(crate) const GLOBAL_LOCK_NAMESPACE: &str = "osdns:global-os";
 
 fn registry() -> MutexGuard<'static, Option<HashSet<RegistryKey>>> {
     static REGISTRY: Mutex<Option<HashSet<RegistryKey>>> = Mutex::new(None);
-    REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    REGISTRY.lock()
 }
 
 fn registry_contains(key: &RegistryKey) -> bool {

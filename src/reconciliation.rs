@@ -32,10 +32,12 @@
 //! expires.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use crate::error::Error;
 use crate::fault::TxPoint;
@@ -100,20 +102,14 @@ pub(crate) struct Reconciler {
 impl Reconciler {
     #[cfg(feature = "test-util")]
     pub(crate) fn is_pending(&self, resource: &ResourceId) -> bool {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(resource)
+        self.pending.lock().contains_key(resource)
     }
     /// Coalesces a watcher event into the pending set. An already-pending
     /// resource keeps its scheduled time: deferral windows (rate limit,
     /// circuit breaker, error backoff) are never bypassed by new events, and
     /// the deferred pass always reads the latest authoritative state.
     fn touch(&self, resource: ResourceId) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pending = self.pending.lock();
         pending.entry(resource).or_insert(Pending {
             ready_at: Instant::now(),
             consecutive_errors: 0,
@@ -121,10 +117,7 @@ impl Reconciler {
     }
 
     fn defer(&self, resource: &ResourceId, delay: Duration, failed: bool) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pending = self.pending.lock();
         let now = Instant::now();
         let entry = pending.entry(resource.clone()).or_insert(Pending {
             ready_at: now + delay,
@@ -137,25 +130,16 @@ impl Reconciler {
     }
 
     fn remove(&self, resource: &ResourceId) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(resource);
+        self.pending.lock().remove(resource);
     }
 
     #[cfg(feature = "test-util")]
     pub(crate) fn clear(&self) {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
+        self.pending.lock().clear();
     }
 
     fn breaker_gate(&self, resource: &ResourceId) -> Option<Duration> {
-        let mut breaker = self
-            .breaker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut breaker = self.breaker.lock();
         let state = breaker.entry(resource.clone()).or_default();
         let now = Instant::now();
         if let Some(open_until) = state.open_until {
@@ -186,34 +170,19 @@ impl Inner {
     pub(crate) fn lease_token(&self, resource: &ResourceId) -> Arc<Mutex<()>> {
         self.lease_tokens
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(resource.clone())
             .or_default()
             .clone()
     }
 
     pub(crate) fn register_active(&self, record: Arc<Mutex<LiveRecord>>) {
-        let resource = record
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record
-            .resource
-            .clone();
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(resource, record);
+        let resource = record.lock().record.resource.clone();
+        self.active.lock().insert(resource, record);
     }
 
     pub(crate) fn unregister_active(&self, resource: &ResourceId) {
-        self.active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(resource);
-        self.lease_tokens
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(resource);
+        self.active.lock().remove(resource);
+        self.lease_tokens.lock().remove(resource);
     }
 
     /// Runs `f` with one live record locked against reconciliation: the
@@ -224,17 +193,10 @@ impl Inner {
         live: &Arc<Mutex<LiveRecord>>,
         f: impl FnOnce(&mut LiveRecord),
     ) {
-        let resource = live
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record
-            .resource
-            .clone();
+        let resource = live.lock().record.resource.clone();
         let token = self.lease_token(&resource);
-        let _token_guard = token
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut guard = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _token_guard = token.lock();
+        let mut guard = live.lock();
         f(&mut guard);
     }
 
@@ -243,46 +205,23 @@ impl Inner {
         resource: &ResourceId,
         reconciler: &Reconciler,
     ) -> ReconcileOutcome {
-        let Some(_entry) = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(resource)
-            .cloned()
-        else {
+        let Some(_entry) = self.active.lock().get(resource).cloned() else {
             reconciler.remove(resource);
             return ReconcileOutcome::NoActiveLease;
         };
         let token = self.lease_token(resource);
-        let _token_guard = token
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _token_guard = token.lock();
         // Re-check after acquiring the token: the lease may have ended while
         // this pass waited for it.
-        let Some(entry) = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(resource)
-            .cloned()
-        else {
+        let Some(entry) = self.active.lock().get(resource).cloned() else {
             reconciler.remove(resource);
             return ReconcileOutcome::NoActiveLease;
         };
 
-        let identity = entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record
-            .identity
-            .clone();
+        let identity = entry.lock().record.identity.clone();
         match self.backend.resource_status(&identity) {
             Ok(ResourceStatus::Gone | ResourceStatus::Replaced) => {
-                let record = entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record
-                    .clone();
+                let record = entry.lock().record.clone();
                 if self.journal.remove(&record.lease_id, resource).is_ok() {
                     self.unregister_active(resource);
                     reconciler.remove(resource);
@@ -317,11 +256,7 @@ impl Inner {
                 // retry. Keep the lease registered and the journal intact.
             }
             ReconcileOutcome::Failed => {
-                let pending = self
-                    .reconciler
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let pending = self.reconciler.pending.lock();
                 let exhausted = pending
                     .get(resource)
                     .is_some_and(|p| p.consecutive_errors + 1 >= MAX_CONSECUTIVE_ERRORS);
@@ -350,11 +285,7 @@ impl Inner {
         let first = match self.backend.readback(resource) {
             Ok(first) => first,
             Err(Error::ResourceGone { .. }) => {
-                let record = entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record
-                    .clone();
+                let record = entry.lock().record.clone();
                 if self.journal.remove(&record.lease_id, resource).is_ok() {
                     self.unregister_active(resource);
                     return ReconcileOutcome::NoActiveLease;
@@ -374,11 +305,7 @@ impl Inner {
         let second = match self.backend.readback(resource) {
             Ok(second) => second,
             Err(Error::ResourceGone { .. }) => {
-                let record = entry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record
-                    .clone();
+                let record = entry.lock().record.clone();
                 if self.journal.remove(&record.lease_id, resource).is_ok() {
                     self.unregister_active(resource);
                     return ReconcileOutcome::NoActiveLease;
@@ -398,9 +325,7 @@ impl Inner {
             return ReconcileOutcome::Deferred;
         }
 
-        let mut guard = entry
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = entry.lock();
 
         match self.finalize_live(&mut guard, Some(&second)) {
             Ok(()) => {}
@@ -545,32 +470,40 @@ impl Inner {
     }
 }
 
-fn lock_live(entry: &Arc<Mutex<LiveRecord>>) -> std::sync::MutexGuard<'_, LiveRecord> {
-    entry
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+fn lock_live(entry: &Arc<Mutex<LiveRecord>>) -> parking_lot::MutexGuard<'_, LiveRecord> {
+    entry.lock()
 }
 
 /// Spawns the reconciliation worker for an Enforce-policy manager and returns
-/// the feed used to enqueue resources from watcher events.
+/// the feed used to mark resources pending from watcher events.
 ///
 /// The worker coalesces pending resources and processes each as soon as it is
 /// due; events that arrive during a defer window update the pending entry
 /// instead of being dropped.
-pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<ResourceId>, Error> {
+#[derive(Clone)]
+pub(crate) struct ReconcileFeed {
+    reconciler: Arc<Reconciler>,
+    wake: mpsc::SyncSender<()>,
+}
+
+impl ReconcileFeed {
+    pub(crate) fn notify(&self, resource: ResourceId) {
+        self.reconciler.touch(resource);
+        let _ = self.wake.try_send(());
+    }
+}
+
+pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error> {
     let kind = inner.backend.kind();
-    let (tx, rx) = mpsc::channel::<ResourceId>();
+    let (wake, rx) = mpsc::sync_channel::<()>(1);
+    let worker_inner = Arc::clone(&inner);
     thread::Builder::new()
         .name("osdns-reconciler".to_string())
         .spawn(move || {
             loop {
                 let now = Instant::now();
                 let due: Vec<ResourceId> = {
-                    let pending = inner
-                        .reconciler
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let pending = worker_inner.reconciler.pending.lock();
                     pending
                         .iter()
                         .filter(|(_, p)| p.ready_at <= now)
@@ -579,11 +512,7 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<Resourc
                 };
                 if due.is_empty() {
                     let timeout = {
-                        let pending = inner
-                            .reconciler
-                            .pending
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let pending = worker_inner.reconciler.pending.lock();
                         let now = Instant::now();
                         pending
                             .values()
@@ -591,17 +520,17 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<Resourc
                             .min()
                     };
                     match rx.recv_timeout(timeout.unwrap_or(Duration::from_secs(3600))) {
-                        Ok(resource) => inner.reconciler.touch(resource),
+                        Ok(()) => {}
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
                     continue;
                 }
                 for resource in due {
-                    if inner.enforce_parked() {
+                    if worker_inner.enforce_parked() {
                         continue;
                     }
-                    inner.reconcile_resource(&resource, &inner.reconciler);
+                    worker_inner.reconcile_resource(&resource, &worker_inner.reconciler);
                 }
             }
         })
@@ -609,5 +538,8 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<mpsc::Sender<Resourc
             backend: kind,
             message: format!("cannot spawn reconciler thread: {e}"),
         })?;
-    Ok(tx)
+    Ok(ReconcileFeed {
+        reconciler: Arc::clone(&inner.reconciler),
+        wake,
+    })
 }

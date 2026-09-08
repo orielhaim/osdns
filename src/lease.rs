@@ -1,6 +1,7 @@
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::config::{DnsConfig, validate_against};
@@ -154,10 +155,7 @@ impl Lease {
         let caps = self.inner.backend.capabilities();
         let plan = validate_against(config, &caps)?;
         self.inner.backend.validate_plan(config.scope(), &plan)?;
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.state.lock();
         let Some(state) = guard.take() else {
             return Err(Error::Conflict {
                 resource: self
@@ -171,11 +169,7 @@ impl Lease {
         let LiveLease { live, _locks } = state;
         let repack = |live: Vec<Arc<Mutex<LiveRecord>>>| LiveLease { live, _locks };
         for entry in &live {
-            let record = entry
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .record
-                .clone();
+            let record = entry.lock().record.clone();
             match self.inner.backend.resource_status(&record.identity) {
                 Ok(ResourceStatus::Same) => {}
                 Ok(status @ (ResourceStatus::Gone | ResourceStatus::Replaced)) => {
@@ -228,14 +222,7 @@ impl Lease {
         wanted_sorted.sort();
         let mut owned_sorted: Vec<ResourceId> = live
             .iter()
-            .map(|record| {
-                record
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .record
-                    .resource
-                    .clone()
-            })
+            .map(|record| record.lock().record.resource.clone())
             .collect();
         owned_sorted.sort();
         if wanted_sorted != owned_sorted {
@@ -247,18 +234,11 @@ impl Lease {
         }
         // Hold every per-resource token for the whole transaction so
         // reconciliation and concurrent updates cannot interleave with it.
-        let tokens: Vec<std::sync::Arc<std::sync::Mutex<()>>> = owned_sorted
+        let tokens: Vec<std::sync::Arc<parking_lot::Mutex<()>>> = owned_sorted
             .iter()
             .map(|resource| self.inner.lease_token(resource))
             .collect();
-        let token_guards: Vec<_> = tokens
-            .iter()
-            .map(|token| {
-                token
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-            })
-            .collect();
+        let token_guards: Vec<_> = tokens.iter().map(|token| token.lock()).collect();
         let result = self.inner.transact_update(&live, &plan);
         drop(token_guards);
         drop(tokens);
@@ -305,10 +285,7 @@ impl Lease {
     }
 
     fn restore_state(&self) -> Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.state.lock();
         let Some(state) = guard.take() else {
             return Err(Error::Conflict {
                 resource: self
@@ -361,10 +338,7 @@ impl Lease {
     /// [`Error::ExternalModification`] from [`Lease::restore`]. Never fails
     /// due to external state; only journal I/O errors are reported.
     pub fn abandon(self) -> Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.state.lock();
         if let Some(LiveLease { live, _locks }) = guard.take() {
             let mut failure = None;
             for record in &live {
@@ -394,10 +368,7 @@ impl Lease {
     /// proof is discarded.
     #[cfg(feature = "test-util")]
     pub fn debug_release_locks_keep_journal(self) {
-        let mut guard = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.state.lock();
         if let Some(LiveLease { live, _locks }) = guard.take() {
             for record in &live {
                 self.inner.with_live_record(record, |live| {
@@ -455,12 +426,7 @@ impl fmt::Debug for Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(LiveLease { live, _locks }) = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(LiveLease { live, _locks }) = self.state.lock().take() {
             for record in &live {
                 self.inner.with_live_record(record, |live| {
                     let resource = live.record.resource.clone();

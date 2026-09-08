@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use uuid::Uuid;
 
 use crate::capability::{Capabilities, OwnershipIdentity};
@@ -11,7 +12,7 @@ use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
 use crate::fsutil::ensure_private_dir;
 use crate::interface::InterfaceInfo;
-use crate::journal::{JournalRecord, JournalStore, Phase, SCHEMA_VERSION};
+use crate::journal::{JournalRecord, JournalStore, Phase};
 use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
@@ -138,7 +139,7 @@ pub(crate) struct Inner {
     pub(crate) active: Mutex<HashMap<ResourceId, Arc<Mutex<LiveRecord>>>>,
     pub(crate) lease_tokens: Mutex<HashMap<ResourceId, Arc<Mutex<()>>>>,
     #[allow(dead_code)]
-    pub(crate) reconciler: Reconciler,
+    pub(crate) reconciler: Arc<Reconciler>,
     pub(crate) enforce: Mutex<EnforceState>,
 }
 
@@ -151,7 +152,7 @@ pub(crate) struct Inner {
 pub(crate) struct EnforceState {
     refs: usize,
     handle: Option<WatchHandle>,
-    feed: Option<std::sync::mpsc::Sender<ResourceId>>,
+    feed: Option<crate::reconciliation::ReconcileFeed>,
     parked: bool,
 }
 
@@ -180,16 +181,13 @@ impl Inner {
                 "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
             ));
         }
-        let mut enforce = self
-            .enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut enforce = self.enforce.lock();
         if enforce.refs == 0 {
             debug_assert!(enforce.handle.is_none() && enforce.feed.is_none());
             let feed = crate::reconciliation::spawn_reconciler(Arc::clone(self))?;
             let feed_clone = feed.clone();
             let callback: WatchCallback = Arc::new(move |event| {
-                let _ = feed_clone.send(event.resource().clone());
+                feed_clone.notify(event.resource().clone());
             });
             match self.backend.start_watch(callback) {
                 Ok(handle) => {
@@ -213,10 +211,7 @@ impl Inner {
         if self.conflict_policy != ConflictPolicy::Enforce {
             return;
         }
-        let mut enforce = self
-            .enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut enforce = self.enforce.lock();
         if enforce.refs == 0 {
             return;
         }
@@ -231,22 +226,15 @@ impl Inner {
     /// Clones the internal Enforce feed when one is running, so public
     /// watchers share the same reconciler instead of spawning duplicate
     /// worker threads.
-    pub(crate) fn enforce_feed(&self) -> Option<std::sync::mpsc::Sender<ResourceId>> {
-        self.enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .feed
-            .clone()
+    pub(crate) fn enforce_feed(&self) -> Option<crate::reconciliation::ReconcileFeed> {
+        self.enforce.lock().feed.clone()
     }
 
     /// Number of live leases holding Enforce observation (testing only).
     #[cfg(feature = "test-util")]
     #[allow(dead_code)]
     pub(crate) fn enforce_refs(&self) -> usize {
-        self.enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .refs
+        self.enforce.lock().refs
     }
 
     /// Drops the internal Enforce watch/feed without touching the refcount,
@@ -254,20 +242,14 @@ impl Inner {
     /// without racing a background worker. The lease-drop balance is kept:
     /// `release_enforce_watch` still runs once per lease.
     pub(crate) fn enforce_parked(&self) -> bool {
-        self.enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .parked
+        self.enforce.lock().parked
     }
 
     #[cfg(feature = "test-util")]
     #[allow(dead_code)]
     pub(crate) fn suspend_enforce_watch(&self) {
         {
-            let mut enforce = self
-                .enforce
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut enforce = self.enforce.lock();
             enforce.handle = None;
             enforce.feed = None;
             enforce.parked = true;
@@ -282,15 +264,9 @@ impl Inner {
         let Some(feed) = self.enforce_feed() else {
             return;
         };
-        let resources: Vec<ResourceId> = self
-            .active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .keys()
-            .cloned()
-            .collect();
+        let resources: Vec<ResourceId> = self.active.lock().keys().cloned().collect();
         for resource in resources {
-            let _ = feed.send(resource);
+            feed.notify(resource);
         }
     }
 
@@ -298,11 +274,7 @@ impl Inner {
     #[cfg(feature = "test-util")]
     #[allow(dead_code)]
     pub(crate) fn enforce_watching(&self) -> bool {
-        self.enforce
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .handle
-            .is_some()
+        self.enforce.lock().handle.is_some()
     }
 }
 
@@ -352,11 +324,7 @@ enum RecoverBlock {
 
 impl Inner {
     pub(crate) fn fire(&self, point: TxPoint) -> Result<()> {
-        let hook = self
-            .hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
+        let hook = self.hook.lock().clone();
         if let Some(hook) = hook {
             match hook.on_point(point) {
                 FaultAction::Continue => {}
@@ -607,7 +575,6 @@ impl Inner {
                 .zip(befores)
                 .zip(identities)
                 .map(|((resource, before), identity)| JournalRecord {
-                    schema_version: SCHEMA_VERSION,
                     owner: self.owner.clone(),
                     lease_id,
                     resource,
@@ -636,7 +603,6 @@ impl Inner {
             .zip(befores)
             .zip(identities)
             .map(|((resource, before), identity)| JournalRecord {
-                schema_version: SCHEMA_VERSION,
                 owner: self.owner.clone(),
                 lease_id,
                 resource,
@@ -739,9 +705,7 @@ impl Inner {
         let mut olds: Vec<JournalRecord> = Vec::with_capacity(live.len());
         let mut applieds: Vec<PlatformSnapshot> = Vec::with_capacity(live.len());
         for record in live {
-            let mut guard = record
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = record.lock();
             self.finalize_live(&mut guard, None)?;
             let applied = guard.record.applied.clone().ok_or_else(|| {
                 Error::ExternalModification {
@@ -774,9 +738,7 @@ impl Inner {
         }
         // Persist the prepared intent for every resource before mutating any.
         for record in live {
-            let mut guard = record
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = record.lock();
             guard.record.desired = plan.clone();
             guard.record.phase = Phase::Prepared;
             // `applied` still carries the previous applied state until the
@@ -786,9 +748,7 @@ impl Inner {
                 // the lease is never left half-prepared on a write failure.
                 drop(guard);
                 for (old, live_record) in olds.iter().zip(live.iter()) {
-                    let mut guard = live_record
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut guard = live_record.lock();
                     guard.record = old.clone();
                     let _ = self.journal.write(&guard.record);
                 }
@@ -830,9 +790,7 @@ impl Inner {
                     self.fire(TxPoint::AfterUpdateVerify).ok();
                     for (old_index, (old, live_record)) in olds.iter().zip(live.iter()).enumerate()
                     {
-                        let mut guard = live_record
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut guard = live_record.lock();
                         if old_index == index && residue.leftover.is_some() {
                             guard.verified = residue.leftover.take();
                             guard.record.phase = Phase::Prepared;
@@ -857,9 +815,7 @@ impl Inner {
         }
         let mut write_error = None;
         for (index, record) in live.iter().enumerate() {
-            let mut guard = record
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut guard = record.lock();
             let mutation = mutations[index].as_ref().expect("mutation succeeded");
             let persisted = mutation.persist();
             guard.record.phase = Phase::Applied;
@@ -1405,7 +1361,7 @@ impl DnsManager {
     /// observation is already running, this reuses its worker instead of
     /// spawning a duplicate.
     ///
-    /// The callback must only enqueue or coalesce events; it must never
+    /// The callback must only publish or coalesce events; it must never
     /// perform expensive or mutating work. The returned [`WatchHandle`]
     /// cancels this subscription's native notification when stopped or
     /// dropped; dropping it never disables Enforce while an active lease
@@ -1425,7 +1381,7 @@ impl DnsManager {
         let suppressions = Arc::clone(&self.inner.suppressions);
         let filtered: WatchCallback = Arc::new(move |event| {
             if let Some(feed) = &feed {
-                let _ = feed.send(event.resource().clone());
+                feed.notify(event.resource().clone());
             }
             if suppressions.is_suppressed(event.resource()) {
                 return;
@@ -1484,11 +1440,7 @@ impl DnsManager {
     /// injection (testing only).
     pub fn install_fault_injector(&self, injector: Arc<crate::testing::FaultInjector>) {
         let hook: Arc<dyn FaultHook> = injector;
-        *self
-            .inner
-            .hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+        *self.inner.hook.lock() = Some(hook);
     }
 
     /// Toggles injected journal write failures (testing only).
@@ -1705,7 +1657,7 @@ impl DnsManagerBuilder {
             suppressions: Arc::new(SuppressionRegistry::new()),
             active: Mutex::new(HashMap::new()),
             lease_tokens: Mutex::new(HashMap::new()),
-            reconciler: Reconciler::default(),
+            reconciler: Arc::new(Reconciler::default()),
             enforce: Mutex::new(EnforceState::default()),
         })))
     }

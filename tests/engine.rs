@@ -362,6 +362,33 @@ fn update_of_vanished_incarnation_requires_a_fresh_lease_without_rebinding() {
 }
 
 #[test]
+fn update_of_replaced_incarnation_clears_ownership_without_mutation() {
+    let fixture = new_fixture("update-replaced");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.external_remove(IFACE1).unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+
+    let error = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+    assert!(
+        matches!(error, Error::ResourceIdentity { resource, .. } if resource == resource_id(IFACE1))
+    );
+    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
 fn ambiguous_identity_before_update_fails_closed_without_mutation() {
     let fixture = new_fixture("update-ambiguous-identity");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();

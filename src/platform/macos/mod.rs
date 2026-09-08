@@ -26,7 +26,7 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::macos::system_configuration as sc;
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod resolver_files;
@@ -126,23 +126,20 @@ impl MacosBackend {
         resource: &ResourceId,
         snapshot: &MacosSnapshot,
     ) -> Result<PlatformSnapshot> {
-        let data = serde_json::to_value(snapshot).map_err(|e| {
-            Error::platform(BackendKind::MacosSystemConfiguration, format_args!("{e}"))
-        })?;
         Ok(PlatformSnapshot::new(
             BackendKind::MacosSystemConfiguration,
             resource.clone(),
-            data,
+            SnapshotData::MacosSystemConfiguration(snapshot.clone()),
         ))
     }
 
     fn parse_snapshot(&self, snapshot: &PlatformSnapshot) -> Result<MacosSnapshot> {
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::MacosSystemConfiguration,
-                format_args!("snapshot data cannot be interpreted: {e}"),
-            )
-        })
+        match &snapshot.data {
+            SnapshotData::MacosSystemConfiguration(data) => Ok(data.clone()),
+            _ => Err(Error::JournalCorrupt(
+                "macOS snapshot has the wrong backend data".to_string(),
+            )),
+        }
     }
 }
 

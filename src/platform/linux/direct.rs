@@ -8,7 +8,7 @@ use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::linux;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot};
+use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 const RESOLV_CONF: &str = linux::RESOLV_CONF_PATH;
@@ -131,22 +131,20 @@ impl DirectResolvConf {
     }
 
     fn to_platform(resource: &ResourceId, snapshot: &DirectSnapshot) -> Result<PlatformSnapshot> {
-        let data = serde_json::to_value(snapshot)
-            .map_err(|e| Error::platform(BackendKind::ResolvConfFile, format_args!("{e}")))?;
         Ok(PlatformSnapshot::new(
             BackendKind::ResolvConfFile,
             resource.clone(),
-            data,
+            SnapshotData::ResolvConfFile(snapshot.clone()),
         ))
     }
 
     fn from_platform(snapshot: &PlatformSnapshot) -> Result<DirectSnapshot> {
-        serde_json::from_value(snapshot.data.clone()).map_err(|e| {
-            Error::platform(
-                BackendKind::ResolvConfFile,
-                format_args!("snapshot data cannot be interpreted: {e}"),
-            )
-        })
+        match &snapshot.data {
+            SnapshotData::ResolvConfFile(data) => Ok(data.clone()),
+            _ => Err(Error::JournalCorrupt(
+                "resolv.conf snapshot has the wrong backend data".to_string(),
+            )),
+        }
     }
 }
 
@@ -282,17 +280,15 @@ mod tests {
 
     #[test]
     fn absent_file_is_the_only_read_failure_treated_as_absent() {
-        let root = std::env::temp_dir().join(format!("osdns-direct-read-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root).unwrap();
-        let missing = root.join("missing");
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing");
         assert_eq!(
             DirectResolvConf::read_current(&missing).unwrap().content,
             None
         );
-        assert!(DirectResolvConf::read_current(&root).is_err());
+        assert!(DirectResolvConf::read_current(root.path()).is_err());
         use std::os::unix::ffi::OsStrExt;
         let invalid = std::path::Path::new(std::ffi::OsStr::from_bytes(b"invalid\0path"));
         assert!(DirectResolvConf::current_mode(invalid).is_err());
-        std::fs::remove_dir(&root).unwrap();
     }
 }

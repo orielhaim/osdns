@@ -201,8 +201,8 @@ impl DnsConfigBuilder {
     }
 
     /// Adds a search domain (validated on build).
-    pub fn search_domain(mut self, domain: impl AsRef<str>) -> Self {
-        self.search_domains.push(domain.as_ref().to_string());
+    pub fn search_domain(mut self, domain: impl Into<String>) -> Self {
+        self.search_domains.push(domain.into());
         self
     }
 
@@ -210,10 +210,10 @@ impl DnsConfigBuilder {
     pub fn search_domains<I, S>(mut self, domains: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: Into<String>,
     {
         self.search_domains
-            .extend(domains.into_iter().map(|d| d.as_ref().to_string()));
+            .extend(domains.into_iter().map(Into::into));
         self
     }
 
@@ -221,8 +221,8 @@ impl DnsConfigBuilder {
     ///
     /// Each entry is parsed as [`DnsSuffix`]; `"."` selects
     /// the root (default-route) domain where the backend supports it.
-    pub fn routing_domain(mut self, domain: impl AsRef<str>) -> Self {
-        self.routing_domains.push(domain.as_ref().to_string());
+    pub fn routing_domain(mut self, domain: impl Into<String>) -> Self {
+        self.routing_domains.push(domain.into());
         self
     }
 
@@ -230,10 +230,10 @@ impl DnsConfigBuilder {
     pub fn routing_domains<I, S>(mut self, domains: I) -> Self
     where
         I: IntoIterator<Item = S>,
-        S: AsRef<str>,
+        S: Into<String>,
     {
         self.routing_domains
-            .extend(domains.into_iter().map(|d| d.as_ref().to_string()));
+            .extend(domains.into_iter().map(Into::into));
         self
     }
 

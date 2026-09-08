@@ -1,12 +1,11 @@
 //! Native change notifications: `NotifyIpInterfaceChange` for interface
 //! events and `RegNotifyChangeKeyValue` for NRPT registry changes.
 //!
-//! Callbacks only enqueue; heavy logic never runs inside them, and
+//! Callbacks only publish into the manager's bounded event sink, and
 //! notifications are never cancelled from inside their own callback.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
 use std::thread;
 
 use windows_registry::Key;
@@ -36,7 +35,7 @@ fn resource_from_row(row: &MIB_IPINTERFACE_ROW) -> Option<ResourceId> {
 }
 
 struct IpNotifyContext {
-    sender: Sender<ResourceId>,
+    callback: Arc<dyn Fn(&DnsEvent) + Send + Sync>,
 }
 
 unsafe extern "system" fn ip_interface_callback(
@@ -50,7 +49,7 @@ unsafe extern "system" fn ip_interface_callback(
     // SAFETY: the OS passes a valid row for the duration of the callback.
     let row = unsafe { &*row };
     if let Some(resource) = resource_from_row(row) {
-        let _ = context.sender.send(resource);
+        (context.callback)(&DnsEvent::ResourceChanged { resource });
     }
 }
 
@@ -94,8 +93,7 @@ pub(crate) fn start_ip_interface_watch(
     flag: Arc<std::sync::atomic::AtomicBool>,
     callback: Arc<dyn Fn(&DnsEvent) + Send + Sync>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    let (tx, rx) = std::sync::mpsc::channel::<ResourceId>();
-    let context = Box::into_raw(Box::new(IpNotifyContext { sender: tx }));
+    let context = Box::into_raw(Box::new(IpNotifyContext { callback }));
 
     let mut notification: HANDLE = std::ptr::null_mut();
     let status = unsafe {
@@ -112,33 +110,6 @@ pub(crate) fn start_ip_interface_watch(
         unsafe { drop(Box::from_raw(context)) };
         return Err(error);
     }
-
-    let worker_flag = flag.clone();
-    let worker = match thread::Builder::new()
-        .name("osdns-ipnotify-worker".to_string())
-        .spawn(move || {
-            while let Ok(resource) = rx.recv() {
-                if worker_flag.load(Ordering::Acquire) {
-                    break;
-                }
-                callback(&DnsEvent::ResourceChanged { resource });
-                if worker_flag.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            unsafe {
-                let _ = ffi::CancelMibChangeNotify2(notification);
-                drop(Box::from_raw(context));
-            }
-            return Err(Error::Platform {
-                backend: BackendKind::WindowsIpHelper,
-                message: format!("cannot spawn notification worker: {error}"),
-            });
-        }
-    };
 
     // SAFETY: notification handle is valid until CancelMibChangeNotify2; cancel
     // runs once on the caller thread, never inside the callback.
@@ -164,7 +135,6 @@ pub(crate) fn start_ip_interface_watch(
         flag.store(true, Ordering::Release);
         wrapped.cancel();
         context.release();
-        let _ = worker.join();
     }))
 }
 

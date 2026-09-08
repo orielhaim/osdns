@@ -177,9 +177,10 @@ fn update_after_defunct_lease_conflicts() {
 #[test]
 #[cfg(target_os = "macos")]
 fn default_backend_is_macos_system_configuration() {
+    let dir = temp_dir("default-backend");
     let manager = DnsManager::builder()
         .owner("io.osdns.test")
-        .state_dir(temp_dir("default-backend"))
+        .state_dir(dir.to_path_buf())
         .build()
         .unwrap();
     assert_eq!(
@@ -190,8 +191,9 @@ fn default_backend_is_macos_system_configuration() {
 
 #[test]
 fn builder_requires_owner() {
+    let dir = temp_dir("no-owner");
     let err = DnsManager::builder()
-        .state_dir(temp_dir("no-owner"))
+        .state_dir(dir.to_path_buf())
         .build()
         .unwrap_err();
     assert!(matches!(err, Error::InvalidConfig(_)));
@@ -199,9 +201,10 @@ fn builder_requires_owner() {
 
 #[test]
 fn builder_rejects_bad_owner() {
+    let dir = temp_dir("bad-owner");
     let err = DnsManager::builder()
         .owner("has spaces")
-        .state_dir(temp_dir("bad-owner"))
+        .state_dir(dir.to_path_buf())
         .build()
         .unwrap_err();
     assert!(matches!(err, Error::InvalidConfig(_)));

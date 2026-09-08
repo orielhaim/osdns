@@ -23,6 +23,7 @@ test-util = []
 [dependencies]
 atomic-write-file = "0.3"
 idna = "1"
+parking_lot = "0.12.5"
 resolv-conf = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,11 +52,16 @@ notify = { version = "8.2.0", default-features = false, features = [
 system-configuration = "0.8.0"
 
 [dev-dependencies]
+arcstr = "1"
 criterion = "0.8.2"
 osdns = { path = ".", features = ["test-util"] }
+proptest = "1"
+proptest-state-machine = "0.8"
 rstest = "0.27"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+smallvec = "1"
+tempfile = "3"
 
 [lints.rust]
 missing_docs = "deny"
@@ -68,6 +74,10 @@ all = { level = "warn", priority = -1 }
 name = "engine"
 harness = false
 required-features = ["test-util"]
+
+[[bench]]
+name = "data_structures"
+harness = false
 
 [package.metadata.docs.rs]
 all-features = true

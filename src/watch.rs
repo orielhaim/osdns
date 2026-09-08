@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,7 +17,7 @@ use crate::ownership::ResourceId;
 /// Variants are `#[non_exhaustive]` so new event kinds can be added without a
 /// breaking change. Match with a wildcard arm.
 ///
-/// Watch callbacks must only enqueue or coalesce events; expensive or
+/// Watch callbacks must only publish or coalesce events; expensive or
 /// mutating logic must never run inside a callback. Events caused by our own
 /// mutations are suppressed from the user callback path (under
 /// [`ConflictPolicy::Enforce`](crate::ConflictPolicy) the reconciler still
@@ -54,7 +56,7 @@ impl DnsEvent {
 /// Callback invoked by a backend's event thread.
 ///
 /// Must be `Send + Sync` because it runs on a native watcher thread. Keep it
-/// short: enqueue the event and return. Never call [`DnsManager::apply`](crate::DnsManager::apply),
+/// short: publish the event and return. Never call [`DnsManager::apply`](crate::DnsManager::apply),
 /// [`Lease::restore`](crate::Lease::restore), or other mutating APIs from
 /// inside the callback; doing so risks deadlock with the coalescer and
 /// reconciler threads.
@@ -107,12 +109,7 @@ impl WatchHandle {
 
     fn deactivate(&mut self) {
         self.flag.store(true, Ordering::Release);
-        if let Some(cancel) = self
-            .cancel
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
+        if let Some(cancel) = self.cancel.lock().take() {
             cancel();
         }
     }
@@ -148,19 +145,13 @@ impl SuppressionRegistry {
     }
 
     pub(crate) fn suppress(&self, resource: &ResourceId) {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = self.entries.lock();
         Self::prune(&mut entries);
         entries.insert(resource.clone(), Instant::now());
     }
 
     pub(crate) fn is_suppressed(&self, resource: &ResourceId) -> bool {
-        let mut entries = self
-            .entries
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut entries = self.entries.lock();
         Self::prune(&mut entries);
         entries.contains_key(resource)
     }
@@ -174,37 +165,33 @@ impl SuppressionRegistry {
 /// Wraps a callback so bursts of events for the same resource coalesce into
 /// a single delivery.
 ///
-/// The returned callback never blocks: it enqueues into a channel drained by
-/// a dedicated thread that blocks on `recv` when idle (zero polling) and
-/// flushes once the stream stays quiet for `window`.
+/// The returned callback replaces the latest pending event for its resource
+/// and signals a capacity-one wake channel with `try_send`. A dedicated
+/// thread flushes once the stream stays quiet for `window`.
 pub(crate) fn spawn_coalescer(
     kind: BackendKind,
     callback: WatchCallback,
     window: Duration,
 ) -> Result<Coalescer> {
-    let (tx, rx) = mpsc::channel::<DnsEvent>();
+    let pending = Arc::new(Mutex::new(HashMap::<ResourceId, DnsEvent>::new()));
+    let worker_pending = Arc::clone(&pending);
+    let (wake, rx) = mpsc::sync_channel::<()>(1);
     let worker = thread::Builder::new()
         .name("osdns-watch-coalescer".to_string())
         .spawn(move || {
-            let mut pending: HashMap<ResourceId, DnsEvent> = HashMap::new();
-            while let Ok(first) = rx.recv() {
-                let resource = first.resource().clone();
-                pending.insert(resource, first);
+            while rx.recv().is_ok() {
                 let deadline = Instant::now() + window;
                 loop {
                     match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                        Ok(event) => {
-                            let (resource, _) = event.clone().into_owned();
-                            pending.insert(resource, event);
-                        }
+                        Ok(()) => {}
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            flush(&callback, &mut pending);
+                            flush(&callback, &worker_pending);
                             return;
                         }
                     }
                 }
-                flush(&callback, &mut pending);
+                flush(&callback, &worker_pending);
             }
         })
         .map_err(|e| Error::Platform {
@@ -212,7 +199,9 @@ pub(crate) fn spawn_coalescer(
             message: format!("cannot spawn coalescer thread: {e}"),
         })?;
     let sender: WatchCallback = Arc::new(move |event| {
-        let _ = tx.send(event.clone());
+        let (resource, _) = event.clone().into_owned();
+        pending.lock().insert(resource, event.clone());
+        let _ = wake.try_send(());
     });
     Ok(Coalescer {
         sender: Some(sender),
@@ -247,7 +236,11 @@ impl Drop for Coalescer {
     }
 }
 
-fn flush(callback: &WatchCallback, pending: &mut HashMap<ResourceId, DnsEvent>) {
+fn flush(callback: &WatchCallback, shared: &Mutex<HashMap<ResourceId, DnsEvent>>) {
+    let mut pending = {
+        let mut shared = shared.lock();
+        std::mem::take(&mut *shared)
+    };
     for event in pending.values() {
         callback(event);
     }
@@ -264,7 +257,7 @@ mod tests {
         let sink = Arc::clone(&delivered);
         let coalescer = spawn_coalescer(
             BackendKind::Fake,
-            Arc::new(move |event| sink.lock().unwrap().push(event.clone())),
+            Arc::new(move |event| sink.lock().push(event.clone())),
             Duration::from_millis(5),
         )
         .unwrap();
@@ -277,7 +270,7 @@ mod tests {
         drop(callback);
         coalescer.stop();
         assert!(matches!(
-            delivered.lock().unwrap().as_slice(),
+            delivered.lock().as_slice(),
             [DnsEvent::ResourceChanged { .. }]
         ));
     }

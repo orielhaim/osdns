@@ -78,6 +78,7 @@ enum CrashPhase {
     UpdateApplied,
 }
 
+#[derive(Clone, Debug)]
 enum Op {
     Apply(Plan),
     ApplyWhileLeased(Plan),
@@ -534,101 +535,248 @@ impl Runner {
     }
 }
 
-struct XorShift(u64);
-
-impl XorShift {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, bound: u64) -> u64 {
-        self.next() % bound
-    }
-
-    fn pick_plan(&mut self) -> Plan {
-        PLANS[self.below(PLANS.len() as u64) as usize]
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JournalM {
+    None,
+    Recoverable,
+    Conflict,
 }
 
-fn next_op(runner: &Runner, rng: &mut XorShift) -> Op {
-    let leased = runner.model.lease.is_some();
-    let journalled = runner.model.journal.is_some();
-    let roll = rng.below(100);
-    match (leased, journalled) {
-        (false, false) => match roll {
-            0..=39 => Op::Apply(rng.pick_plan()),
-            40..=54 => Op::External(rng.below(2) as usize),
-            55..=74 => Op::CrashApply(
-                rng.pick_plan(),
-                if rng.below(2) == 0 {
-                    CrashPhase::Prepared
-                } else {
-                    CrashPhase::Applied
-                },
-            ),
-            75..=84 => Op::Recover,
-            _ => Op::External(rng.below(2) as usize),
-        },
-        (false, true) => match roll {
-            0..=39 => Op::Apply(rng.pick_plan()),
-            40..=59 => Op::Recover,
-            60..=79 => Op::External(rng.below(2) as usize),
-            _ => Op::Apply(rng.pick_plan()),
-        },
-        (true, _) => match roll {
-            0..=24 => Op::Update(rng.pick_plan()),
-            25..=44 => Op::Restore,
-            45..=54 => Op::Abandon,
-            55..=64 => Op::DropLease,
-            65..=74 => Op::ApplyWhileLeased(rng.pick_plan()),
-            75..=84 => Op::External(rng.below(2) as usize),
-            85..=89 => Op::Recover,
-            _ => {
-                if let Some(LeaseM::Owned { applied, .. }) = &runner.model.lease
-                    && runner.model.current == *applied
-                {
-                    return Op::CrashUpdate(
-                        rng.pick_plan(),
-                        if rng.below(2) == 0 {
-                            CrashPhase::UpdatePrepared
-                        } else {
-                            CrashPhase::UpdateApplied
-                        },
-                    );
-                }
-                Op::Restore
+#[derive(Clone, Debug)]
+struct RefState {
+    leased: bool,
+    lease_owned: bool,
+    lease_before_plan: Option<Plan>,
+    current_owned: bool,
+    journal: JournalM,
+    allow_crash_apply: bool,
+    current_plan: Option<Plan>,
+    recovery_plan: Option<Plan>,
+}
+
+struct Lifecycle;
+
+impl proptest_state_machine::ReferenceStateMachine for Lifecycle {
+    type State = RefState;
+    type Transition = Op;
+
+    fn init_state() -> proptest::strategy::BoxedStrategy<Self::State> {
+        use proptest::strategy::{Just, Strategy};
+        Just(RefState {
+            leased: false,
+            lease_owned: false,
+            lease_before_plan: None,
+            current_owned: false,
+            journal: JournalM::None,
+            allow_crash_apply: true,
+            current_plan: None,
+            recovery_plan: None,
+        })
+        .boxed()
+    }
+
+    fn transitions(state: &Self::State) -> proptest::strategy::BoxedStrategy<Self::Transition> {
+        use proptest::prop_oneof;
+        use proptest::strategy::{Just, Strategy};
+
+        let plans = proptest::sample::select(PLANS.to_vec());
+        if state.leased {
+            let mut transitions = vec![
+                Just(Op::Restore).boxed(),
+                Just(Op::Abandon).boxed(),
+                Just(Op::DropLease).boxed(),
+                Just(Op::Recover).boxed(),
+                (0usize..EXTERNALS.len()).prop_map(Op::External).boxed(),
+                plans.clone().prop_map(Op::Update).boxed(),
+                plans.clone().prop_map(Op::ApplyWhileLeased).boxed(),
+            ];
+            if state.current_owned {
+                transitions.push(
+                    (plans, proptest::bool::ANY)
+                        .prop_map(|(plan, applied)| {
+                            Op::CrashUpdate(
+                                plan,
+                                if applied {
+                                    CrashPhase::UpdateApplied
+                                } else {
+                                    CrashPhase::UpdatePrepared
+                                },
+                            )
+                        })
+                        .boxed(),
+                );
             }
-        },
+            proptest::strategy::Union::new(transitions).boxed()
+        } else if state.journal == JournalM::None {
+            prop_oneof![
+                plans.clone().prop_map(Op::Apply),
+                (0usize..EXTERNALS.len()).prop_map(Op::External),
+                (plans, proptest::bool::ANY).prop_map(|(plan, applied)| Op::CrashApply(
+                    plan,
+                    if applied {
+                        CrashPhase::Applied
+                    } else {
+                        CrashPhase::Prepared
+                    }
+                )),
+                Just(Op::Recover),
+            ]
+            .boxed()
+        } else {
+            prop_oneof![
+                Just(Op::Recover),
+                (0usize..EXTERNALS.len()).prop_map(Op::External),
+            ]
+            .boxed()
+        }
+    }
+
+    fn preconditions(state: &Self::State, transition: &Self::Transition) -> bool {
+        match transition {
+            Op::Apply(_) => !state.leased && state.journal == JournalM::None,
+            Op::CrashApply(plan, _) => {
+                !state.leased
+                    && state.journal == JournalM::None
+                    && state.allow_crash_apply
+                    && state.current_plan != Some(*plan)
+            }
+            Op::ApplyWhileLeased(_) | Op::Update(_) | Op::Restore | Op::Abandon | Op::DropLease => {
+                state.leased
+            }
+            Op::CrashUpdate(plan, _) => {
+                state.leased
+                    && state.lease_owned
+                    && state.current_owned
+                    && state.current_plan != Some(*plan)
+            }
+            Op::External(_) | Op::Recover => true,
+        }
+    }
+
+    fn apply(mut state: Self::State, transition: &Self::Transition) -> Self::State {
+        match transition {
+            Op::Apply(plan) => {
+                state.lease_before_plan = state.current_plan;
+                state.lease_owned = state.current_plan != Some(*plan);
+                state.leased = true;
+                state.current_owned = true;
+                state.journal = JournalM::Recoverable;
+                state.allow_crash_apply = false;
+                state.current_plan = Some(*plan);
+            }
+            Op::ApplyWhileLeased(_) => {}
+            Op::Update(plan) if state.current_owned => {
+                if state.current_plan != Some(*plan) {
+                    state.lease_owned = true;
+                }
+                state.current_plan = Some(*plan);
+            }
+            Op::Update(_) => {}
+            Op::External(_) => {
+                state.current_owned = false;
+                state.allow_crash_apply = true;
+                state.current_plan = None;
+                if !state.leased && state.journal != JournalM::None {
+                    state.journal = JournalM::Conflict;
+                }
+            }
+            Op::Restore => {
+                if state.current_owned && state.lease_owned {
+                    state.current_plan = state.lease_before_plan;
+                }
+                state.leased = false;
+                state.lease_owned = false;
+                state.current_owned = false;
+                state.journal = JournalM::None;
+                state.lease_before_plan = None;
+            }
+            Op::Abandon => {
+                state.leased = false;
+                state.lease_owned = false;
+                state.current_owned = false;
+                state.journal = JournalM::None;
+                state.lease_before_plan = None;
+            }
+            Op::DropLease => {
+                if state.current_owned && state.lease_owned {
+                    state.current_plan = state.lease_before_plan;
+                }
+                state.leased = false;
+                state.lease_owned = false;
+                state.journal = if state.current_owned {
+                    JournalM::None
+                } else {
+                    JournalM::Conflict
+                };
+                state.current_owned = false;
+                state.lease_before_plan = None;
+            }
+            Op::CrashApply(plan, phase) => {
+                state.recovery_plan = state.current_plan;
+                state.journal = JournalM::Recoverable;
+                state.current_owned = *phase == CrashPhase::Applied;
+                state.allow_crash_apply = false;
+                if *phase == CrashPhase::Applied {
+                    state.current_plan = Some(*plan);
+                }
+            }
+            Op::CrashUpdate(plan, phase) => {
+                state.recovery_plan = state.lease_before_plan;
+                state.leased = false;
+                state.lease_owned = false;
+                state.journal = JournalM::Recoverable;
+                state.current_owned = *phase == CrashPhase::UpdateApplied;
+                if *phase == CrashPhase::UpdateApplied {
+                    state.current_plan = Some(*plan);
+                }
+            }
+            Op::Recover => {
+                if !state.leased && state.journal == JournalM::Recoverable {
+                    state.journal = JournalM::None;
+                    state.current_owned = false;
+                    state.current_plan = state.recovery_plan;
+                    state.recovery_plan = None;
+                }
+            }
+        }
+        state
     }
 }
 
-fn run_sequence(seed: u64, steps: usize) {
-    let fixture = new_fixture(&format!("fsm-{seed}"));
-    let mut runner = Runner {
-        fixture,
-        live: None,
-        model: Model {
-            current: FakeState::Empty,
-            lease: None,
-            journal: None,
-        },
-    };
-    let mut rng = XorShift(seed | 1);
-    for step in 0..steps {
-        let op = next_op(&runner, &mut rng);
-        runner.run(op, step);
+struct LifecycleTest;
+
+impl proptest_state_machine::StateMachineTest for LifecycleTest {
+    type SystemUnderTest = Runner;
+    type Reference = Lifecycle;
+
+    fn init_test(_: &RefState) -> Self::SystemUnderTest {
+        Runner {
+            fixture: new_fixture("proptest-fsm"),
+            live: None,
+            model: Model {
+                current: FakeState::Empty,
+                lease: None,
+                journal: None,
+            },
+        }
     }
-    let _ = runner.fixture.manager.recover_stale().unwrap();
+
+    fn apply(
+        mut state: Self::SystemUnderTest,
+        _: &RefState,
+        transition: Op,
+    ) -> Self::SystemUnderTest {
+        state.run(transition, 0);
+        state
+    }
+
+    fn check_invariants(state: &Self::SystemUnderTest, _: &RefState) {
+        state.assert_invariants(0);
+    }
 }
 
-#[test]
-fn state_machine_survives_random_sequences() {
-    for seed in [1, 2, 3, 7, 42, 1337, 90210] {
-        run_sequence(seed, 150);
-    }
+proptest_state_machine::prop_state_machine! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(64))]
+    #[test]
+    fn lifecycle_state_machine(sequential 1..80 => LifecycleTest);
 }

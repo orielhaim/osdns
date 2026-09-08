@@ -1,0 +1,36 @@
+[package]
+name = "osdns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+osdns = { path = "..", features = ["test-util"] }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "identifiers"
+path = "fuzz_targets/identifiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal"
+path = "fuzz_targets/journal.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "platform_parsers"
+path = "fuzz_targets/platform_parsers.rs"
+test = false
+doc = false
+bench = false
