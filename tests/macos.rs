@@ -12,14 +12,14 @@ mod common;
 use common::*;
 use osdns::{BackendKind, DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 
-fn real_manager(tag: &str) -> Option<DnsManager> {
+fn real_manager(tag: &str) -> Option<(DnsManager, TestDir)> {
     let dir = temp_dir(tag);
     match DnsManager::builder()
         .owner("io.osdns.test")
         .state_dir(&dir)
         .build()
     {
-        Ok(manager) => Some(manager),
+        Ok(manager) => Some((manager, dir)),
         Err(osdns::Error::RequiresPrivilege(_)) => None,
         Err(error) => panic!("unexpected builder error: {error}"),
     }
@@ -27,7 +27,7 @@ fn real_manager(tag: &str) -> Option<DnsManager> {
 
 #[test]
 fn default_backend_is_system_configuration() {
-    let Some(manager) = real_manager("macos-backend") else {
+    let Some((manager, _state_dir)) = real_manager("macos-backend") else {
         return;
     };
     let caps = manager.capabilities().unwrap();
@@ -41,7 +41,7 @@ fn default_backend_is_system_configuration() {
 
 #[test]
 fn interfaces_listing_is_read_only() {
-    let Some(manager) = real_manager("macos-interfaces") else {
+    let Some((manager, _state_dir)) = real_manager("macos-interfaces") else {
         return;
     };
     let interfaces = manager.interfaces().unwrap();
@@ -50,7 +50,7 @@ fn interfaces_listing_is_read_only() {
 
 #[test]
 fn snapshot_of_primary_service_is_read_only() {
-    let Some(manager) = real_manager("macos-snapshot") else {
+    let Some((manager, _state_dir)) = real_manager("macos-snapshot") else {
         return;
     };
     let snapshot = manager.snapshot(&DnsScope::Global).unwrap();
@@ -63,7 +63,7 @@ fn snapshot_of_primary_service_is_read_only() {
 
 #[test]
 fn root_routing_domain_is_rejected_before_mutation() {
-    let Some(manager) = real_manager("macos-root") else {
+    let Some((manager, _state_dir)) = real_manager("macos-root") else {
         return;
     };
     let config = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Default))
@@ -82,7 +82,7 @@ fn mutation_requires_explicit_opt_in() {
     if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
         return;
     }
-    let Some(manager) = real_manager("macos-mutate") else {
+    let Some((manager, _state_dir)) = real_manager("macos-mutate") else {
         return;
     };
     let scope = DnsScope::Interface(InterfaceSelector::Default);
@@ -132,7 +132,7 @@ fn mutation_requires_explicit_opt_in() {
 
 #[test]
 fn watchers_start_and_stop_cleanly() {
-    let Some(manager) = real_manager("macos-watch") else {
+    let Some((manager, _state_dir)) = real_manager("macos-watch") else {
         return;
     };
     let handle = manager.watch(std::sync::Arc::new(|_| {})).unwrap();
@@ -144,7 +144,7 @@ fn resolver_file_watch_reports_external_changes() {
     if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
         return;
     }
-    let Some(manager) = real_manager("macos-watch-resolver") else {
+    let Some((manager, _state_dir)) = real_manager("macos-watch-resolver") else {
         return;
     };
     use std::sync::{Arc as StdArc, Mutex as StdMutex};

@@ -268,10 +268,9 @@ impl FakeDns {
         Ok(())
     }
 
-    /// Blocks the next native watch installation until the returned function
-    /// is called. Used to inject an external change in the watcher-start
-    /// window.
-    pub fn block_next_start_watch(&self) -> impl FnOnce() + Send {
+    /// Returns a signal that the next native watcher start is blocked and a
+    /// function that releases it.
+    pub fn block_next_start_watch(&self) -> (std::sync::mpsc::Receiver<()>, impl FnOnce() + Send) {
         self.backend.block_next_start_watch()
     }
 }

@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
@@ -196,7 +197,12 @@ pub(crate) struct FakeBackend {
     /// Ownership universe of this simulated OS instance, shared by every
     /// manager built around the same [`crate::testing::FakeDns`].
     namespace: String,
-    start_watch_block: Mutex<Option<std::sync::Arc<std::sync::Barrier>>>,
+    start_watch_block: Mutex<Option<WatchStartBlock>>,
+}
+
+struct WatchStartBlock {
+    entered: SyncSender<()>,
+    release: Receiver<()>,
 }
 
 impl FakeBackend {
@@ -367,14 +373,18 @@ impl FakeBackend {
         self.lock_inner().before_nth_guarded = Some((skip, resource, state));
     }
 
-    /// Blocks the next [`Backend::start_watch`] until the returned release
-    /// function is called.
-    pub(crate) fn block_next_start_watch(&self) -> impl FnOnce() + Send {
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-        *self.start_watch_block.lock() = Some(std::sync::Arc::clone(&barrier));
-        move || {
-            barrier.wait();
-        }
+    /// Returns a signal that the next watcher start is blocked and a function
+    /// that releases it.
+    pub(crate) fn block_next_start_watch(&self) -> (Receiver<()>, impl FnOnce() + Send) {
+        let (entered_tx, entered_rx) = sync_channel(1);
+        let (release_tx, release_rx) = sync_channel(1);
+        *self.start_watch_block.lock() = Some(WatchStartBlock {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, move || {
+            let _ = release_tx.send(());
+        })
     }
 
     pub(crate) fn external_remove(&self, resource: &ResourceId) -> bool {
@@ -1041,8 +1051,9 @@ impl Backend for FakeBackend {
                 "watching is disabled for this fake backend",
             ));
         }
-        if let Some(barrier) = self.start_watch_block.lock().take() {
-            barrier.wait();
+        if let Some(block) = self.start_watch_block.lock().take() {
+            let _ = block.entered.send(());
+            let _ = block.release.recv();
         }
         let flag = Arc::new(AtomicBool::new(false));
         {

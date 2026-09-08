@@ -12,14 +12,14 @@ mod common;
 use common::*;
 use osdns::{BackendKind, Capabilities, DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 
-fn real_manager(tag: &str) -> Option<DnsManager> {
+fn real_manager(tag: &str) -> Option<(DnsManager, TestDir)> {
     let dir = temp_dir(tag);
     match DnsManager::builder()
         .owner("io.osdns.test")
         .state_dir(&dir)
         .build()
     {
-        Ok(manager) => Some(manager),
+        Ok(manager) => Some((manager, dir)),
         Err(osdns::Error::RequiresPrivilege(_)) => None,
         Err(error) => panic!("unexpected builder error: {error}"),
     }
@@ -27,7 +27,7 @@ fn real_manager(tag: &str) -> Option<DnsManager> {
 
 #[test]
 fn default_backend_is_windows_ip_helper() {
-    let Some(manager) = real_manager("win-backend") else {
+    let Some((manager, _state_dir)) = real_manager("win-backend") else {
         return;
     };
     let caps = manager.capabilities().unwrap();
@@ -43,7 +43,7 @@ fn default_backend_is_windows_ip_helper() {
 
 #[test]
 fn interfaces_listing_is_read_only() {
-    let Some(manager) = real_manager("win-interfaces") else {
+    let Some((manager, _state_dir)) = real_manager("win-interfaces") else {
         return;
     };
     let interfaces = manager.interfaces().unwrap();
@@ -53,7 +53,7 @@ fn interfaces_listing_is_read_only() {
 
 #[test]
 fn snapshot_of_real_adapter_is_read_only() {
-    let Some(manager) = real_manager("win-snapshot") else {
+    let Some((manager, _state_dir)) = real_manager("win-snapshot") else {
         return;
     };
     let interfaces = manager.interfaces().unwrap();
@@ -68,7 +68,7 @@ fn snapshot_of_real_adapter_is_read_only() {
 
 #[test]
 fn global_scope_is_unsupported() {
-    let Some(manager) = real_manager("win-global") else {
+    let Some((manager, _state_dir)) = real_manager("win-global") else {
         return;
     };
     let config = DnsConfig::builder(DnsScope::Global)
@@ -83,7 +83,7 @@ fn global_scope_is_unsupported() {
 
 #[test]
 fn validation_rejects_unrepresentable_configs() {
-    let Some(manager) = real_manager("win-validate") else {
+    let Some((manager, _state_dir)) = real_manager("win-validate") else {
         return;
     };
     let caps = manager.capabilities().unwrap();
@@ -102,7 +102,7 @@ fn mutation_requires_explicit_opt_in() {
     if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
         return;
     }
-    let Some(manager) = real_manager("win-mutate") else {
+    let Some((manager, _state_dir)) = real_manager("win-mutate") else {
         return;
     };
     let loopback = windows_test_interface(&manager);

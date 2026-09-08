@@ -622,11 +622,13 @@ fn equivalent_rewrite_is_not_still_ours() {
 #[test]
 fn enforce_rescan_sees_change_during_watcher_start() {
     let fixture = enforce_manager("enforce-watch-gap");
-    let release = fixture.fake.block_next_start_watch();
+    let (watch_started, release) = fixture.fake.block_next_start_watch();
     let manager = fixture.manager.clone();
     let fake = fixture.fake.clone();
     let apply = std::thread::spawn(move || manager.apply(&iface_config(1, "1.1.1.1")));
-    wait_until(|| journal_files(&fixture.dir).len() == 1);
+    watch_started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("native watcher start");
     fake.external_change(IFACE1, state_with("9.9.9.9")).unwrap();
     release();
     let lease = apply.join().expect("apply thread").unwrap();

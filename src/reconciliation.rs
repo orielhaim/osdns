@@ -43,7 +43,7 @@ use crate::error::Error;
 use crate::fault::TxPoint;
 use crate::journal::Phase;
 use crate::lease::LiveRecord;
-use crate::manager::{INITIAL_POINTS, Inner};
+use crate::manager::{Inner, RECONCILE_POINTS};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::PlatformSnapshot;
@@ -386,7 +386,7 @@ impl Inner {
             expected,
             desired,
             Some(rollback_to),
-            INITIAL_POINTS,
+            RECONCILE_POINTS,
             &mut residue,
         ) {
             Ok(mutation) => self.commit_applied(resource, entry, mutation),
@@ -440,7 +440,6 @@ impl Inner {
         entry: &Arc<Mutex<LiveRecord>>,
         external_base: &PlatformSnapshot,
     ) -> ReconcileOutcome {
-        self.suppressions.suppress(resource);
         {
             let mut live = lock_live(entry);
             let old = live.record.clone();

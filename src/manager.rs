@@ -282,18 +282,26 @@ pub(crate) struct MutatePoints {
     apply: TxPoint,
     readback: TxPoint,
     verify: TxPoint,
+    suppress_events: bool,
 }
 
 pub(crate) const INITIAL_POINTS: MutatePoints = MutatePoints {
     apply: TxPoint::AfterApply,
     readback: TxPoint::AfterReadback,
     verify: TxPoint::AfterVerify,
+    suppress_events: true,
+};
+
+pub(crate) const RECONCILE_POINTS: MutatePoints = MutatePoints {
+    suppress_events: false,
+    ..INITIAL_POINTS
 };
 
 const UPDATE_POINTS: MutatePoints = MutatePoints {
     apply: TxPoint::AfterUpdateApply,
     readback: TxPoint::AfterUpdateReadback,
     verify: TxPoint::AfterUpdateVerify,
+    suppress_events: true,
 };
 
 pub(crate) struct MutationResidue {
@@ -359,7 +367,9 @@ impl Inner {
         let resource = &identity.resource;
         residue.leftover = None;
         residue.restored = None;
-        self.suppressions.suppress(resource);
+        if points.suppress_events {
+            self.suppressions.suppress(resource);
+        }
         match self.apply_attempt(identity, expected_current, plan) {
             MutationAttempt::Rejected { error } => Err(error),
             MutationAttempt::Indeterminate { error, produced } => {
