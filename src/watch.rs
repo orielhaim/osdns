@@ -182,7 +182,11 @@ pub(crate) fn spawn_coalescer(
             while rx.recv().is_ok() {
                 let deadline = Instant::now() + window;
                 loop {
-                    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining) {
                         Ok(()) => {}
                         Err(mpsc::RecvTimeoutError::Timeout) => break,
                         Err(mpsc::RecvTimeoutError::Disconnected) => {

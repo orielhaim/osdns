@@ -84,6 +84,7 @@ pub(crate) enum ReconcileOutcome {
 #[derive(Debug, Clone)]
 struct Pending {
     ready_at: Instant,
+    generation: u64,
     consecutive_errors: u32,
 }
 
@@ -110,10 +111,14 @@ impl Reconciler {
     /// the deferred pass always reads the latest authoritative state.
     fn touch(&self, resource: ResourceId) {
         let mut pending = self.pending.lock();
-        pending.entry(resource).or_insert(Pending {
-            ready_at: Instant::now(),
-            consecutive_errors: 0,
-        });
+        pending
+            .entry(resource)
+            .and_modify(|p| p.generation = p.generation.saturating_add(1))
+            .or_insert(Pending {
+                ready_at: Instant::now(),
+                generation: 0,
+                consecutive_errors: 0,
+            });
     }
 
     fn defer(&self, resource: &ResourceId, delay: Duration, failed: bool) {
@@ -121,6 +126,7 @@ impl Reconciler {
         let now = Instant::now();
         let entry = pending.entry(resource.clone()).or_insert(Pending {
             ready_at: now + delay,
+            generation: 0,
             consecutive_errors: 0,
         });
         entry.ready_at = now + delay;
@@ -131,6 +137,26 @@ impl Reconciler {
 
     fn remove(&self, resource: &ResourceId) {
         self.pending.lock().remove(resource);
+    }
+
+    fn generation_of(&self, resource: &ResourceId) -> u64 {
+        self.pending
+            .lock()
+            .get(resource)
+            .map(|p| p.generation)
+            .unwrap_or(0)
+    }
+
+    fn complete_unless_touched(&self, resource: &ResourceId, generation: u64) {
+        let mut pending = self.pending.lock();
+        match pending.get_mut(resource) {
+            Some(p) if p.generation != generation => {
+                p.ready_at = Instant::now();
+            }
+            _ => {
+                pending.remove(resource);
+            }
+        }
     }
 
     #[cfg(feature = "test-util")]
@@ -217,6 +243,7 @@ impl Inner {
             reconciler.remove(resource);
             return ReconcileOutcome::NoActiveLease;
         };
+        let generation = reconciler.generation_of(resource);
 
         let identity = entry.lock().record.identity.clone();
         match self.backend.resource_status(&identity) {
@@ -246,7 +273,7 @@ impl Inner {
             ReconcileOutcome::NoActiveLease
             | ReconcileOutcome::StillOurs
             | ReconcileOutcome::Rebased => {
-                reconciler.remove(resource);
+                reconciler.complete_unless_touched(resource, generation);
             }
             ReconcileOutcome::Deferred => {
                 reconciler.defer(resource, UNSTABLE_RETRY, false);
@@ -518,7 +545,11 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error
                             .map(|p| p.ready_at.saturating_duration_since(now))
                             .min()
                     };
-                    match rx.recv_timeout(timeout.unwrap_or(Duration::from_secs(3600))) {
+                    let timeout = timeout.unwrap_or(Duration::from_secs(3600));
+                    if timeout.is_zero() {
+                        continue;
+                    }
+                    match rx.recv_timeout(timeout) {
                         Ok(()) => {}
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -541,4 +572,39 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error
         reconciler: Arc::clone(&inner.reconciler),
         wake,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rid() -> ResourceId {
+        ResourceId::new("fake:interface:1").unwrap()
+    }
+
+    #[test]
+    fn complete_keeps_a_touch_that_arrived_during_the_pass() {
+        let reconciler = Reconciler::default();
+        let resource = rid();
+        reconciler.touch(resource.clone());
+        let generation = reconciler.generation_of(&resource);
+        reconciler.touch(resource.clone());
+        reconciler.complete_unless_touched(&resource, generation);
+        let pending = reconciler.pending.lock();
+        let kept = pending
+            .get(&resource)
+            .expect("concurrent touch must stay pending");
+        assert!(kept.generation > generation);
+        assert!(kept.ready_at <= Instant::now());
+    }
+
+    #[test]
+    fn complete_removes_when_no_touch_arrived() {
+        let reconciler = Reconciler::default();
+        let resource = rid();
+        reconciler.touch(resource.clone());
+        let generation = reconciler.generation_of(&resource);
+        reconciler.complete_unless_touched(&resource, generation);
+        assert!(!reconciler.pending.lock().contains_key(&resource));
+    }
 }

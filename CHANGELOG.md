@@ -5,12 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.1] - 2026-09-17
+## [0.2.2] - 2026-09-17
 
 ### Fixed
 
 * Treated `DnsFlushResolverCache` as BOOL (nonzero success). Mapping the return as a Win32 status made a successful flush look like `ERROR_INVALID_FUNCTION`.
 * Windows crash recovery now reports vanished adapters as `ResourceStatus::Gone` / `Error::ResourceGone` instead of a platform `GetInterfaceDnsSettings` not-found failure.
+* Enforce no longer drops a watcher event that arrives during a StillOurs/Rebased pass. `touch` does not reschedule an already-pending resource, so removing the entry at the end of the pass swallowed the change and left the worker idle (the usual failure of `public_watch_is_optional_and_does_not_own_enforce` on loaded Windows).
+* Avoid `recv_timeout(Duration::ZERO)` in the reconciler and watch coalescer. A zero timeout can block on Windows instead of returning.
 
 ## [0.2.0] - 2026-09-07
 

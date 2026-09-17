@@ -145,6 +145,7 @@ fn public_watch_is_optional_and_does_not_own_enforce() {
     let fixture = enforce_manager("enforce-watch-optional");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     assert!(fixture.manager.debug_enforce_watching());
+    wait_until(|| !fixture.manager.debug_reconcile_pending(IFACE1).unwrap());
     let seen: Arc<Mutex<Vec<osdns::DnsEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = Arc::clone(&seen);
     let watch = fixture
