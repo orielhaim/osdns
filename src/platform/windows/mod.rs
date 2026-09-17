@@ -39,10 +39,12 @@ use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::windows::ffi::GUID;
 use crate::platform::windows::interface::{
-    adapter_for_selector, get_dns_settings, get_ipv6_dns_settings, list_adapters,
+    adapter_for_selector, get_dns_settings, get_ipv6_dns_settings, guid_to_string, list_adapters,
     parse_address_list, set_dns_settings,
 };
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
+use crate::platform::{
+    ApplyReceipt, Backend, PlatformSnapshot, ResourceIdentity, ResourceStatus, SnapshotData,
+};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod cache;
@@ -142,6 +144,21 @@ impl WindowsBackend {
     /// the error means indeterminate state, and the transaction engine
     /// always reads back and rolls back under guard rather than assuming
     /// nothing changed.
+    fn interface_present(guid: &GUID) -> Result<bool> {
+        let want = guid_to_string(guid);
+        Ok(list_adapters()?
+            .iter()
+            .any(|adapter| adapter.guid_string == want))
+    }
+
+    fn gone_interface(resource: &ResourceId) -> Error {
+        Error::ResourceGone {
+            backend: BackendKind::WindowsIpHelper,
+            resource: resource.clone(),
+            message: "the adapter is absent from GetAdaptersAddresses".to_string(),
+        }
+    }
+
     fn apply_interface(&self, guid: &GUID, state: &InterfaceState) -> Result<()> {
         for (ipv6_stack, nameservers, search) in [
             (false, &state.ipv4_nameservers, &state.ipv4_search),
@@ -308,9 +325,30 @@ impl Backend for WindowsBackend {
             .collect())
     }
 
+    fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
+        if identity.backend != self.kind() || identity.resource.as_str().is_empty() {
+            return Err(Error::JournalCorrupt(
+                "resource identity backend/resource mismatch".to_string(),
+            ));
+        }
+        match Self::parse_resource(&identity.resource)? {
+            ResourceKind::Interface(guid) => {
+                if Self::interface_present(&guid)? {
+                    Ok(ResourceStatus::Same)
+                } else {
+                    Ok(ResourceStatus::Gone)
+                }
+            }
+            ResourceKind::Nrpt { .. } => Ok(ResourceStatus::Same),
+        }
+    }
+
     fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
         match Self::parse_resource(resource)? {
             ResourceKind::Interface(guid) => {
+                if !Self::interface_present(&guid)? {
+                    return Err(Self::gone_interface(resource));
+                }
                 let snapshot = WindowsSnapshot::Interface(InterfaceSnapshot {
                     interface: self.read_interface_state(&guid)?,
                 });
@@ -582,5 +620,23 @@ mod tests {
             rule: Some(rules[0].clone()),
         });
         assert_ne!(before_absent, before_present);
+    }
+
+    #[test]
+    fn vanished_adapter_guid_is_gone() {
+        let backend = WindowsBackend::new("io.test");
+        let identity = ResourceIdentity::new(
+            BackendKind::WindowsIpHelper,
+            rid("windows:interface:00000000-0000-0000-0000-000000000000"),
+            crate::platform::IdentityData::Untracked,
+        );
+        assert_eq!(
+            backend.resource_status(&identity).unwrap(),
+            ResourceStatus::Gone
+        );
+        assert!(matches!(
+            backend.capture(&identity.resource),
+            Err(Error::ResourceGone { .. })
+        ));
     }
 }
