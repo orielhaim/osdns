@@ -546,6 +546,7 @@ impl FakeBackend {
         }
         match &snapshot.data {
             SnapshotData::Fake(data) => Ok(data.clone()),
+            #[allow(unreachable_patterns)]
             _ => Err(Error::JournalCorrupt(
                 "fake snapshot has the wrong backend data".to_string(),
             )),

@@ -1624,9 +1624,11 @@ impl DnsManagerBuilder {
 
     /// Builds the manager.
     ///
-    /// Fails with [`Error::RequiresPrivilege`] when the state directory
-    /// cannot be created or secured, and with [`Error::BackendUnavailable`]
-    /// when no platform backend is available on this host.
+    /// Fails with [`Error::UnsupportedPlatform`] on targets that have no OS
+    /// DNS backend, with [`Error::RequiresPrivilege`] when the state
+    /// directory cannot be created or secured, and with
+    /// [`Error::BackendUnavailable`] when this host has no usable platform
+    /// backend.
     pub fn build(self) -> Result<DnsManager> {
         let owner = self
             .owner
@@ -1635,6 +1637,13 @@ impl DnsManagerBuilder {
         if self.lock_timeout.is_zero() {
             return Err(Error::invalid_config(
                 "lock_timeout must be greater than zero",
+            ));
+        }
+        let backend = select_default_backend(&owner)?;
+        if self.conflict_policy == ConflictPolicy::Enforce && !backend.capabilities().watch {
+            return Err(Error::unsupported(
+                backend.kind(),
+                "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
             ));
         }
         let state_dir = match self.state_dir {
@@ -1650,13 +1659,6 @@ impl DnsManagerBuilder {
         let global_lock_dir = global_lock_root()?.join("locks");
         let locks = ResourceLockManager::new(global_lock_dir, self.lock_timeout);
         let journal = JournalStore::open(state_dir.join("journal"))?;
-        let backend = select_default_backend(&owner)?;
-        if self.conflict_policy == ConflictPolicy::Enforce && !backend.capabilities().watch {
-            return Err(Error::unsupported(
-                backend.kind(),
-                "ConflictPolicy::Enforce requires change notifications, which this backend does not support",
-            ));
-        }
         Ok(DnsManager::from_inner(Arc::new(Inner {
             owner,
             backend,

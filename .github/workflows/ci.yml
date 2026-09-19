@@ -151,7 +151,7 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
-          rustup target add aarch64-apple-darwin
+          rustup target add aarch64-apple-darwin aarch64-linux-android
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm
 
@@ -162,6 +162,12 @@ jobs:
           CC: clang
           AR: llvm-ar
           CFLAGS: -ffreestanding
+
+      - name: Cross-check / Linux -> Android ARM64
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          cargo check --locked --target aarch64-linux-android
+          cargo check --locked --target aarch64-linux-android --all-features
 
       - name: Prepare cross-check / Windows
         if: ${{ runner.os == 'Windows' }}

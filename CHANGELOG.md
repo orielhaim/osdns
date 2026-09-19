@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-09-20
+
+### Added
+
+* `Error::UnsupportedPlatform` when constructing a system manager on a target with no OS DNS backend. The crate compiles there; it does not pretend to be Linux and does not ship a no-op backend.
+
+### Fixed
+
+* Journal snapshot encode/decode and snapshot types compile on targets with no OS backend, without treating them as Linux.
+
 ## [0.2.2] - 2026-09-17
 
 ### Fixed

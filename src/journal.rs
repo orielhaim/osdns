@@ -178,21 +178,41 @@ impl TryFrom<PlatformSnapshotV3> for PlatformSnapshot {
 fn encode_snapshot(data: &SnapshotData) -> std::result::Result<serde_json::Value, String> {
     match data {
         #[cfg(feature = "test-util")]
-        SnapshotData::Fake(value) => serde_json::to_value(value),
+        SnapshotData::Fake(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
         #[cfg(target_os = "linux")]
-        SnapshotData::SystemdResolved(value) => serde_json::to_value(value),
+        SnapshotData::SystemdResolved(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
         #[cfg(target_os = "linux")]
-        SnapshotData::NetworkManager(value) => serde_json::to_value(value),
+        SnapshotData::NetworkManager(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
         #[cfg(target_os = "linux")]
-        SnapshotData::Resolvconf(value) => serde_json::to_value(value),
+        SnapshotData::Resolvconf(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
         #[cfg(target_os = "linux")]
-        SnapshotData::ResolvConfFile(value) => serde_json::to_value(value),
+        SnapshotData::ResolvConfFile(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
         #[cfg(target_os = "macos")]
-        SnapshotData::MacosSystemConfiguration(value) => serde_json::to_value(value),
+        SnapshotData::MacosSystemConfiguration(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
         #[cfg(target_os = "windows")]
-        SnapshotData::WindowsIpHelper(value) => serde_json::to_value(value),
+        SnapshotData::WindowsIpHelper(value) => {
+            serde_json::to_value(value).map_err(|error| error.to_string())
+        }
+        #[cfg(not(any(
+            feature = "test-util",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )))]
+        SnapshotData::NoOsBackend => {
+            Err("no OS DNS backend is implemented for this target".to_string())
+        }
     }
-    .map_err(|error| error.to_string())
 }
 
 fn decode_snapshot(
@@ -201,32 +221,38 @@ fn decode_snapshot(
 ) -> std::result::Result<SnapshotData, String> {
     match backend {
         #[cfg(feature = "test-util")]
-        BackendKind::Fake => serde_json::from_value(data).map(SnapshotData::Fake),
+        BackendKind::Fake => serde_json::from_value(data)
+            .map(SnapshotData::Fake)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "linux")]
-        BackendKind::SystemdResolved => {
-            serde_json::from_value(data).map(SnapshotData::SystemdResolved)
-        }
+        BackendKind::SystemdResolved => serde_json::from_value(data)
+            .map(SnapshotData::SystemdResolved)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "linux")]
-        BackendKind::NetworkManager => {
-            serde_json::from_value(data).map(SnapshotData::NetworkManager)
-        }
+        BackendKind::NetworkManager => serde_json::from_value(data)
+            .map(SnapshotData::NetworkManager)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "linux")]
-        BackendKind::Resolvconf => serde_json::from_value(data).map(SnapshotData::Resolvconf),
+        BackendKind::Resolvconf => serde_json::from_value(data)
+            .map(SnapshotData::Resolvconf)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "linux")]
-        BackendKind::ResolvConfFile => {
-            serde_json::from_value(data).map(SnapshotData::ResolvConfFile)
-        }
+        BackendKind::ResolvConfFile => serde_json::from_value(data)
+            .map(SnapshotData::ResolvConfFile)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "macos")]
-        BackendKind::MacosSystemConfiguration => {
-            serde_json::from_value(data).map(SnapshotData::MacosSystemConfiguration)
-        }
+        BackendKind::MacosSystemConfiguration => serde_json::from_value(data)
+            .map(SnapshotData::MacosSystemConfiguration)
+            .map_err(|error| error.to_string()),
         #[cfg(target_os = "windows")]
-        BackendKind::WindowsIpHelper => {
-            serde_json::from_value(data).map(SnapshotData::WindowsIpHelper)
+        BackendKind::WindowsIpHelper => serde_json::from_value(data)
+            .map(SnapshotData::WindowsIpHelper)
+            .map_err(|error| error.to_string()),
+        _ => {
+            let _ = data;
+            Err(format!("backend {backend} is unavailable on this platform"))
         }
-        _ => return Err(format!("backend {backend} is unavailable on this platform")),
     }
-    .map_err(|error| error.to_string())
 }
 
 fn encode_identity(data: &IdentityData) -> std::result::Result<serde_json::Value, String> {
@@ -434,6 +460,18 @@ impl JournalStore {
             .into_iter()
             .filter(|record| &record.resource == resource)
             .collect())
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+mod snapshot_codec {
+    use super::*;
+
+    #[test]
+    fn decode_snapshot_rejects_backends_without_local_payload() {
+        let err = decode_snapshot(BackendKind::WindowsIpHelper, serde_json::json!({}))
+            .expect_err("foreign backend snapshots must not decode here");
+        assert!(err.contains("unavailable on this platform"), "{err}");
     }
 }
 

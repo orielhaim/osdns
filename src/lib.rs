@@ -4,6 +4,8 @@
 
 //! `osdns` provides transactional, ownership-safe control over host
 //! operating-system DNS configuration on Linux, Windows, and macOS.
+//! Other targets still compile; constructing a system [`DnsManager`]
+//! fails with [`Error::UnsupportedPlatform`].
 //!
 //! It is intended for VPN clients, mesh networks, local DNS proxies, tunnels,
 //! security agents, and other software that must modify the host resolver

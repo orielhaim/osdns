@@ -14,6 +14,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// # Operational semantics
 ///
+/// - [`Error::UnsupportedPlatform`]: nothing was mutated. This compilation
+///   target has no OS DNS backend (for example Android). The crate still
+///   builds; constructing a system [`DnsManager`](crate::DnsManager) fails here.
 /// - [`Error::Unsupported`]: nothing was mutated. The backend cannot
 ///   represent the request. Do not retry without changing the configuration;
 ///   probe [`Capabilities`](crate::Capabilities) first.
@@ -87,6 +90,17 @@ pub enum Error {
         resource: ResourceId,
         /// Why equality could not be established.
         message: String,
+    },
+    /// This compilation target has no operating-system DNS backend.
+    ///
+    /// Nothing was mutated. `osdns` compiles on Android and other
+    /// non-Linux/macOS/Windows targets, but a real manager cannot be
+    /// constructed there. This is not [`Error::Unsupported`]: there is no
+    /// backend to probe.
+    #[error("unsupported platform ({os}): no OS DNS backend is implemented for this target")]
+    UnsupportedPlatform {
+        /// `std::env::consts::OS` for the compiled target.
+        os: &'static str,
     },
     /// The active backend cannot represent or perform the requested operation.
     ///
@@ -232,6 +246,12 @@ impl Error {
         Error::Unsupported {
             backend,
             reason: reason.to_string(),
+        }
+    }
+
+    pub(crate) fn unsupported_platform() -> Self {
+        Error::UnsupportedPlatform {
+            os: std::env::consts::OS,
         }
     }
 

@@ -45,6 +45,16 @@ pub(crate) enum SnapshotData {
     MacosSystemConfiguration(macos::MacosSnapshot),
     #[cfg(target_os = "windows")]
     WindowsIpHelper(windows::WindowsSnapshot),
+    /// Keeps journal/snapshot types inhabited when this target has no OS
+    /// backend. Never constructed; [`select_default_backend`] fails first.
+    #[cfg(not(any(
+        feature = "test-util",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
+    #[allow(dead_code)]
+    NoOsBackend,
 }
 
 /// Backend-defined evidence naming the native resource incarnation that a
@@ -496,7 +506,9 @@ pub(crate) fn construct_backend(
     kind: BackendKind,
     owner: &str,
 ) -> Result<std::sync::Arc<dyn Backend>> {
+    #[allow(unused_imports)]
     use std::sync::Arc;
+    let _ = owner;
     match kind {
         #[cfg(target_os = "linux")]
         BackendKind::SystemdResolved => {
@@ -521,14 +533,28 @@ pub(crate) fn construct_backend(
         #[cfg(feature = "test-util")]
         BackendKind::Fake => Ok(Arc::new(fake::FakeBackend::new())),
         #[allow(unreachable_patterns)]
-        _ => Err(Error::BackendUnavailable(format!(
-            "{kind} is not available on this platform"
-        ))),
+        _ => {
+            if cfg!(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "windows"
+            )) {
+                Err(Error::BackendUnavailable(format!(
+                    "{kind} is not available on this platform"
+                )))
+            } else {
+                let _ = kind;
+                Err(Error::unsupported_platform())
+            }
+        }
     }
 }
 
 /// Selects the platform backend based on which component actually owns DNS
 /// state on this host (Linux) or the single native backend (Windows, macOS).
+///
+/// Android and other non-desktop targets have no OS backend. Detection fails
+/// with [`Error::UnsupportedPlatform`] instead of pretending to be Linux.
 pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn Backend>> {
     #[cfg(target_os = "linux")]
     {
@@ -545,8 +571,39 @@ pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn B
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     {
         let _ = owner;
-        Err(Error::BackendUnavailable(
-            "no platform backend is implemented for this target".to_string(),
-        ))
+        Err(Error::unsupported_platform())
+    }
+}
+
+#[cfg(all(
+    test,
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_backend_is_unsupported_platform() {
+        let err = select_default_backend("io.osdns.test").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::UnsupportedPlatform { os } if os == std::env::consts::OS
+        ));
+        assert!(err.to_string().contains("unsupported platform"), "{err}");
+    }
+
+    #[test]
+    fn named_backend_construction_is_unsupported_platform() {
+        let err = construct_backend(BackendKind::SystemdResolved, "io.osdns.test").unwrap_err();
+        assert!(matches!(err, Error::UnsupportedPlatform { .. }));
+    }
+
+    #[test]
+    fn manager_build_fails_unsupported_platform() {
+        let err = crate::DnsManager::builder()
+            .owner("io.osdns.test")
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, Error::UnsupportedPlatform { .. }), "{err:?}");
     }
 }
