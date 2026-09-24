@@ -19,9 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-* The `Resolvconf` backend is explicitly Openresolv-only; Openresolv 3.9+
-  is required for its version marker, passthrough mode is rejected, and
-  classic Debian `resolvconf` is rejected.
+* The `Resolvconf` backend is explicitly Openresolv-only; Openresolv 3.12+
+  is required, passthrough mode is rejected, and classic Debian `resolvconf`
+  is rejected.
 
 ## [0.2.3] - 2026-09-20
 

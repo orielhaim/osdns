@@ -189,8 +189,8 @@
 //! NetworkManager (per-interface DNS), Openresolv's `resolvconf(8)`
 //! implementation (owner-tagged global records), and direct
 //! `/etc/resolv.conf` manipulation, based on which component actually owns
-//! DNS state on the host. Openresolv 3.9 or newer is required for its version
-//! marker; passthrough mode and classic Debian `resolvconf` are not supported
+//! DNS state on the host. Openresolv 3.12 or newer is required; passthrough
+//! mode and classic Debian `resolvconf` are not supported
 //! by `BackendKind::Resolvconf`.
 //!
 //! Windows uses the modern IP Helper APIs for per-interface IPv4/IPv6

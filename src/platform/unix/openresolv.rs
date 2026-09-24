@@ -30,6 +30,7 @@ const STATE_DIR_CANDIDATES: [&str; 4] = [
 ];
 const SEARCH_PATH: [&str; 5] = ["/sbin", "/usr/sbin", "/usr/local/sbin", "/bin", "/usr/bin"];
 const METRIC_SUBDIRS: [&str; 5] = ["metrics", "private", "nosearch", "exclusive", "deprecated"];
+const MIN_OPENRESOLV_VERSION: (u64, u64, u64) = (3, 12, 0);
 
 pub(crate) struct Probe {
     pub(crate) binary: PathBuf,
@@ -85,11 +86,22 @@ fn openresolv_version_is_supported(output: &[u8]) -> bool {
     let Some(version) = first_line.strip_prefix("openresolv ") else {
         return false;
     };
-    !version.is_empty()
-        && version.as_bytes()[0].is_ascii_digit()
-        && version
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_'))
+    parse_openresolv_version(version).is_some_and(|version| version >= MIN_OPENRESOLV_VERSION)
+}
+
+fn parse_openresolv_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut components = version.split('.');
+    let major = parse_openresolv_version_component(components.next()?)?;
+    let minor = parse_openresolv_version_component(components.next()?)?;
+    let patch = parse_openresolv_version_component(components.next()?)?;
+    components.next().is_none().then_some((major, minor, patch))
+}
+
+fn parse_openresolv_version_component(component: &str) -> Option<u64> {
+    if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    component.parse().ok()
 }
 
 fn configured_resolv_conf_matches(resolv_conf: &Path) -> bool {
@@ -1204,8 +1216,22 @@ mod tests {
     }
 
     #[test]
-    fn openresolv_version_marker_is_required() {
-        assert!(openresolv_version_is_supported(b"openresolv 3.17.4\n"));
+    fn openresolv_version_is_parsed_and_bounded() {
+        for (version, supported) in [
+            ("3.8.1", false),
+            ("3.9.0", false),
+            ("3.10.0", false),
+            ("3.11.0", false),
+            ("3.12.0", true),
+            ("3.17.4", true),
+        ] {
+            let output = format!("openresolv {version}\n");
+            assert_eq!(
+                openresolv_version_is_supported(output.as_bytes()),
+                supported,
+                "{version}"
+            );
+        }
         assert!(!openresolv_version_is_supported(
             b"Debian resolvconf 1.91\n"
         ));
@@ -1213,6 +1239,7 @@ mod tests {
         assert!(!openresolv_version_is_supported(
             b"prefix openresolv 3.17.4\n"
         ));
+        assert!(!openresolv_version_is_supported(b"openresolv 3.12\n"));
     }
 
     #[test]
