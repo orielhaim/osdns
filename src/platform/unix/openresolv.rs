@@ -300,20 +300,26 @@ fn run(binary: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
                     format_args!("cannot spawn resolvconf: {error}"),
                 )
             })?;
-            if let Some(mut handle) = child.stdin.take() {
-                handle.write_all(bytes).map_err(|error| {
-                    Error::platform(
-                        BackendKind::Resolvconf,
-                        format_args!("cannot write to resolvconf stdin: {error}"),
-                    )
-                })?;
-            }
-            child.wait_with_output().map_err(|error| {
+            let write_error = child
+                .stdin
+                .take()
+                .and_then(|mut handle| handle.write_all(bytes).err());
+            let output = child.wait_with_output().map_err(|error| {
                 Error::platform(
                     BackendKind::Resolvconf,
                     format_args!("resolvconf failed: {error}"),
                 )
-            })?
+            })?;
+            if let Some(error) = write_error
+                && error.kind() != std::io::ErrorKind::BrokenPipe
+                && output.status.success()
+            {
+                return Err(Error::platform(
+                    BackendKind::Resolvconf,
+                    format_args!("cannot write to resolvconf stdin: {error}"),
+                ));
+            }
+            output
         }
         None => command.output().map_err(|error| {
             Error::platform(
@@ -1211,10 +1217,11 @@ mod tests {
 
     #[test]
     fn subprocess_failures_include_stderr_on_stdin_paths() {
+        let input = vec![b'x'; 1024 * 1024];
         let error = run(
             Path::new("/bin/sh"),
             &["-c", "printf 'osdns-test-diagnostic\\n' >&2; exit 7"],
-            Some(b"input"),
+            Some(&input),
         )
         .unwrap_err();
         assert!(
