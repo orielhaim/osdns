@@ -742,6 +742,13 @@ fn owner_tag(owner: &str) -> String {
     if readable.is_empty() {
         readable.push_str("owner");
     }
+    if !readable
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+    {
+        readable.insert(0, 'x');
+    }
     let namespace = uuid::Uuid::from_u128(OWNER_TAG_NAMESPACE);
     let hash = uuid::Uuid::new_v5(&namespace, owner.as_bytes()).simple();
     format!("{readable}-{}.osdns", hash.to_string().to_ascii_lowercase())
@@ -1210,6 +1217,27 @@ mod tests {
             owner_tag("IO.Example/Owner")
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn owner_tags_are_openresolv_safe_and_deterministic() {
+        let owners = ["io.example.agent", ".foo", "-foo", "_foo", "___"];
+        let mut tags = Vec::new();
+        for owner in owners {
+            let tag = owner_tag(owner);
+            assert_eq!(tag, owner_tag(owner));
+            assert!(
+                tag.as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            );
+            assert!(tag.chars().all(
+                |character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+            ));
+            assert!(!tags.contains(&tag));
+            tags.push(tag);
+        }
+        assert!(owner_tag("io.example.agent").starts_with("io.example.agent-"));
     }
 
     #[test]
