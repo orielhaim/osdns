@@ -64,11 +64,15 @@ fn linux_resolvconf_guard() -> MutexGuard<'static, ()> {
 
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 fn resolvconf_binary() -> PathBuf {
-    ["/sbin/resolvconf", "/usr/sbin/resolvconf"]
-        .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
-        .expect("openresolv resolvconf must be installed")
+    [
+        "/usr/local/sbin/resolvconf",
+        "/sbin/resolvconf",
+        "/usr/sbin/resolvconf",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .expect("openresolv resolvconf must be installed")
 }
 
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]

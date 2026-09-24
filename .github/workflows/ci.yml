@@ -245,14 +245,15 @@ jobs:
           copyback: false
           prepare: |
             pkg update -f
-            pkg install -y rust ca_root_nss
+            pkg install -y rust ca_root_nss openresolv
           run: |
             set -eu
             cargo fmt --all --check
             cargo clippy --locked --all-targets --all-features -- -D warnings
             cargo test --locked --all-features
 
-            resolvconf=$(command -v resolvconf)
+            resolvconf=/usr/local/sbin/resolvconf
+            test -x "$resolvconf"
             nameserver=$(awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" { print $2; exit }' /etc/resolv.conf)
             test -n "$nameserver"
             work=$(mktemp -d)

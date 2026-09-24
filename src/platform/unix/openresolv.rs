@@ -58,10 +58,7 @@ fn probe_for_resolv_conf(resolv_conf: &Path) -> Option<Probe> {
     if !configured_resolv_conf_matches(resolv_conf) {
         return None;
     }
-    let binary = find_binary("resolvconf")?;
-    if !is_openresolv(&binary) {
-        return None;
-    }
+    let binary = find_supported_openresolv_binary()?;
     let key_dir = locate_key_dir(&binary)?;
     Some(Probe {
         binary,
@@ -234,12 +231,12 @@ fn contains_setting_token(line: &str, setting: &str) -> bool {
         .any(|token| token == setting)
 }
 
-fn find_binary(name: &str) -> Option<PathBuf> {
+fn find_supported_openresolv_binary() -> Option<PathBuf> {
     SEARCH_PATH.iter().find_map(|directory| {
-        let path = PathBuf::from(directory).join(name);
+        let path = PathBuf::from(directory).join("resolvconf");
         let metadata = std::fs::metadata(&path).ok()?;
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            Some(path)
+            is_openresolv(&path).then_some(path)
         } else {
             None
         }
