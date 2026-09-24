@@ -7,7 +7,7 @@
 
 Transactional control of operating-system DNS configuration.
 
-`osdns` provides a Rust API for reading, applying, watching, reconciling, and restoring host DNS configuration on Linux, Windows, and macOS.
+`osdns` provides a Rust API for reading, applying, watching, reconciling, and restoring host DNS configuration on Linux, FreeBSD, NetBSD, Windows, and macOS.
 
 It is intended for VPNs, mesh networks, local DNS proxies, tunnels, security agents, and other software that needs to modify the host resolver without taking ownership of unrelated system state.
 
@@ -36,12 +36,20 @@ If another actor changes the resource, `osdns` does not blindly restore an old s
 | -------- | ----------------------- | ----------------------- | ----------------- | ---------------------------------- |
 | Linux    | systemd-resolved        | per-link                | routing domains   | D-Bus                              |
 | Linux    | NetworkManager          | per-interface           | backend-dependent | D-Bus                              |
-| Linux    | resolvconf / openresolv | global                  | limited           | native integration                 |
+| Linux    | resolvconf / openresolv | global source record    | no                | state-directory events             |
 | Linux    | `/etc/resolv.conf`      | global                  | no                | inotify                            |
+| FreeBSD  | resolvconf / openresolv | global source record    | no                | kqueue via `notify`                |
+| FreeBSD  | `/etc/resolv.conf`      | global, unmanaged only  | no                | kqueue via `notify`                |
+| NetBSD   | resolvconf / openresolv | global source record    | no                | kqueue via `notify`                |
+| NetBSD   | `/etc/resolv.conf`      | global, unmanaged only  | no                | kqueue via `notify`                |
 | Windows  | IP Helper               | per-interface IPv4/IPv6 | NRPT              | IP Helper + registry notifications |
 | macOS    | SystemConfiguration     | per-service             | `/etc/resolver`   | SCDynamicStore + FSEvents          |
 
-Linux backend selection is based on the component that actually owns DNS configuration, not simply on which programs are installed.
+Backend selection is based on live DNS ownership, not on installed programs. On BSD, an exact openresolv signature in `/etc/resolv.conf` is required before osdns will use openresolv. The openresolv key store must also be identifiable through its standard state directories; custom `state_dir` layouts fail closed because `resolvconf.conf` is executable shell code and is never evaluated by osdns.
+
+Openresolv records feed one libc-global resolver. They are not per-interface routes, so `per_interface_dns` and `split_dns` are false. The active libc file must contain the requested values after apply; changes to that file or another openresolv record are treated as global external changes. FreeBSD and NetBSD libc limits of three nameservers and six search domains are checked before mutation; the search-list limit is 256 characters on FreeBSD and 1024 on NetBSD.
+
+Direct BSD `/etc/resolv.conf` mutation is limited to an unmanaged, single-link regular file. Symlinks, generated files, hard links, file flags, ACLs, and extended attributes are refused rather than stripped or replaced unsafely.
 
 Platform capabilities are exposed at runtime through `DnsManager::capabilities()`.
 
@@ -66,9 +74,12 @@ fn main() -> osdns::Result<()> {
 
     println!("backend: {}", caps.backend);
 
-    let current = dns.snapshot(&DnsScope::Interface(
-        InterfaceSelector::Default,
-    ))?;
+    let scope = if caps.per_interface_dns {
+        DnsScope::Interface(InterfaceSelector::Default)
+    } else {
+        DnsScope::Global
+    };
+    let current = dns.snapshot(&scope)?;
 
     println!("{current:?}");
 
@@ -91,10 +102,14 @@ fn main() -> osdns::Result<()> {
         .owner("io.example.agent")
         .build()?;
 
-    let config = DnsConfig::builder(DnsScope::Interface(
-        InterfaceSelector::Default,
-    ))
-    .nameserver("127.0.0.1".parse().unwrap())
+    let caps = dns.capabilities()?;
+    let scope = if caps.per_interface_dns {
+        DnsScope::Interface(InterfaceSelector::Default)
+    } else {
+        DnsScope::Global
+    };
+    let config = DnsConfig::builder(scope)
+    .nameserver("1.1.1.1".parse().unwrap())
     .build()?;
 
     dns.validate(&config)?;
@@ -135,6 +150,8 @@ The exact mechanism depends on the active backend:
 * NetworkManager DNS routing where supported;
 * NRPT rules on Windows;
 * scoped `/etc/resolver/<domain>` resolvers on macOS.
+
+Openresolv's private-key mode is not exposed as split DNS. It requires a separately configured local resolver and does not change the semantics of libc's global resolver.
 
 Unsupported configurations are rejected before mutation.
 
@@ -342,7 +359,7 @@ Configuration changes are control-plane operations. Native blocking APIs are use
 
 Primary backends do not shell out.
 
-The `resolvconf` / `openresolv` fallback invokes the corresponding utility directly when that backend is selected.
+The `resolvconf` / `openresolv` backend invokes the corresponding utility directly when live ownership and its key store have been verified.
 
 ## Features
 

@@ -3,8 +3,8 @@
 #![warn(clippy::all)]
 
 //! `osdns` provides transactional, ownership-safe control over host
-//! operating-system DNS configuration on Linux, Windows, and macOS.
-//! Other targets still compile; constructing a system [`DnsManager`]
+//! operating-system DNS configuration on Linux, FreeBSD, NetBSD, Windows,
+//! and macOS. Other targets still compile; constructing a system [`DnsManager`]
 //! fails with [`Error::UnsupportedPlatform`].
 //!
 //! It is intended for VPN clients, mesh networks, local DNS proxies, tunnels,
@@ -46,8 +46,14 @@
 //!     .owner("io.example.agent")
 //!     .build()?;
 //!
-//! let config = DnsConfig::builder(DnsScope::Interface(InterfaceSelector::Default))
-//!     .nameserver("127.0.0.1".parse().unwrap())
+//! let capabilities = manager.capabilities()?;
+//! let scope = if capabilities.per_interface_dns {
+//!     DnsScope::Interface(InterfaceSelector::Default)
+//! } else {
+//!     DnsScope::Global
+//! };
+//! let config = DnsConfig::builder(scope)
+//!     .nameserver("1.1.1.1".parse().unwrap())
 //!     .build()?;
 //!
 //! manager.validate(&config)?;
@@ -193,6 +199,15 @@
 //! `/etc/resolver/<domain>` files for split DNS, with SCDynamicStore and
 //! FSEvents notifications for watching.
 //!
+//! FreeBSD and NetBSD select openresolv only when `/etc/resolv.conf` has its
+//! exact generated signature and the openresolv key store can be identified.
+//! The backend owns one global input record and verifies that the requested
+//! values are active in the libc resolver. It does not expose openresolv's
+//! local-resolver-only private mode as per-interface or split DNS. A direct
+//! `/etc/resolv.conf` backend is used only for an unmanaged regular file; BSD
+//! file flags, ACLs, extended attributes, hard links, and symlinks are refused.
+//! Watching uses directory notifications backed by kqueue.
+//!
 //! [`Capabilities`] is the authoritative runtime description of what the
 //! active backend guarantees. Never assume two backends behave identically.
 //!
@@ -217,8 +232,7 @@
 //! - Filesystem and registry resources are ownership-controlled: files, rules,
 //!   and records not demonstrably ours are never overwritten or deleted.
 //! - Corrupt or unknown journal state fails closed; no mutation is attempted.
-//! - Unsafe code is isolated to platform FFI modules and justified with
-//!   `SAFETY:` comments.
+//! - Unsafe code is isolated to platform FFI modules.
 //! - DNS configuration alone does not enforce packet routing and is not DNS
 //!   leak prevention. Applications requiring traffic isolation must separately
 //!   control routing and firewall policy.

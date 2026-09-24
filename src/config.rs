@@ -9,7 +9,7 @@ use crate::normalize::{DnsSuffix, NormalizedConfig};
 ///
 /// - [`DnsScope::Global`] addresses system-wide DNS state. Only backends with
 ///   [`Capabilities::global_dns`](crate::Capabilities) support it (Linux
-///   resolvconf/direct and macOS); Windows rejects it with
+///   resolvconf/direct, macOS, and the BSD backends); Windows rejects it with
 ///   [`Error::Unsupported`](crate::Error).
 /// - [`DnsScope::Interface`] addresses one interface's DNS state. Requires
 ///   [`Capabilities::per_interface_dns`](crate::Capabilities).

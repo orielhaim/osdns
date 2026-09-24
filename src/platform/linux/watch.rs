@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::capability::BackendKind;
 use crate::error::{Error, Result};
 use crate::ownership::ResourceId;
+use crate::platform::unix::ResourceMapper;
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
 const EVENT_MASK: WatchMask = WatchMask::CLOSE_WRITE
@@ -19,54 +20,50 @@ const EVENT_MASK: WatchMask = WatchMask::CLOSE_WRITE
     .union(WatchMask::MOVED_FROM)
     .union(WatchMask::MOVED_TO);
 
-/// Watches `dir` with inotify and maps file-name events to resources.
-///
-/// The thread blocks on the inotify descriptor (zero polling) and exits when
-/// the returned handle is stopped or dropped; stopping works by arming a
-/// cancel flag and touching a private wake directory watched by the same
-/// inotify instance.
-pub(crate) fn watch_directory(
+pub(crate) fn watch_directories(
     kind: BackendKind,
-    dir: &Path,
+    directories: &[PathBuf],
     initial_resources: Vec<ResourceId>,
-    to_resource: impl Fn(&str) -> Option<ResourceId> + Send + 'static,
+    to_resource: ResourceMapper,
     callback: WatchCallback,
 ) -> Result<WatchHandle> {
-    let mut inotify = Inotify::init().map_err(|e| inotify_error(kind, e))?;
-    let mut dirs: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
-    let main_wd = inotify
-        .watches()
-        .add(dir, EVENT_MASK)
-        .map_err(|e| inotify_error(kind, e))?;
-    dirs.insert(main_wd, dir.to_path_buf());
+    if directories.is_empty() {
+        return Err(Error::platform(
+            kind,
+            "cannot create a watcher without a directory",
+        ));
+    }
+    let mut inotify = Inotify::init().map_err(|error| inotify_error(kind, error))?;
+    let mut watched: HashMap<WatchDescriptor, PathBuf> = HashMap::new();
+    for directory in directories {
+        let descriptor = inotify
+            .watches()
+            .add(directory, EVENT_MASK)
+            .map_err(|error| inotify_error(kind, error))?;
+        watched.insert(descriptor, directory.clone());
+    }
 
     let wake_dir = std::env::temp_dir().join(format!("osdns-watch-wake-{}", Uuid::new_v4()));
     fs::create_dir_all(&wake_dir)?;
     let wake_wd = inotify
         .watches()
         .add(&wake_dir, WatchMask::CREATE)
-        .map_err(|e| inotify_error(kind, e))?;
-    dirs.insert(wake_wd.clone(), wake_dir.clone());
+        .map_err(|error| inotify_error(kind, error))?;
+    watched.insert(wake_wd.clone(), wake_dir.clone());
 
     let flag = Arc::new(AtomicBool::new(false));
     let watch_flag = flag.clone();
     let thread_wake_dir = wake_dir.clone();
-    let watched_dir = dir.to_path_buf();
+    let watched_dirs = directories.to_vec();
     let worker = thread::Builder::new()
         .name("osdns-inotify-watch".to_string())
         .spawn(move || {
-            let _ = dirs;
+            let _ = watched;
             let mut buffer = [0u8; 4096];
             let seeds: HashSet<ResourceId> = initial_resources.into_iter().collect();
             let mut known = seeds.clone();
-            if let Ok(entries) = fs::read_dir(&watched_dir) {
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str()
-                        && let Some(resource) = to_resource(name)
-                    {
-                        known.insert(resource);
-                    }
-                }
+            for resource in scan(&watched_dirs, &to_resource).unwrap_or_default() {
+                known.insert(resource);
             }
             loop {
                 let Ok(events) = inotify.read_events_blocking(&mut buffer) else {
@@ -74,19 +71,7 @@ pub(crate) fn watch_directory(
                 };
                 for event in events {
                     if event.mask.contains(EventMask::Q_OVERFLOW) {
-                        let current = fs::read_dir(&watched_dir).and_then(|entries| {
-                            let mut current = HashSet::new();
-                            for entry in entries {
-                                let entry = entry?;
-                                if let Some(name) = entry.file_name().to_str()
-                                    && let Some(resource) = to_resource(name)
-                                {
-                                    current.insert(resource);
-                                }
-                            }
-                            Ok(current)
-                        });
-                        match current {
+                        match scan(&watched_dirs, &to_resource) {
                             Ok(current) => {
                                 for event in resync_events(&known, &current) {
                                     callback(&event);
@@ -112,9 +97,13 @@ pub(crate) fn watch_directory(
                         }
                         continue;
                     }
-                    let Some(name) = event.name else { continue };
-                    let name = name.to_string_lossy().to_string();
-                    let Some(resource) = to_resource(&name) else {
+                    let Some(name) = event.name else {
+                        continue;
+                    };
+                    let Some(directory) = watched_dirs_for_event(&watched, event.wd) else {
+                        continue;
+                    };
+                    let Some(resource) = to_resource(&directory.join(name)) else {
                         continue;
                     };
                     let removed = event
@@ -130,9 +119,9 @@ pub(crate) fn watch_directory(
                 }
             }
         })
-        .map_err(|e| Error::Platform {
+        .map_err(|error| Error::Platform {
             backend: kind,
-            message: format!("cannot spawn watch thread: {e}"),
+            message: format!("cannot spawn watch thread: {error}"),
         })?;
 
     let cancel_flag = flag.clone();
@@ -144,6 +133,31 @@ pub(crate) fn watch_directory(
         let _ = worker.join();
         let _ = fs::remove_dir_all(&cancel_wake);
     }))
+}
+
+fn watched_dirs_for_event(
+    watched: &HashMap<WatchDescriptor, PathBuf>,
+    descriptor: WatchDescriptor,
+) -> Option<PathBuf> {
+    watched.get(&descriptor).cloned()
+}
+
+fn scan(directories: &[PathBuf], mapper: &ResourceMapper) -> Result<HashSet<ResourceId>> {
+    let mut resources = HashSet::new();
+    for directory in directories {
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            if let Some(resource) = mapper(&entry.path()) {
+                resources.insert(resource);
+            }
+        }
+    }
+    Ok(resources)
 }
 
 fn resync_events(known: &HashSet<ResourceId>, current: &HashSet<ResourceId>) -> Vec<DnsEvent> {

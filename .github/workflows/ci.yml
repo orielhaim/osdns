@@ -151,7 +151,11 @@ jobs:
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
-          rustup target add aarch64-apple-darwin aarch64-linux-android
+          rustup target add \
+            aarch64-apple-darwin \
+            aarch64-linux-android \
+            x86_64-unknown-freebsd \
+            x86_64-unknown-netbsd
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm
 
@@ -168,6 +172,14 @@ jobs:
         run: |
           cargo check --locked --target aarch64-linux-android
           cargo check --locked --target aarch64-linux-android --all-features
+
+      - name: Cross-check / Linux -> FreeBSD x86_64
+        if: ${{ runner.os == 'Linux' }}
+        run: cargo check --locked --target x86_64-unknown-freebsd --all-features
+
+      - name: Cross-check / Linux -> NetBSD x86_64
+        if: ${{ runner.os == 'Linux' }}
+        run: cargo check --locked --target x86_64-unknown-netbsd --all-features
 
       - name: Prepare cross-check / Windows
         if: ${{ runner.os == 'Windows' }}
@@ -213,9 +225,185 @@ jobs:
           if ($tree -notmatch 'windows-registry v0\.100') { throw 'windows-registry 0.100 missing' }
           if ($tree -notmatch 'windows-link v0\.100') { throw 'windows-link 0.100 missing' }
           Write-Host 'dependency assertions ok'
+  freebsd:
+    name: FreeBSD 15.1 x86_64
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run in FreeBSD 15.1
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15.1"
+          arch: x86_64
+          sync: rsync
+          copyback: false
+          prepare: |
+            pkg update -f
+            pkg install -y rust ca_root_nss
+          run: |
+            set -eu
+            cargo fmt --all --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-features
+
+            resolvconf=$(command -v resolvconf)
+            nameserver=$(awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" { print $2; exit }' /etc/resolv.conf)
+            test -n "$nameserver"
+            work=$(mktemp -d)
+            tar -cpf "$work/live.tar" -C /etc resolv.conf
+            cp -p /etc/resolv.conf "$work/base"
+            rm -f /etc/resolv.conf
+            "$resolvconf" -a osdns-ci < "$work/base"
+            cleanup_openresolv() {
+              "$resolvconf" -d osdns-ci -f >/dev/null 2>&1 || true
+              tar -xpf "$work/live.tar" -C /etc
+              rm -rf "$work"
+            }
+            trap cleanup_openresolv EXIT HUP INT TERM
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_openresolv -- --nocapture --test-threads=1
+            cleanup_openresolv
+            trap - EXIT HUP INT TERM
+            work=$(mktemp -d)
+
+            tar -cpf "$work/direct.tar" -C /etc resolv.conf
+            cleanup_direct() {
+              rm -f /etc/resolv.conf
+              tar -xpf "$work/direct.tar" -C /etc
+            }
+            trap cleanup_direct EXIT HUP INT TERM
+            rm -f /etc/resolv.conf
+            printf 'nameserver %s\n' "$nameserver" > /etc/resolv.conf
+            chmod 0644 /etc/resolv.conf
+            if [ "$(uname -s)" = FreeBSD ]; then
+              chflags 0 /etc/resolv.conf
+            fi
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_direct -- --nocapture --test-threads=1
+            cleanup_direct
+            trap - EXIT HUP INT TERM
+
+            custom=/var/run/resolvconf-osdns-ci
+            had_config=0
+            if [ -f /etc/resolvconf.conf ]; then
+              cp -p /etc/resolvconf.conf "$work/resolvconf.conf"
+              had_config=1
+            fi
+            tar -cpf "$work/custom-live.tar" -C /etc resolv.conf
+            rm -rf "$custom"
+            printf 'state_dir=%s\nresolv_conf=/etc/resolv.conf\nresolvconf=YES\n' "$custom" > /etc/resolvconf.conf
+            rm -f /etc/resolv.conf
+            printf 'nameserver %s\n' "$nameserver" | "$resolvconf" -a osdns-ci-custom
+            cleanup_custom() {
+              "$resolvconf" -d osdns-ci-custom -f >/dev/null 2>&1 || true
+              if [ "$had_config" -eq 1 ]; then
+                cp -p "$work/resolvconf.conf" /etc/resolvconf.conf
+              else
+                rm -f /etc/resolvconf.conf
+              fi
+              tar -xpf "$work/custom-live.tar" -C /etc
+              rm -rf "$custom" "$work"
+            }
+            trap cleanup_custom EXIT HUP INT TERM
+            OSDNS_BSD_CUSTOM_STATE=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_custom_openresolv_state_is_refused -- --exact --nocapture
+            cleanup_custom
+            trap - EXIT HUP INT TERM
+
+  netbsd:
+    name: NetBSD 11.0 x86_64
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run in NetBSD 11.0
+        uses: vmactions/netbsd-vm@v1
+        with:
+          release: "11.0"
+          arch: x86_64
+          sync: rsync
+          copyback: false
+          prepare: |
+            /usr/sbin/pkg_add -u rust-bin
+            /usr/sbin/pkg_add -u ca-certificates
+          run: |
+            set -eu
+            cargo fmt --all --check
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo test --locked --all-features
+
+            resolvconf=$(command -v resolvconf)
+            nameserver=$(awk '$1 == "nameserver" && $2 !~ /^127\./ && $2 != "::1" { print $2; exit }' /etc/resolv.conf)
+            test -n "$nameserver"
+            work=$(mktemp -d)
+            tar -cpf "$work/live.tar" -C /etc resolv.conf
+            cp -p /etc/resolv.conf "$work/base"
+            rm -f /etc/resolv.conf
+            "$resolvconf" -a osdns-ci < "$work/base"
+            cleanup_openresolv() {
+              "$resolvconf" -d osdns-ci -f >/dev/null 2>&1 || true
+              tar -xpf "$work/live.tar" -C /etc
+              rm -rf "$work"
+            }
+            trap cleanup_openresolv EXIT HUP INT TERM
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_openresolv -- --nocapture --test-threads=1
+            cleanup_openresolv
+            trap - EXIT HUP INT TERM
+            work=$(mktemp -d)
+
+            tar -cpf "$work/direct.tar" -C /etc resolv.conf
+            cleanup_direct() {
+              rm -f /etc/resolv.conf
+              tar -xpf "$work/direct.tar" -C /etc
+            }
+            trap cleanup_direct EXIT HUP INT TERM
+            rm -f /etc/resolv.conf
+            printf 'nameserver %s\n' "$nameserver" > /etc/resolv.conf
+            chmod 0644 /etc/resolv.conf
+            if [ "$(uname -s)" = FreeBSD ]; then
+              chflags 0 /etc/resolv.conf
+            fi
+            OSDNS_ALLOW_SYSTEM_MUTATION=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_direct -- --nocapture --test-threads=1
+            cleanup_direct
+            trap - EXIT HUP INT TERM
+
+            custom=/var/run/resolvconf-osdns-ci
+            had_config=0
+            if [ -f /etc/resolvconf.conf ]; then
+              cp -p /etc/resolvconf.conf "$work/resolvconf.conf"
+              had_config=1
+            fi
+            tar -cpf "$work/custom-live.tar" -C /etc resolv.conf
+            rm -rf "$custom"
+            printf 'state_dir=%s\nresolv_conf=/etc/resolv.conf\nresolvconf=YES\n' "$custom" > /etc/resolvconf.conf
+            rm -f /etc/resolv.conf
+            printf 'nameserver %s\n' "$nameserver" | "$resolvconf" -a osdns-ci-custom
+            cleanup_custom() {
+              "$resolvconf" -d osdns-ci-custom -f >/dev/null 2>&1 || true
+              if [ "$had_config" -eq 1 ]; then
+                cp -p "$work/resolvconf.conf" /etc/resolvconf.conf
+              else
+                rm -f /etc/resolvconf.conf
+              fi
+              tar -xpf "$work/custom-live.tar" -C /etc
+              rm -rf "$custom" "$work"
+            }
+            trap cleanup_custom EXIT HUP INT TERM
+            OSDNS_BSD_CUSTOM_STATE=1 cargo test --locked --all-features --test backend_matrix matrix_bsd_custom_openresolv_state_is_refused -- --exact --nocapture
+            cleanup_custom
+            trap - EXIT HUP INT TERM
+
   release-checks:
     name: Release checks
-    needs: verify
+    needs: [verify, freebsd, netbsd]
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -294,7 +482,7 @@ jobs:
       - name: Configure openresolv
         run: |
           echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
-          resolvconf -u
+          resolvconf -a osdns-ci < /etc/resolv.conf
 
       - name: Integration / openresolv
         run: |
@@ -308,3 +496,4 @@ jobs:
             --nocapture
         env:
           OSDNS_ALLOW_SYSTEM_MUTATION: "1"
+          OSDNS_TEST_RESOLV_CONF: /tmp/osdns-resolv.conf

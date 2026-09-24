@@ -1,277 +1,113 @@
-use serde::{Deserialize, Serialize};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use crate::capability::{BackendKind, Capabilities};
-use crate::config::{DnsConfig, DnsScope};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::linux;
-use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
-use crate::watch::{WatchCallback, WatchHandle};
+use crate::platform::unix::WatchDirectory;
+use crate::platform::unix::detect::{self, ResolvConfState};
+use crate::platform::unix::direct::{DirectFileMetadata, DirectPolicy, DirectResolvConf};
 
-const RESOLV_CONF: &str = linux::RESOLV_CONF_PATH;
-
-fn capabilities() -> Capabilities {
-    Capabilities::new(BackendKind::ResolvConfFile)
-        .with_read(true)
-        .with_global_dns(true)
-        .with_per_interface_dns(false)
-        .with_search_domains(true)
-        .with_split_dns(false)
-        .with_watch(true)
-        .with_cache_flush(false)
+struct LinuxDirectPolicy {
+    resource: ResourceId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DirectSnapshot {
-    pub(crate) content: Option<Vec<u8>>,
-    #[cfg(unix)]
-    pub(crate) mode: Option<u32>,
-    #[cfg(not(unix))]
-    pub(crate) mode: Option<()>,
-}
-
-/// Direct `/etc/resolv.conf` backend: the last resort, used only when no
-/// manager owns the file.
-///
-/// The whole file content is the managed resource. That is deliberately
-/// conservative: any byte change made by another actor while a lease is held
-/// is an external modification and is never overwritten. The written content
-/// is a deterministic function of the desired configuration, so read-back
-/// verification and journal recovery compare exact bytes.
-pub(crate) struct DirectResolvConf {
-    caps: Capabilities,
-}
-
-impl DirectResolvConf {
-    pub(crate) fn new() -> Self {
+impl LinuxDirectPolicy {
+    fn new() -> Self {
         Self {
-            caps: capabilities(),
+            resource: ResourceId::new("linux:resolv-conf").expect("valid resource"),
+        }
+    }
+}
+
+impl DirectPolicy for LinuxDirectPolicy {
+    fn check_usable(&self, path: &Path) -> Result<()> {
+        match detect::classify(path) {
+            ResolvConfState::Missing | ResolvConfState::Unmanaged => Ok(()),
+            ResolvConfState::OpenResolv => Err(Error::unsupported(
+                crate::capability::BackendKind::ResolvConfFile,
+                "/etc/resolv.conf is managed by resolvconf",
+            )),
+            ResolvConfState::Foreign => Err(Error::unsupported(
+                crate::capability::BackendKind::ResolvConfFile,
+                "/etc/resolv.conf is managed by another DNS configuration system",
+            )),
         }
     }
 
-    fn check_usable(path: &std::path::Path) -> Result<()> {
-        let metadata = match std::fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        if metadata.is_symlink() {
-            let target = std::fs::read_link(path)?.to_string_lossy().to_string();
-            if target.contains("systemd/resolve") {
-                return Err(Error::unsupported(
-                    BackendKind::ResolvConfFile,
-                    "/etc/resolv.conf is managed by systemd-resolved",
-                ));
-            }
-            if target.contains("NetworkManager") {
-                return Err(Error::unsupported(
-                    BackendKind::ResolvConfFile,
-                    "/etc/resolv.conf is managed by NetworkManager",
-                ));
-            }
-            if target.contains("resolvconf") {
-                return Err(Error::unsupported(
-                    BackendKind::ResolvConfFile,
-                    "/etc/resolv.conf is managed by resolvconf",
-                ));
-            }
-            return Err(Error::unsupported(
-                BackendKind::ResolvConfFile,
-                format_args!("refusing to replace the symlink /etc/resolv.conf -> {target}"),
-            ));
+    fn metadata(&self, path: &Path) -> Result<Option<DirectFileMetadata>> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(Some(DirectFileMetadata {
+                mode: metadata.permissions().mode(),
+                owner: None,
+                flags: None,
+                links: None,
+                modified: None,
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
         }
-        Ok(())
     }
 
-    fn write_content(path: &std::path::Path, content: &[u8], mode: Option<u32>) -> Result<()> {
+    fn write(
+        &self,
+        path: &Path,
+        content: &[u8],
+        mode: Option<u32>,
+        _metadata: Option<&DirectFileMetadata>,
+        _restore_modified_time: bool,
+    ) -> Result<()> {
         let mut file = atomic_write_file::AtomicWriteFile::open(path)?;
         std::io::Write::write_all(&mut file, content)?;
         file.sync_all()?;
         file.commit()?;
-        #[cfg(unix)]
         if let Some(mode) = mode {
-            use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
         }
         Ok(())
     }
 
-    fn current_mode(path: &std::path::Path) -> Result<Option<u32>> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match std::fs::metadata(path) {
-                Ok(metadata) => Ok(Some(metadata.permissions().mode())),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error.into()),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = path;
-            Ok(None)
-        }
-    }
-
-    fn read_current(path: &std::path::Path) -> Result<DirectSnapshot> {
-        let content = match std::fs::read(path) {
-            Ok(content) => Some(content),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
-        };
-        let mode = if content.is_some() {
-            Self::current_mode(path)?
-        } else {
-            None
-        };
-        Ok(DirectSnapshot { content, mode })
-    }
-
-    fn to_platform(resource: &ResourceId, snapshot: &DirectSnapshot) -> Result<PlatformSnapshot> {
-        Ok(PlatformSnapshot::new(
-            BackendKind::ResolvConfFile,
-            resource.clone(),
-            SnapshotData::ResolvConfFile(snapshot.clone()),
-        ))
-    }
-
-    fn from_platform(snapshot: &PlatformSnapshot) -> Result<DirectSnapshot> {
-        match &snapshot.data {
-            SnapshotData::ResolvConfFile(data) => Ok(data.clone()),
-            _ => Err(Error::JournalCorrupt(
-                "resolv.conf snapshot has the wrong backend data".to_string(),
-            )),
-        }
-    }
-}
-
-impl Default for DirectResolvConf {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Backend for DirectResolvConf {
-    fn kind(&self) -> BackendKind {
-        BackendKind::ResolvConfFile
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        self.caps.clone()
-    }
-
-    fn resolve_resources(
+    fn metadata_equivalent(
         &self,
-        scope: &DnsScope,
-        _plan: &NormalizedConfig,
-    ) -> Result<Vec<ResourceId>> {
-        match scope {
-            DnsScope::Global => ResourceId::new("linux:resolv-conf").map(|id| vec![id]),
-            DnsScope::Interface(_) => Err(Error::unsupported(
-                BackendKind::ResolvConfFile,
-                "per-interface DNS is not representable in /etc/resolv.conf",
-            )),
-        }
+        _left: Option<&DirectFileMetadata>,
+        _right: Option<&DirectFileMetadata>,
+    ) -> bool {
+        true
+    }
+
+    fn mutation_metadata_preserved(
+        &self,
+        _before: Option<&DirectFileMetadata>,
+        _after: Option<&DirectFileMetadata>,
+    ) -> bool {
+        true
     }
 
     fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>> {
         linux::list_interfaces()
     }
 
-    fn capture(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let path = std::path::Path::new(RESOLV_CONF);
-        Self::check_usable(path)?;
-        let snapshot = Self::read_current(path)?;
-        Self::to_platform(resource, &snapshot)
+    fn watch_directory(&self) -> WatchDirectory {
+        linux::watch::watch_directories
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
-        let path = std::path::Path::new(RESOLV_CONF);
-        Self::check_usable(path)?;
-        let existing_mode = Self::current_mode(path)?;
-        Self::write_content(path, &build_resolv_conf_content(plan), existing_mode)?;
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
+    fn validate_plan(&self, _plan: &NormalizedConfig) -> Result<()> {
+        Ok(())
     }
 
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let path = std::path::Path::new(RESOLV_CONF);
-        Self::check_usable(path)?;
-        let snapshot = Self::read_current(path)?;
-        Self::to_platform(resource, &snapshot)
+    fn resource(&self) -> &ResourceId {
+        &self.resource
     }
+}
 
-    fn restore(&self, _resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
-        let before = Self::from_platform(snapshot)?;
-        let path = std::path::Path::new(RESOLV_CONF);
-        match before.content {
-            Some(content) => Self::write_content(path, &content, before.mode),
-            None => match std::fs::remove_file(path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            },
-        }
-    }
-
-    fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
-        match (Self::from_platform(a), Self::from_platform(b)) {
-            (Ok(x), Ok(y)) => x.content == y.content,
-            _ => false,
-        }
-    }
-
-    fn matches_desired(&self, snapshot: &PlatformSnapshot, plan: &NormalizedConfig) -> bool {
-        let Ok(current) = Self::from_platform(snapshot) else {
-            return false;
-        };
-        current.content.as_deref() == Some(build_resolv_conf_content(plan).as_slice())
-    }
-
-    fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig> {
-        let snapshot = Self::from_platform(snapshot)?;
-        let Some(bytes) = snapshot.content else {
-            return Ok(DnsConfig::from_parts(
-                scope.clone(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            ));
-        };
-        let (nameservers, search) = parse_resolv_conf_content(&bytes)?;
-        Ok(DnsConfig::from_parts(
-            scope.clone(),
-            nameservers,
-            search,
-            Vec::new(),
-            None,
-        ))
-    }
-
-    fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
-        let parent = std::path::Path::new(RESOLV_CONF)
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("/etc"));
-        crate::platform::linux::watch::watch_directory(
-            BackendKind::ResolvConfFile,
-            &parent,
-            vec![ResourceId::new("linux:resolv-conf").expect("valid resource")],
-            |name| {
-                if name == "resolv.conf" {
-                    ResourceId::new("linux:resolv-conf").ok()
-                } else {
-                    None
-                }
-            },
-            callback,
-        )
-    }
+pub(crate) fn new() -> DirectResolvConf {
+    DirectResolvConf::new(
+        PathBuf::from(linux::RESOLV_CONF_PATH),
+        Arc::new(LinuxDirectPolicy::new()),
+    )
 }
 
 #[cfg(test)]
@@ -279,16 +115,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn absent_file_is_the_only_read_failure_treated_as_absent() {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing");
-        assert_eq!(
-            DirectResolvConf::read_current(&missing).unwrap().content,
-            None
-        );
-        assert!(DirectResolvConf::read_current(root.path()).is_err());
-        use std::os::unix::ffi::OsStrExt;
-        let invalid = std::path::Path::new(std::ffi::OsStr::from_bytes(b"invalid\0path"));
-        assert!(DirectResolvConf::current_mode(invalid).is_err());
+    fn direct_policy_rejects_foreign_generated_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        std::fs::write(&path, b"# Generated by NetworkManager\n").unwrap();
+        assert!(LinuxDirectPolicy::new().check_usable(&path).is_err());
     }
 }

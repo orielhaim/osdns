@@ -93,10 +93,9 @@ pub enum Error {
     },
     /// This compilation target has no operating-system DNS backend.
     ///
-    /// Nothing was mutated. `osdns` compiles on Android and other
-    /// non-Linux/macOS/Windows targets, but a real manager cannot be
-    /// constructed there. This is not [`Error::Unsupported`]: there is no
-    /// backend to probe.
+    /// Nothing was mutated. `osdns` compiles on Android and other targets
+    /// without a DNS backend, but a real manager cannot be constructed there.
+    /// This is not [`Error::Unsupported`]: there is no backend to probe.
     #[error("unsupported platform ({os}): no OS DNS backend is implemented for this target")]
     UnsupportedPlatform {
         /// `std::env::consts::OS` for the compiled target.

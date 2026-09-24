@@ -1588,7 +1588,7 @@ impl DnsManagerBuilder {
     /// Overrides the directory used for the durable journal.
     ///
     /// Defaults to a platform-appropriate system location (`/var/lib/osdns`
-    /// on Linux, `PROGRAMDATA\osdns` on Windows, `/Library/Application
+    /// on Linux and the BSDs, `PROGRAMDATA\osdns` on Windows, `/Library/Application
     /// Support/osdns` on macOS). The directory is created on
     /// [`DnsManagerBuilder::build`] and secured against unprivileged
     /// modification; failure surfaces as [`Error::RequiresPrivilege`] or

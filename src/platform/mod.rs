@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+pub(crate) mod bsd;
 #[cfg(feature = "test-util")]
 pub(crate) mod fake;
 #[cfg(target_os = "linux")]
@@ -6,6 +8,8 @@ pub(crate) mod linux;
 pub(crate) mod macos;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) mod text_config;
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+pub(crate) mod unix;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
@@ -37,10 +41,10 @@ pub(crate) enum SnapshotData {
     SystemdResolved(linux::resolved::ResolvedSnapshot),
     #[cfg(target_os = "linux")]
     NetworkManager(linux::network_manager::NmSnapshotData),
-    #[cfg(target_os = "linux")]
-    Resolvconf(linux::resolvconf::ResolvconfSnapshot),
-    #[cfg(target_os = "linux")]
-    ResolvConfFile(linux::direct::DirectSnapshot),
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+    Resolvconf(unix::openresolv::ResolvconfSnapshot),
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+    ResolvConfFile(unix::direct::DirectSnapshot),
     #[cfg(target_os = "macos")]
     MacosSystemConfiguration(macos::MacosSnapshot),
     #[cfg(target_os = "windows")]
@@ -49,7 +53,9 @@ pub(crate) enum SnapshotData {
     /// backend. Never constructed; [`select_default_backend`] fails first.
     #[cfg(not(any(
         feature = "test-util",
+        target_os = "freebsd",
         target_os = "linux",
+        target_os = "netbsd",
         target_os = "macos",
         target_os = "windows"
     )))]
@@ -519,13 +525,26 @@ pub(crate) fn construct_backend(
             .map(|b| Arc::new(b) as Arc<dyn Backend>),
         #[cfg(target_os = "linux")]
         BackendKind::Resolvconf => {
-            let probe = linux::resolvconf::probe().ok_or_else(|| {
+            #[cfg(feature = "test-util")]
+            let probe = std::env::var_os("OSDNS_TEST_RESOLV_CONF")
+                .map(std::path::PathBuf::from)
+                .and_then(linux::resolvconf::probe_for_test)
+                .or_else(linux::resolvconf::probe);
+            #[cfg(not(feature = "test-util"))]
+            let probe = linux::resolvconf::probe();
+            let probe = probe.ok_or_else(|| {
                 Error::BackendUnavailable("resolvconf/openresolv is not available".to_string())
             })?;
-            Ok(Arc::new(linux::resolvconf::Resolvconf::new(probe, owner)))
+            Ok(Arc::new(linux::resolvconf::new(probe, owner)))
         }
         #[cfg(target_os = "linux")]
-        BackendKind::ResolvConfFile => Ok(Arc::new(linux::direct::DirectResolvConf::new())),
+        BackendKind::ResolvConfFile => Ok(Arc::new(linux::direct::new())),
+        #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+        BackendKind::Resolvconf => {
+            bsd::new_resolvconf(owner).map(|backend| Arc::new(backend) as Arc<dyn Backend>)
+        }
+        #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+        BackendKind::ResolvConfFile => Ok(Arc::new(bsd::direct::new())),
         #[cfg(target_os = "windows")]
         BackendKind::WindowsIpHelper => Ok(Arc::new(windows::WindowsBackend::new(owner))),
         #[cfg(target_os = "macos")]
@@ -535,7 +554,9 @@ pub(crate) fn construct_backend(
         #[allow(unreachable_patterns)]
         _ => {
             if cfg!(any(
+                target_os = "freebsd",
                 target_os = "linux",
+                target_os = "netbsd",
                 target_os = "macos",
                 target_os = "windows"
             )) {
@@ -551,7 +572,7 @@ pub(crate) fn construct_backend(
 }
 
 /// Selects the platform backend based on which component actually owns DNS
-/// state on this host (Linux) or the single native backend (Windows, macOS).
+/// state (Linux and the BSDs) or the single native backend (Windows, macOS).
 ///
 /// Android and other non-desktop targets have no OS backend. Detection fails
 /// with [`Error::UnsupportedPlatform`] instead of pretending to be Linux.
@@ -568,7 +589,17 @@ pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn B
     {
         Ok(std::sync::Arc::new(windows::WindowsBackend::new(owner)))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+    {
+        bsd::select(owner)
+    }
+    #[cfg(not(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     {
         let _ = owner;
         Err(Error::unsupported_platform())
@@ -577,7 +608,13 @@ pub(crate) fn select_default_backend(owner: &str) -> Result<std::sync::Arc<dyn B
 
 #[cfg(all(
     test,
-    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+    not(any(
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd",
+        target_os = "macos",
+        target_os = "windows"
+    ))
 ))]
 mod tests {
     use super::*;

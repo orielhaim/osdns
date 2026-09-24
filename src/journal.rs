@@ -187,11 +187,11 @@ fn encode_snapshot(data: &SnapshotData) -> std::result::Result<serde_json::Value
         SnapshotData::NetworkManager(value) => {
             serde_json::to_value(value).map_err(|error| error.to_string())
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
         SnapshotData::Resolvconf(value) => {
             serde_json::to_value(value).map_err(|error| error.to_string())
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
         SnapshotData::ResolvConfFile(value) => {
             serde_json::to_value(value).map_err(|error| error.to_string())
         }
@@ -205,7 +205,9 @@ fn encode_snapshot(data: &SnapshotData) -> std::result::Result<serde_json::Value
         }
         #[cfg(not(any(
             feature = "test-util",
+            target_os = "freebsd",
             target_os = "linux",
+            target_os = "netbsd",
             target_os = "macos",
             target_os = "windows"
         )))]
@@ -232,11 +234,11 @@ fn decode_snapshot(
         BackendKind::NetworkManager => serde_json::from_value(data)
             .map(SnapshotData::NetworkManager)
             .map_err(|error| error.to_string()),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
         BackendKind::Resolvconf => serde_json::from_value(data)
             .map(SnapshotData::Resolvconf)
             .map_err(|error| error.to_string()),
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
         BackendKind::ResolvConfFile => serde_json::from_value(data)
             .map(SnapshotData::ResolvConfFile)
             .map_err(|error| error.to_string()),
@@ -466,6 +468,23 @@ impl JournalStore {
 #[cfg(all(test, not(target_os = "windows")))]
 mod snapshot_codec {
     use super::*;
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+    #[test]
+    fn legacy_unix_resolver_payloads_decode_without_optional_fields() {
+        let resolvconf = decode_snapshot(
+            BackendKind::Resolvconf,
+            serde_json::json!({"content": null}),
+        )
+        .unwrap();
+        assert!(matches!(resolvconf, SnapshotData::Resolvconf(_)));
+        let direct = decode_snapshot(
+            BackendKind::ResolvConfFile,
+            serde_json::json!({"content": null}),
+        )
+        .unwrap();
+        assert!(matches!(direct, SnapshotData::ResolvConfFile(_)));
+    }
 
     #[test]
     fn decode_snapshot_rejects_backends_without_local_payload() {

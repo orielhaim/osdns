@@ -68,8 +68,9 @@ impl fmt::Display for BackendKind {
 /// Linux: systemd-resolved mutations are unconditional and best-effort.
 /// NetworkManager can compare-and-mutate on applied-connection
 /// `version_id` but Reapply does not return the resulting version, so
-/// ownership identity is best-effort. resolvconf, `/etc/resolv.conf`,
-/// Windows, and macOS are unconditional and best-effort. Check
+/// ownership identity is best-effort. Openresolv owns a global source record;
+/// it does not provide per-interface routing through libc. Openresolv,
+/// `/etc/resolv.conf`, Windows, and macOS are unconditional and best-effort. Check
 /// [`Capabilities::mutation_guard`] and
 /// [`Capabilities::ownership_identity`].
 ///
