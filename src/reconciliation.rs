@@ -98,6 +98,7 @@ struct BreakerState {
 pub(crate) struct Reconciler {
     pending: Mutex<HashMap<ResourceId, Pending>>,
     breaker: Mutex<HashMap<ResourceId, BreakerState>>,
+    reconcile_gate: Mutex<()>,
 }
 
 impl Reconciler {
@@ -162,6 +163,10 @@ impl Reconciler {
     #[cfg(feature = "test-util")]
     pub(crate) fn clear(&self) {
         self.pending.lock().clear();
+    }
+
+    pub(crate) fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.reconcile_gate.lock()
     }
 
     fn breaker_gate(&self, resource: &ResourceId) -> Option<Duration> {
@@ -557,6 +562,10 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error
                     continue;
                 }
                 for resource in due {
+                    if worker_inner.enforce_parked() {
+                        continue;
+                    }
+                    let _reconcile_guard = worker_inner.reconciler.lock_gate();
                     if worker_inner.enforce_parked() {
                         continue;
                     }

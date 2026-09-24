@@ -254,6 +254,7 @@ impl Inner {
             enforce.feed = None;
             enforce.parked = true;
         }
+        let _reconcile_guard = self.reconciler.lock_gate();
         self.reconciler.clear();
     }
 
@@ -1527,6 +1528,7 @@ impl DnsManager {
         let resource: ResourceId = resource.parse().map_err(|e| {
             Error::invalid_config(format_args!("invalid resource id {resource:?}: {e}"))
         })?;
+        let _reconcile_guard = self.inner.reconciler.lock_gate();
         Ok(
             match self
                 .inner
