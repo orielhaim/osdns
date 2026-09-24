@@ -481,6 +481,7 @@ jobs:
 
       - name: Configure openresolv
         run: |
+          sed -i '/^[[:space:]]*resolv_conf[[:space:]]*=/d' /etc/resolvconf.conf
           echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
           resolvconf -a osdns-ci < /etc/resolv.conf
 
