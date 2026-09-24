@@ -211,6 +211,13 @@ impl MutationAttempt {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) enum LegacyJournalRecovery {
+    NotLegacy,
+    Clear,
+    Unresolved(&'static str),
+}
+
 /// The boundary between the transaction engine and platform-specific code.
 ///
 /// Implementations are crate-internal; the public API never exposes
@@ -414,6 +421,18 @@ pub(crate) trait Backend: Send + Sync {
         }
     }
 
+    /// Classifies a backend-local legacy journal during recovery. A legacy
+    /// backend may clear only when no native mutation is needed; unresolved
+    /// records remain retained and block subsequent apply rather than being
+    /// reconstructed.
+    fn legacy_recovery(
+        &self,
+        _before: &PlatformSnapshot,
+        _current: &PlatformSnapshot,
+    ) -> LegacyJournalRecovery {
+        LegacyJournalRecovery::NotLegacy
+    }
+
     /// Applies `plan` only while current state still matches `expected`.
     ///
     /// Implemented only by backends with [`MutationGuard::CompareAndMutate`].
@@ -484,6 +503,9 @@ pub(crate) trait Backend: Send + Sync {
     }
 
     /// Interprets a snapshot as a platform-neutral [`DnsConfig`].
+    ///
+    /// For Openresolv global snapshots this is the effective generated libc
+    /// resolver state, not the private owner-tagged source record.
     fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig>;
 
     /// Starts native change notifications for the backend's resources.
@@ -533,7 +555,9 @@ pub(crate) fn construct_backend(
             #[cfg(not(feature = "test-util"))]
             let probe = linux::resolvconf::probe();
             let probe = probe.ok_or_else(|| {
-                Error::BackendUnavailable("resolvconf/openresolv is not available".to_string())
+                Error::BackendUnavailable(
+                    "a verified openresolv backend is not available".to_string(),
+                )
             })?;
             Ok(Arc::new(linux::resolvconf::new(probe, owner)))
         }

@@ -9,7 +9,7 @@ use crate::normalize::{DnsSuffix, NormalizedConfig};
 ///
 /// - [`DnsScope::Global`] addresses system-wide DNS state. Only backends with
 ///   [`Capabilities::global_dns`](crate::Capabilities) support it (Linux
-///   resolvconf/direct, macOS, and the BSD backends); Windows rejects it with
+///   Openresolv/direct, macOS, and the BSD backends); Windows rejects it with
 ///   [`Error::Unsupported`](crate::Error).
 /// - [`DnsScope::Interface`] addresses one interface's DNS state. Requires
 ///   [`Capabilities::per_interface_dns`](crate::Capabilities).
@@ -34,6 +34,8 @@ pub enum DnsScope {
 /// the primary interface (default route on Linux, primary service on macOS).
 /// macOS rejects [`InterfaceSelector::Index`] with
 /// [`Error::InvalidConfig`](crate::Error); use `Default` or `Name` there.
+/// Openresolv, direct `/etc/resolv.conf`, and the BSD backends reject
+/// interface scopes because their DNS records are global-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum InterfaceSelector {

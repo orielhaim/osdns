@@ -36,20 +36,20 @@ If another actor changes the resource, `osdns` does not blindly restore an old s
 | -------- | ----------------------- | ----------------------- | ----------------- | ---------------------------------- |
 | Linux    | systemd-resolved        | per-link                | routing domains   | D-Bus                              |
 | Linux    | NetworkManager          | per-interface           | backend-dependent | D-Bus                              |
-| Linux    | resolvconf / openresolv | global source record    | no                | state-directory events             |
-| Linux    | `/etc/resolv.conf`      | global                  | no                | inotify                            |
-| FreeBSD  | resolvconf / openresolv | global source record    | no                | kqueue via `notify`                |
-| FreeBSD  | `/etc/resolv.conf`      | global, unmanaged only  | no                | kqueue via `notify`                |
-| NetBSD   | resolvconf / openresolv | global source record    | no                | kqueue via `notify`                |
-| NetBSD   | `/etc/resolv.conf`      | global, unmanaged only  | no                | kqueue via `notify`                |
+| Linux    | Openresolv (`resolvconf`) | global source record  | no                | state-directory events             |
+| Linux    | `/etc/resolv.conf`        | global                | no                | inotify                            |
+| FreeBSD  | Openresolv (`resolvconf`) | global source record  | no                | kqueue via `notify`                |
+| FreeBSD  | `/etc/resolv.conf`        | global, unmanaged only | no                | kqueue via `notify`                |
+| NetBSD   | Openresolv (`resolvconf`) | global source record  | no                | kqueue via `notify`                |
+| NetBSD   | `/etc/resolv.conf`        | global, unmanaged only | no                | kqueue via `notify`                |
 | Windows  | IP Helper               | per-interface IPv4/IPv6 | NRPT              | IP Helper + registry notifications |
 | macOS    | SystemConfiguration     | per-service             | `/etc/resolver`   | SCDynamicStore + FSEvents          |
 
-Backend selection is based on live DNS ownership, not on installed programs. On BSD, an exact openresolv signature in `/etc/resolv.conf` is required before osdns will use openresolv. The openresolv key store must also be identifiable through its standard state directories; custom `state_dir` layouts fail closed because `resolvconf.conf` is executable shell code and is never evaluated by osdns.
+Backend selection is based on live DNS ownership, not on installed programs. The `BackendKind::Resolvconf` backend is specifically Openresolv's `resolvconf(8)` implementation; it requires Openresolv 3.9 or newer, verifies the Openresolv version marker and key store before use, and rejects passthrough mode. Classic Debian `resolvconf` is rejected rather than treated as compatible. On BSD, an exact Openresolv signature in `/etc/resolv.conf` is also required before osdns will use the backend. The key store must be identifiable through its standard state directories; custom `state_dir` layouts and complex or ambiguous `resolvconf.conf` shell syntax fail closed because osdns never sources that file.
 
-Openresolv records feed one libc-global resolver. They are not per-interface routes, so `per_interface_dns` and `split_dns` are false. The active libc file must contain the requested values after apply; changes to that file or another openresolv record are treated as global external changes. FreeBSD and NetBSD libc limits of three nameservers and six search domains are checked before mutation; the search-list limit is 256 characters on FreeBSD and 1024 on NetBSD.
+Openresolv records feed one libc-global resolver. They are not per-interface routes, so `per_interface_dns` and `split_dns` are false. BSD interface enumeration is informational; `DnsScope::Interface` is unsupported. `snapshot(Global)` reports the effective generated libc resolver state, including contributions from all Openresolv records; the owner-tagged source record remains private transaction state. The active libc file must contain the requested values after apply; changes to that file or another Openresolv record are treated as global external changes. FreeBSD and NetBSD libc limits of three nameservers and six search domains are checked before mutation; the search-list limit is 256 characters on FreeBSD and 1024 on NetBSD.
 
-Direct BSD `/etc/resolv.conf` mutation is limited to an unmanaged, single-link regular file. Symlinks, generated files, hard links, file flags, ACLs, and extended attributes are refused rather than stripped or replaced unsafely.
+Direct BSD `/etc/resolv.conf` mutation is limited to an unmanaged, single-link regular file. Symlinks, generated files, hard links, file flags, ACLs, and extended attributes are refused rather than stripped or replaced unsafely. Linux direct mutation preserves the captured mode and attempts owner preservation, but does not promise preservation of ACLs, xattrs, hard-link identity, timestamps, or security labels.
 
 Platform capabilities are exposed at runtime through `DnsManager::capabilities()`.
 
@@ -57,7 +57,7 @@ Platform capabilities are exposed at runtime through `DnsManager::capabilities()
 
 ```toml
 [dependencies]
-osdns = "0.2"
+osdns = "0.3"
 ```
 
 Create a manager with an application-specific owner identifier:
@@ -227,7 +227,13 @@ Recovery never guesses ownership.
 
 If current state no longer matches either side of a recorded transaction, the resource is reported as an external conflict and left untouched.
 
-Unknown or corrupt journal formats fail closed.
+Unknown or corrupt journal formats fail closed. Schema-3 Openresolv records
+written by 0.2.x are recognized as content-only legacy records. They are
+cleared without mutation only when the current owner-key content matches their
+captured original content and the effective generated resolver output contains
+those original values; otherwise recovery refuses to restore because the old
+key attributes and effective-file witness are unavailable. Do not downgrade
+after writing 0.3.x journals.
 
 ## External changes
 
@@ -259,7 +265,9 @@ let dns = DnsManager::builder()
     .build()?;
 ```
 
-When watching is active, external changes to resources owned by a live lease are reconciled.
+When an Enforce lease is active, external changes to resources owned by that
+lease are reconciled. Public [`watch()`](#watching) subscriptions are optional
+observability hooks and are not required for Enforce.
 
 The reconciler:
 
@@ -273,7 +281,8 @@ The reconciler:
 
 Restoring a rebased lease returns to the new external base, not the state that existed when the original lease was created.
 
-Reconciliation only runs when `watch()` is active.
+The first active Enforce lease starts internal observation automatically; the
+last lease ending stops it.
 
 ## Watching
 
@@ -321,7 +330,7 @@ if caps.split_dns {
 }
 ```
 
-Available capability flags include:
+Available capability fields include:
 
 ```text
 read
@@ -329,8 +338,12 @@ global_dns
 per_interface_dns
 search_domains
 split_dns
+default_route
 watch
 cache_flush
+mutation_guard
+ownership_identity
+resource_binding
 ```
 
 Applications should use capabilities when behavior depends on a platform-specific facility.
@@ -355,18 +368,18 @@ The caller is responsible for running the process with the appropriate OS privil
 
 It does not require Tokio or async-std.
 
-Configuration changes are control-plane operations. Native blocking APIs are used where appropriate, and native watcher threads are started only when watching is requested.
+Configuration changes are control-plane operations. Native blocking APIs are used where appropriate; native watcher threads are started for public watch subscriptions and for the internal observation required by active Enforce leases.
 
-Primary backends do not shell out.
-
-The `resolvconf` / `openresolv` backend invokes the corresponding utility directly when live ownership and its key store have been verified.
+Primary backends use native APIs directly. The Openresolv backend invokes its
+`resolvconf(8)` utility directly after verifying the implementation, live
+ownership, and key store; it never evaluates `/etc/resolvconf.conf` itself.
 
 ## Features
 
 The default feature set is empty.
 
 ```toml
-osdns = { version = "0.2", features = ["tracing"] }
+osdns = { version = "0.3", features = ["tracing"] }
 ```
 
 ### `tracing`

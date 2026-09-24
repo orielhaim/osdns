@@ -9,13 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-* FreeBSD and NetBSD support with native CI.
-* BSD interface, routing, and watch support.
+* FreeBSD and NetBSD global DNS backends with native CI, interface
+  enumeration, and kqueue watch support.
 
 ### Changed
 
 * Openresolv is global-DNS only; per-interface DNS is no longer advertised.
 * Resolver backend detection now uses actual ownership.
+
+### Fixed
+
+* The `Resolvconf` backend is explicitly Openresolv-only; Openresolv 3.9+
+  is required for its version marker, passthrough mode is rejected, and
+  classic Debian `resolvconf` is rejected.
 
 ## [0.2.3] - 2026-09-20
 

@@ -1,6 +1,4 @@
 pub(crate) mod direct;
-#[cfg(test)]
-pub(crate) mod route;
 pub(crate) mod watch;
 
 use std::collections::BTreeMap;
@@ -10,8 +8,6 @@ use std::sync::Arc;
 use nix::ifaddrs::getifaddrs;
 use nix::net::if_::InterfaceFlags;
 
-#[cfg(test)]
-use crate::config::{DnsScope, InterfaceSelector};
 use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::NormalizedConfig;
@@ -40,50 +36,13 @@ pub(crate) fn list_interfaces() -> Result<Vec<InterfaceInfo>> {
             name: OsString::from(name),
             friendly_name: None,
             guid: None,
-            is_up: flags.contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING),
+            is_up: interface_is_up(flags),
         })
         .collect())
 }
 
-#[cfg(test)]
-pub(crate) fn resolve_interface_selector(scope: &DnsScope) -> Result<(u32, OsString)> {
-    let interfaces = list_interfaces()?;
-    match scope {
-        DnsScope::Global => unreachable!("global scope handled by caller"),
-        DnsScope::Interface(InterfaceSelector::Default) => {
-            let index = route::default_interface()?;
-            let interface = interfaces
-                .into_iter()
-                .find(|interface| interface.index == index)
-                .ok_or_else(|| {
-                    Error::invalid_config(format_args!(
-                        "default-route interface index {index} is not present"
-                    ))
-                })?;
-            Ok((index, interface.name))
-        }
-        DnsScope::Interface(InterfaceSelector::Index(index)) => {
-            let interface = interfaces
-                .into_iter()
-                .find(|interface| interface.index == *index)
-                .ok_or_else(|| {
-                    Error::invalid_config(format_args!(
-                        "interface with index {index} does not exist"
-                    ))
-                })?;
-            Ok((*index, interface.name))
-        }
-        DnsScope::Interface(InterfaceSelector::Name(name)) => interfaces
-            .into_iter()
-            .find(|interface| interface.name == *name)
-            .map(|interface| (interface.index, interface.name))
-            .ok_or_else(|| {
-                Error::invalid_config(format_args!(
-                    "interface {} does not exist",
-                    name.to_string_lossy()
-                ))
-            }),
-    }
+fn interface_is_up(flags: InterfaceFlags) -> bool {
+    flags.contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
 }
 
 pub(crate) fn validate_resolver_limits(plan: &NormalizedConfig) -> Result<()> {
@@ -121,7 +80,7 @@ pub(crate) fn validate_resolver_limits(plan: &NormalizedConfig) -> Result<()> {
 pub(crate) fn new_resolvconf(owner: &str) -> Result<shared_openresolv::Resolvconf> {
     let probe = shared_openresolv::probe().ok_or_else(|| {
         Error::BackendUnavailable(
-            "openresolv owns /etc/resolv.conf, but its live key directory could not be verified"
+            "openresolv owns /etc/resolv.conf, but a verified openresolv backend was not found"
                 .to_string(),
         )
     })?;
@@ -140,7 +99,18 @@ pub(crate) fn new_resolvconf(owner: &str) -> Result<shared_openresolv::Resolvcon
 pub(crate) fn select(owner: &str) -> Result<Arc<dyn Backend>> {
     match detect::classify(std::path::Path::new(detect::RESOLV_CONF_PATH)) {
         ResolvConfState::OpenResolv => Ok(Arc::new(new_resolvconf(owner)?)),
-        ResolvConfState::Unmanaged | ResolvConfState::Missing => Ok(Arc::new(direct::new())),
+        ResolvConfState::Unmanaged | ResolvConfState::Missing => {
+            if shared_openresolv::configuration_blocks_direct(std::path::Path::new(
+                detect::RESOLV_CONF_PATH,
+            )) {
+                Err(Error::BackendUnavailable(
+                    "an Openresolv configuration is present but cannot be verified; refusing direct resolv.conf mutation"
+                        .to_string(),
+                ))
+            } else {
+                Ok(Arc::new(direct::new()))
+            }
+        }
         ResolvConfState::Foreign => Err(Error::BackendUnavailable(
             "/etc/resolv.conf has an unknown or foreign DNS manager signature".to_string(),
         )),
@@ -152,31 +122,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_default_route_matches_route_command() {
-        let index = route::default_interface().unwrap();
-        let command_name = route::route_command_interface().unwrap();
-        let interface = list_interfaces()
-            .unwrap()
-            .into_iter()
-            .find(|interface| interface.name == OsString::from(&command_name))
-            .expect("route command interface must be enumerated");
-        assert_eq!(interface.index, index);
-        assert!(interface.is_up);
-    }
-
-    #[test]
-    fn name_index_and_default_selectors_agree() {
-        let (index, name) =
-            resolve_interface_selector(&DnsScope::Interface(InterfaceSelector::Default)).unwrap();
-        assert_eq!(
-            resolve_interface_selector(&DnsScope::Interface(InterfaceSelector::Index(index)))
-                .unwrap(),
-            (index, name.clone())
-        );
-        assert_eq!(
-            resolve_interface_selector(&DnsScope::Interface(InterfaceSelector::Name(name.clone())))
-                .unwrap(),
-            (index, name)
-        );
+    fn interface_up_requires_administrative_and_running_flags() {
+        assert!(!interface_is_up(InterfaceFlags::empty()));
+        assert!(!interface_is_up(InterfaceFlags::IFF_UP));
+        assert!(!interface_is_up(InterfaceFlags::IFF_RUNNING));
+        assert!(interface_is_up(
+            InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING
+        ));
     }
 }

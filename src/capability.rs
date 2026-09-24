@@ -19,7 +19,9 @@ pub enum BackendKind {
     SystemdResolved,
     /// NetworkManager via its D-Bus API.
     NetworkManager,
-    /// The `resolvconf` or `openresolv` utility.
+    /// The Openresolv implementation of the `resolvconf(8)` utility.
+    ///
+    /// Classic Debian `resolvconf` is not supported by this backend kind.
     Resolvconf,
     /// Direct manipulation of `/etc/resolv.conf`.
     ResolvConfFile,

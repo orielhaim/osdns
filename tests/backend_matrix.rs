@@ -19,14 +19,18 @@ use osdns::testing::manager_for_backend;
 use osdns::{BackendKind, DnsConfig, DnsScope};
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 use std::net::IpAddr;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+use std::sync::Arc;
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+use std::time::Instant;
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Output, Stdio},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
-    time::Instant,
 };
 
 fn mutation_gate_open() -> bool {
@@ -50,7 +54,15 @@ fn bsd_system_guard() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(target_os = "linux")]
+fn linux_resolvconf_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 fn resolvconf_binary() -> PathBuf {
     ["/sbin/resolvconf", "/usr/sbin/resolvconf"]
         .into_iter()
@@ -59,7 +71,7 @@ fn resolvconf_binary() -> PathBuf {
         .expect("openresolv resolvconf must be installed")
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 fn resolvconf_owner_tag() -> String {
     const NAMESPACE: u128 = 0x6f73_646e_7372_6573_6f6c_7600_0001;
     let owner = "io.osdns.matrix";
@@ -68,7 +80,7 @@ fn resolvconf_owner_tag() -> String {
     format!("{readable}-{hash}.osdns.global")
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 fn run_resolvconf(args: &[&str], input: Option<&[u8]>) -> Output {
     let mut command = Command::new(resolvconf_binary());
     command
@@ -98,7 +110,7 @@ fn run_resolvconf(args: &[&str], input: Option<&[u8]>) -> Output {
     output
 }
 
-#[cfg(any(target_os = "freebsd", target_os = "netbsd"))]
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
 fn resolvconf_key_exists(tag: &str) -> bool {
     let output = run_resolvconf(&["-i"], None);
     String::from_utf8_lossy(&output.stdout)
@@ -354,6 +366,7 @@ fn matrix_resolvconf_lifecycle() {
     if !mutation_gate_open() {
         return;
     }
+    let _guard = linux_resolvconf_guard();
     let (manager, _state_dir) = match pinned_manager("matrix-resolvconf", BackendKind::Resolvconf) {
         Ok(pair) => pair,
         Err(Error::BackendUnavailable(_)) => {
@@ -380,6 +393,111 @@ fn matrix_resolvconf_lifecycle() {
     );
     lease.restore().unwrap();
     assert_eq!(manager.snapshot(&scope).unwrap(), before);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn matrix_legacy_openresolv_journal_clears_without_mutation() {
+    if !mutation_gate_open() {
+        return;
+    }
+    let _guard = linux_resolvconf_guard();
+    let tag = resolvconf_owner_tag();
+    assert!(!resolvconf_key_exists(&tag));
+    let (manager, state_dir) = pinned_manager("matrix-legacy-openresolv", BackendKind::Resolvconf)
+        .expect("construct openresolv backend");
+    let config = DnsConfig::builder(DnsScope::Global)
+        .nameserver(ip("127.0.0.1"))
+        .build()
+        .unwrap();
+    let lease = manager.apply(&config).expect("apply openresolv record");
+    lease.debug_release_locks_keep_journal();
+    let file = journal_files(&state_dir).pop().unwrap();
+    let path = state_dir.join("journal").join(file);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let original = b"nameserver 192.0.2.10\n";
+    record["before"]["data"] = serde_json::json!({"content": original.to_vec()});
+    record["applied"]["data"] = serde_json::json!({"content": b"nameserver 127.0.0.1\n".to_vec()});
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    run_resolvconf(&["-d", &tag, "-f"], None);
+    run_resolvconf(&["-a", &tag, "-m", "17"], Some(original));
+
+    let outcomes = manager.recover_stale().unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [osdns::RecoveryOutcome::JournalCleared { .. }]
+    ));
+    assert!(journal_files(&state_dir).is_empty());
+    assert!(resolvconf_key_exists(&tag));
+    run_resolvconf(&["-d", &tag, "-f"], None);
+
+    let (manager, state_dir) = pinned_manager(
+        "matrix-legacy-openresolv-unresolved",
+        BackendKind::Resolvconf,
+    )
+    .expect("construct openresolv backend");
+    let lease = manager.apply(&config).expect("apply openresolv record");
+    lease.debug_release_locks_keep_journal();
+    let file = journal_files(&state_dir).pop().unwrap();
+    let path = state_dir.join("journal").join(file);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["before"]["data"] = serde_json::json!({"content": original.to_vec()});
+    record["applied"]["data"] = serde_json::json!({"content": b"nameserver 127.0.0.1\n".to_vec()});
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let outcomes = manager.recover_stale().unwrap();
+    assert!(matches!(
+        outcomes.as_slice(),
+        [osdns::RecoveryOutcome::Failed { detail, .. }]
+            if detail.contains("lacks key attributes")
+    ));
+    assert_eq!(journal_files(&state_dir).len(), 1);
+    assert!(resolvconf_key_exists(&tag));
+    run_resolvconf(&["-d", &tag, "-f"], None);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn matrix_classic_resolvconf_is_rejected() {
+    if std::env::var_os("OSDNS_EXPECT_CLASSIC_RESOLVCONF").is_none() {
+        return;
+    }
+    let state = temp_dir("matrix-classic-resolvconf");
+    let error = manager_for_backend(
+        "io.osdns.classic-resolvconf",
+        &state,
+        BackendKind::Resolvconf,
+        Duration::from_secs(10),
+    )
+    .unwrap_err();
+    match error {
+        Error::BackendUnavailable(detail) => assert!(
+            detail.contains("openresolv"),
+            "classic resolvconf rejection was not explicit: {detail}"
+        ),
+        error => panic!("unexpected error: {error}"),
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn matrix_openresolv_passthrough_is_rejected() {
+    if std::env::var_os("OSDNS_EXPECT_OPENRESOLV_PASSTHROUGH").is_none() {
+        return;
+    }
+    let error = osdns::DnsManager::builder()
+        .owner("io.osdns.openresolv-passthrough")
+        .build()
+        .unwrap_err();
+    match error {
+        Error::BackendUnavailable(detail) => assert!(
+            detail.contains("Openresolv"),
+            "passthrough rejection was not explicit: {detail}"
+        ),
+        error => panic!("unexpected error: {error}"),
+    }
 }
 
 #[test]
@@ -521,8 +639,12 @@ fn matrix_bsd_openresolv_lifecycle_watch_and_external_modification() {
             .starts_with(&format!("{}:resolvconf:tag:", std::env::consts::OS))
     );
     let actual = manager.snapshot(&scope).unwrap();
-    assert_eq!(actual.nameservers(), config.nameservers());
-    assert_eq!(actual.search_domains(), config.search_domains());
+    assert!(actual.nameservers().contains(&config.nameservers()[0]));
+    assert!(
+        actual
+            .search_domains()
+            .contains(&config.search_domains()[0])
+    );
     std::thread::sleep(Duration::from_millis(600));
     run_resolvconf(
         &["-a", &resolvconf_owner_tag(), "-m", "0"],
@@ -554,16 +676,20 @@ fn matrix_bsd_openresolv_restores_preexisting_key_and_metric() {
     assert_eq!(metric_for_tag(&resolvconf_owner_tag()), Some(17));
     let (manager, _state_dir) =
         pinned_manager("matrix-bsd-existing", BackendKind::Resolvconf).unwrap();
+    let active = active_nameserver();
     let config = DnsConfig::builder(DnsScope::Global)
-        .nameserver(active_nameserver())
+        .nameserver(active)
         .build()
         .unwrap();
     let lease = manager.apply(&config).unwrap();
     lease.restore().unwrap();
-    assert_eq!(
-        manager.snapshot(&DnsScope::Global).unwrap().nameservers(),
-        &[ip("192.0.2.251")]
-    );
+    let restored_nameservers = manager
+        .snapshot(&DnsScope::Global)
+        .unwrap()
+        .nameservers()
+        .to_vec();
+    assert!(restored_nameservers.contains(&ip("192.0.2.251")));
+    assert!(restored_nameservers.contains(&active));
     assert_eq!(metric_for_tag(&resolvconf_owner_tag()), Some(17));
     let restored_live = std::fs::read("/etc/resolv.conf").unwrap();
     let restored_text = String::from_utf8_lossy(&restored_live);

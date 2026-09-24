@@ -1,9 +1,8 @@
-//! Enforce mode: reconcile external changes while watching is active.
+//! Enforce mode: self-contained reconciliation for an active lease.
 //!
-//! Reconciliation only operates while `watch()` is active. Without a watch,
-//! `ConflictPolicy::Enforce` behaves like `Cooperative`: conflicts surface as
-//! `Error::ExternalModification` and nothing is overwritten. Requires
-//! elevated privileges like any mutation.
+//! The first Enforce lease starts the internal observer automatically. A
+//! public `watch()` subscription is optional and only adds observability.
+//! Requires elevated privileges like any mutation.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +27,7 @@ fn main() -> osdns::Result<()> {
         .build()?;
     manager.validate(&config)?;
 
-    // The watch must stay alive for reconciliation to run.
+    // Enforce already owns its internal observer; this is optional output.
     let _watch = if caps.watch {
         Some(manager.watch(Arc::new(|event| println!("event: {event:?}")))?)
     } else {

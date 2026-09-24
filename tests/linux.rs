@@ -1,7 +1,7 @@
 //! Linux integration tests.
 //!
 //! These run only on Linux and skip gracefully when the corresponding system
-//! components (D-Bus, systemd-resolved, NetworkManager, resolvconf) are
+//! components (D-Bus, systemd-resolved, NetworkManager, Openresolv) are
 //! absent, so they are safe on minimal CI runners.
 
 #![cfg(target_os = "linux")]

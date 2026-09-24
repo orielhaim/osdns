@@ -486,6 +486,38 @@ mod snapshot_codec {
         assert!(matches!(direct, SnapshotData::ResolvConfFile(_)));
     }
 
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+    #[test]
+    fn schema_3_openresolv_0_2_fixture_decodes_without_current_metadata() {
+        let record = decode_record(
+            Path::new("journal-openresolv-0.2-applied.json"),
+            include_bytes!("../tests/fixtures/journal-openresolv-0.2-applied.json"),
+        )
+        .unwrap();
+        assert_eq!(record.backend, BackendKind::Resolvconf);
+        let SnapshotData::Resolvconf(before) = &record.before.data else {
+            panic!("unexpected snapshot kind");
+        };
+        let applied_snapshot = record.applied.as_ref().unwrap();
+        let SnapshotData::Resolvconf(applied) = &applied_snapshot.data else {
+            panic!("unexpected snapshot kind");
+        };
+        assert!(before.attributes.is_none());
+        assert!(before.live.is_none());
+        assert!(applied.attributes.is_none());
+        assert!(applied.live.is_none());
+        assert!(before.content.is_some());
+        assert!(applied.content.is_some());
+    }
+
+    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
+    #[test]
+    fn missing_openresolv_content_is_not_a_legacy_empty_snapshot() {
+        let error = decode_snapshot(BackendKind::Resolvconf, serde_json::json!({}))
+            .expect_err("missing content must remain malformed");
+        assert!(error.contains("content"), "{error}");
+    }
+
     #[test]
     fn decode_snapshot_rejects_backends_without_local_payload() {
         let err = decode_snapshot(BackendKind::WindowsIpHelper, serde_json::json!({}))

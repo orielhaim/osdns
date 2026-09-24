@@ -403,7 +403,7 @@ jobs:
 
   release-checks:
     name: Release checks
-    needs: [verify, freebsd, netbsd]
+    needs: [verify, freebsd, netbsd, openresolv, classic-resolvconf]
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -498,3 +498,80 @@ jobs:
         env:
           OSDNS_ALLOW_SYSTEM_MUTATION: "1"
           OSDNS_TEST_RESOLV_CONF: /tmp/osdns-resolv.conf
+
+      - name: Integration / legacy openresolv recovery
+        run: |
+          cargo test \
+            --locked \
+            --all-features \
+            --test backend_matrix \
+            matrix_legacy_openresolv_journal_clears_without_mutation \
+            -- \
+            --exact \
+            --nocapture
+        env:
+          OSDNS_ALLOW_SYSTEM_MUTATION: "1"
+          OSDNS_TEST_RESOLV_CONF: /tmp/osdns-resolv.conf
+
+      - name: Integration / openresolv passthrough rejection
+        run: |
+          sed -i 's#^resolv_conf=.*#resolv_conf=/etc/resolv.conf#' /etc/resolvconf.conf
+          echo 'resolv_conf_passthrough=YES' >> /etc/resolvconf.conf
+          printf 'nameserver 192.0.2.1\n' > /etc/resolv.conf
+          cargo test \
+            --locked \
+            --all-features \
+            --test backend_matrix \
+            matrix_openresolv_passthrough_is_rejected \
+            -- \
+            --exact \
+            --nocapture
+        env:
+          OSDNS_EXPECT_OPENRESOLV_PASSTHROUGH: "1"
+
+  classic-resolvconf:
+
+    name: Classic resolvconf rejection
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    container: debian:trixie
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            build-essential \
+            git \
+            curl
+          work=$(mktemp -d)
+          cd "$work"
+          apt-get download resolvconf
+          dpkg-deb -x resolvconf_*.deb extracted
+          install -m 0755 extracted/usr/sbin/resolvconf /usr/sbin/resolvconf
+          test -x /usr/sbin/resolvconf
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@v2.87.7
+        with:
+          tool: rust@1.98.1
+          fallback: none
+
+      - name: Reject classic resolvconf
+        run: |
+          cargo test \
+            --locked \
+            --all-features \
+            --test backend_matrix \
+            matrix_classic_resolvconf_is_rejected \
+            -- \
+            --exact \
+            --nocapture
+        env:
+          OSDNS_EXPECT_CLASSIC_RESOLVCONF: "1"

@@ -16,18 +16,17 @@ use crate::ownership::ResourceId;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
 use crate::platform::unix::detect::{self, RESOLV_CONF_PATH};
 use crate::platform::unix::{ResourceMapper, WatchDirectory};
-use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
+use crate::platform::{
+    ApplyReceipt, Backend, LegacyJournalRecovery, MutationAttempt, PlatformSnapshot, SnapshotData,
+};
 use crate::watch::{WatchCallback, WatchHandle};
 
-const STATE_DIR_CANDIDATES: [&str; 8] = [
+const STANDARD_STATE_DIRS: [&str; 2] = ["/run/resolvconf", "/var/run/resolvconf"];
+const STATE_DIR_CANDIDATES: [&str; 4] = [
     "/run/resolvconf/keys",
     "/run/resolvconf/interfaces",
-    "/run/resolvconf/interface",
     "/var/run/resolvconf/keys",
     "/var/run/resolvconf/interfaces",
-    "/var/run/resolvconf/interface",
-    "/var/run/resolvconf",
-    "/var/run",
 ];
 const SEARCH_PATH: [&str; 5] = ["/sbin", "/usr/sbin", "/usr/local/sbin", "/bin", "/usr/bin"];
 const METRIC_SUBDIRS: [&str; 5] = ["metrics", "private", "nosearch", "exclusive", "deprecated"];
@@ -59,6 +58,9 @@ fn probe_for_resolv_conf(resolv_conf: &Path) -> Option<Probe> {
         return None;
     }
     let binary = find_binary("resolvconf")?;
+    if !is_openresolv(&binary) {
+        return None;
+    }
     let key_dir = locate_key_dir(&binary)?;
     Some(Probe {
         binary,
@@ -67,33 +69,157 @@ fn probe_for_resolv_conf(resolv_conf: &Path) -> Option<Probe> {
     })
 }
 
-fn configured_resolv_conf_matches(resolv_conf: &Path) -> bool {
-    let Ok(config) = std::fs::read_to_string("/etc/resolvconf.conf") else {
-        return true;
+fn is_openresolv(binary: &Path) -> bool {
+    run(binary, &["--version"], None)
+        .map(|output| openresolv_version_is_supported(&output))
+        .unwrap_or(false)
+}
+
+fn openresolv_version_is_supported(output: &[u8]) -> bool {
+    let Some(first_line) = output.split(|byte| *byte == b'\n').next() else {
+        return false;
     };
+    let Ok(first_line) = std::str::from_utf8(first_line) else {
+        return false;
+    };
+    let Some(version) = first_line.strip_prefix("openresolv ") else {
+        return false;
+    };
+    !version.is_empty()
+        && version.as_bytes()[0].is_ascii_digit()
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-' | b'_'))
+}
+
+fn configured_resolv_conf_matches(resolv_conf: &Path) -> bool {
+    match std::fs::read_to_string("/etc/resolvconf.conf") {
+        Ok(config) => parse_resolvconf_config(&config).is_ok_and(|config| config == *resolv_conf),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            resolv_conf == Path::new(RESOLV_CONF_PATH)
+        }
+        Err(_) => false,
+    }
+}
+
+fn config_blocks_direct(resolv_conf: &Path, config: &str) -> bool {
+    match parse_resolvconf_config(config) {
+        Ok(configured) => configured == *resolv_conf,
+        Err(()) => true,
+    }
+}
+
+pub(crate) fn configuration_blocks_direct(resolv_conf: &Path) -> bool {
+    match std::fs::read_to_string("/etc/resolvconf.conf") {
+        Ok(config) => config_blocks_direct(resolv_conf, &config),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+fn parse_resolvconf_config(config: &str) -> Result<PathBuf, ()> {
     let mut configured = None;
-    for line in config.lines() {
-        let line = line.trim();
+    let mut configured_state_dir = false;
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
+        let Some((key, value)) = parse_literal_assignment(line) else {
+            return Err(());
         };
-        if key.trim() != "resolv_conf" {
-            continue;
+        if contains_setting_token(line, "resolv_conf") && key != "resolv_conf" {
+            return Err(());
         }
-        let value = value.trim().trim_matches('"');
-        let candidate = PathBuf::from(value);
-        if configured
-            .as_ref()
-            .is_some_and(|previous| previous != &candidate)
-        {
-            return false;
+        if contains_setting_token(line, "state_dir") && key != "state_dir" {
+            return Err(());
         }
-        configured = Some(candidate);
+        match key {
+            "resolv_conf" => {
+                if configured.is_some() {
+                    return Err(());
+                }
+                let candidate = absolute_path(value).ok_or(())?;
+                configured = Some(candidate);
+            }
+            "state_dir" => {
+                if configured_state_dir {
+                    return Err(());
+                }
+                let state_dir = absolute_path(value).ok_or(())?;
+                if !STANDARD_STATE_DIRS
+                    .iter()
+                    .any(|candidate| Path::new(candidate) == state_dir.as_path())
+                {
+                    return Err(());
+                }
+                configured_state_dir = true;
+            }
+            "resolvconf" | "libc" if value != "YES" => return Err(()),
+            "resolv_conf_passthrough" if value != "NO" => return Err(()),
+            _ => {}
+        }
     }
-    configured.is_none_or(|candidate| candidate == resolv_conf)
+    Ok(configured.unwrap_or_else(|| PathBuf::from(RESOLV_CONF_PATH)))
+}
+
+fn parse_literal_assignment(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once('=')?;
+    if key.is_empty()
+        || key.trim() != key
+        || value.trim() != value
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return None;
+    }
+    Some((key, parse_literal_value(value)?))
+}
+
+fn parse_literal_value(value: &str) -> Option<&str> {
+    if value.trim() != value {
+        return None;
+    }
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return safe_literal_value(inner, true);
+    }
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        return safe_literal_value(inner, true);
+    }
+    safe_literal_value(value, false)
+}
+
+fn safe_literal_value(value: &str, quoted: bool) -> Option<&str> {
+    if value.chars().any(|character| {
+        (character.is_whitespace() && !quoted)
+            || matches!(
+                character,
+                '$' | '`' | '\\' | '\'' | '"' | ';' | '|' | '&' | '(' | ')' | '<' | '>'
+            )
+            || (!quoted
+                && (character == '#'
+                    || matches!(character, '*' | '?' | '[' | ']' | '{' | '}' | '!' | '~')))
+    }) {
+        return None;
+    }
+    Some(value)
+}
+
+fn absolute_path(value: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(value);
+    path.is_absolute().then_some(path)
+}
+
+fn contains_setting_token(line: &str, setting: &str) -> bool {
+    line.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|token| token == setting)
 }
 
 fn find_binary(name: &str) -> Option<PathBuf> {
@@ -163,7 +289,8 @@ fn run(binary: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let output = match stdin {
         Some(bytes) => {
             command.stdin(Stdio::piped());
@@ -195,19 +322,24 @@ fn run(binary: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
             )
         })?,
     };
-    finish(output)
+    finish(output, args)
 }
 
-fn finish(output: std::process::Output) -> Result<Vec<u8>> {
+fn finish(output: std::process::Output, args: &[&str]) -> Result<Vec<u8>> {
     if output.status.success() {
         Ok(output.stdout)
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = if stderr.trim().is_empty() {
+            "no stderr".to_string()
+        } else {
+            stderr.trim().to_string()
+        };
         Err(Error::platform(
             BackendKind::Resolvconf,
             format_args!(
-                "resolvconf exited with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                "resolvconf {:?} exited with {}: {}",
+                args, output.status, stderr
             ),
         ))
     }
@@ -478,10 +610,9 @@ impl Resolvconf {
                 let content = data.content.clone();
                 let attributes = match data.attributes.clone() {
                     Some(attributes) => attributes,
-                    None if content.is_none() => ResolvconfAttributes::default(),
                     None => {
                         return Err(Error::JournalCorrupt(
-                            "openresolv snapshot with content lacks key attributes".to_string(),
+                            "legacy openresolv snapshot lacks key attributes".to_string(),
                         ));
                     }
                 };
@@ -493,6 +624,15 @@ impl Resolvconf {
             _ => Err(Error::JournalCorrupt(
                 "resolvconf snapshot has the wrong backend data".to_string(),
             )),
+        }
+    }
+
+    fn legacy_content(snapshot: &PlatformSnapshot) -> Option<Option<Vec<u8>>> {
+        match &snapshot.data {
+            SnapshotData::Resolvconf(data) if data.attributes.is_none() && data.live.is_none() => {
+                Some(data.content.clone())
+            }
+            _ => None,
         }
     }
 
@@ -612,11 +752,21 @@ struct ResolvconfRecord {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ResolvconfSnapshot {
+    #[serde(deserialize_with = "deserialize_required_content")]
     pub(crate) content: Option<Vec<u8>>,
     #[serde(default)]
     pub(crate) attributes: Option<ResolvconfAttributes>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) live: Option<Vec<u8>>,
+}
+
+fn deserialize_required_content<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<Vec<u8>>::deserialize(deserializer)
 }
 
 fn check_live_snapshot(
@@ -635,6 +785,74 @@ fn check_live_snapshot(
         });
     }
     Ok(())
+}
+
+fn public_state_from_snapshot(snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig> {
+    let SnapshotData::Resolvconf(data) = &snapshot.data else {
+        return Err(Error::JournalCorrupt(
+            "resolvconf snapshot has the wrong backend data".to_string(),
+        ));
+    };
+    let live = data.live.as_deref().ok_or_else(|| {
+        Error::JournalCorrupt(
+            "openresolv public snapshot lacks effective resolver content".to_string(),
+        )
+    })?;
+    let (nameservers, search) = parse_resolv_conf_content(live)?;
+    Ok(DnsConfig::from_parts(
+        scope.clone(),
+        nameservers,
+        search,
+        Vec::new(),
+        None,
+    ))
+}
+
+fn legacy_live_contains_original(live: &[u8], original: &[u8]) -> bool {
+    let Ok((wanted_nameservers, wanted_search)) = parse_resolv_conf_content(original) else {
+        return false;
+    };
+    let Ok((nameservers, search)) = parse_resolv_conf_content(live) else {
+        return false;
+    };
+    if wanted_nameservers.is_empty() && wanted_search.is_empty() {
+        return false;
+    }
+    ordered_subsequence(&wanted_nameservers, &nameservers)
+        && ordered_subsequence(&wanted_search, &search)
+}
+
+fn legacy_recovery_for_snapshots(
+    before: &PlatformSnapshot,
+    current: &PlatformSnapshot,
+) -> LegacyJournalRecovery {
+    let Some(legacy_content) = Resolvconf::legacy_content(before) else {
+        return LegacyJournalRecovery::NotLegacy;
+    };
+    let Some(original) = legacy_content.as_ref() else {
+        return LegacyJournalRecovery::Unresolved(
+            "the legacy openresolv journal lacks the original owner content and effective resolver state; restore the owner key manually, then abandon the journal",
+        );
+    };
+    let SnapshotData::Resolvconf(current_data) = &current.data else {
+        return LegacyJournalRecovery::Unresolved(
+            "the legacy openresolv journal has no matching current backend state",
+        );
+    };
+    let Some(live) = current_data.live.as_deref() else {
+        return LegacyJournalRecovery::Unresolved(
+            "the legacy openresolv journal lacks key attributes and effective resolver state; restore the owner key manually, then abandon the journal",
+        );
+    };
+    if current_data.content.as_deref() == Some(original.as_slice())
+        && legacy_live_contains_original(live, original)
+    {
+        LegacyJournalRecovery::Clear
+    } else {
+        LegacyJournalRecovery::Unresolved(
+            "the legacy openresolv journal lacks key attributes and effective resolver state; restore the owner key manually, then abandon the journal",
+        )
+    }
 }
 
 impl Backend for Resolvconf {
@@ -880,6 +1098,14 @@ impl Backend for Resolvconf {
         self.restore_record(&tag, &Self::record_from_snapshot(snapshot)?)
     }
 
+    fn legacy_recovery(
+        &self,
+        before: &PlatformSnapshot,
+        current: &PlatformSnapshot,
+    ) -> LegacyJournalRecovery {
+        legacy_recovery_for_snapshots(before, current)
+    }
+
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         Self::records_equivalent(a, b)
     }
@@ -901,24 +1127,7 @@ impl Backend for Resolvconf {
     }
 
     fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig> {
-        let record = Self::record_from_snapshot(snapshot)?;
-        let Some(bytes) = record.content else {
-            return Ok(DnsConfig::from_parts(
-                scope.clone(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                None,
-            ));
-        };
-        let (nameservers, search) = parse_resolv_conf_content(&bytes)?;
-        Ok(DnsConfig::from_parts(
-            scope.clone(),
-            nameservers,
-            search,
-            Vec::new(),
-            None,
-        ))
+        public_state_from_snapshot(snapshot, scope)
     }
 
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
@@ -936,7 +1145,6 @@ impl Backend for Resolvconf {
             if ![
                 "keys",
                 "interfaces",
-                "interface",
                 "metrics",
                 "private",
                 "nosearch",
@@ -990,11 +1198,216 @@ mod tests {
     }
 
     #[test]
+    fn openresolv_version_marker_is_required() {
+        assert!(openresolv_version_is_supported(b"openresolv 3.17.4\n"));
+        assert!(!openresolv_version_is_supported(
+            b"Debian resolvconf 1.91\n"
+        ));
+        assert!(!openresolv_version_is_supported(b"openresolv\n"));
+        assert!(!openresolv_version_is_supported(
+            b"prefix openresolv 3.17.4\n"
+        ));
+    }
+
+    #[test]
+    fn subprocess_failures_include_stderr_on_stdin_paths() {
+        let error = run(
+            Path::new("/bin/sh"),
+            &["-c", "printf 'osdns-test-diagnostic\\n' >&2; exit 7"],
+            Some(b"input"),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("osdns-test-diagnostic"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolvconf_config_accepts_only_literal_assignments() {
+        let config = "resolvconf=YES\nstate_dir=/run/resolvconf\nresolv_conf=\"/tmp/resolv.conf\"\nresolv_conf_passthrough=NO\nname_servers=\"8.8.8.8 1.1.1.1\"\nprivate_keys=\"vpn*\"\n";
+        assert_eq!(
+            parse_resolvconf_config(config).unwrap(),
+            PathBuf::from("/tmp/resolv.conf")
+        );
+        assert_eq!(
+            parse_resolvconf_config("").unwrap(),
+            PathBuf::from(RESOLV_CONF_PATH)
+        );
+    }
+
+    #[test]
+    fn resolvconf_config_rejects_ambiguous_shell_forms() {
+        for config in [
+            "export resolv_conf=/tmp/resolv.conf\n",
+            "resolv_conf = /tmp/resolv.conf\n",
+            "resolv_conf=\"$state\"\n",
+            ". /etc/resolvconf.conf.d/other\n",
+            "if true; then resolv_conf=/tmp/resolv.conf; fi\n",
+            "unset resolv_conf\n",
+            "resolv_conf=/tmp/resolv.conf; echo done\n",
+            "resolv_conf=/tmp/resolv.conf # comment\n",
+            "resolvconf=NO\n",
+            "libc=NO\n",
+            "resolv_conf_passthrough=YES\n",
+            "resolv_conf_passthrough=NULL\n",
+            "resolv_conf_passthrough=/dev/null\n",
+            "state_dir=/tmp/custom-resolvconf\n",
+            "replace=\"$replace nameserver/1.1.1.1/8.8.8.8\"\n",
+            "foo=bar; touch /tmp/should-not-run\n",
+            "foo=bar touch /tmp/should-not-run\n",
+            "resolv_conf=relative/path\n",
+            "resolv_conf=/etc/resolv.conf\nresolv_conf=/tmp/resolv.conf\n",
+            "resolv_conf=/etc/resolv.conf\nresolv_conf=/etc/resolv.conf\n",
+            "state_dir=/run/resolvconf\nstate_dir=/run/resolvconf\n",
+        ] {
+            assert!(parse_resolvconf_config(config).is_err(), "{config}");
+        }
+    }
+
+    #[test]
+    fn resolvconf_config_blocks_direct_fallback_when_unverifiable() {
+        assert!(config_blocks_direct(
+            Path::new(RESOLV_CONF_PATH),
+            "resolv_conf_passthrough=YES\n"
+        ));
+        assert!(config_blocks_direct(
+            Path::new(RESOLV_CONF_PATH),
+            "resolv_conf=\"$state\"\n"
+        ));
+        assert!(config_blocks_direct(
+            Path::new(RESOLV_CONF_PATH),
+            "resolv_conf=/etc/resolv.conf\n"
+        ));
+        assert!(!config_blocks_direct(
+            Path::new(RESOLV_CONF_PATH),
+            "resolv_conf=/tmp/resolv.conf\n"
+        ));
+    }
+
+    #[test]
     fn schema_v3_resolvconf_payloads_remain_readable() {
         let snapshot: ResolvconfSnapshot = serde_json::from_str(r#"{"content":null}"#).unwrap();
         assert_eq!(snapshot.content, None);
         assert_eq!(snapshot.attributes, None);
         assert_eq!(snapshot.live, None);
+    }
+
+    #[test]
+    fn legacy_resolvconf_snapshot_is_not_defaulted_to_current_state() {
+        let snapshot: ResolvconfSnapshot = serde_json::from_str(
+            r#"{"content":[110,97,109,101,115,101,114,118,101,114,32,49,46,1,49,10]}"#,
+        )
+        .unwrap();
+        assert!(snapshot.attributes.is_none());
+        assert!(snapshot.live.is_none());
+        assert!(Resolvconf::record_from_snapshot(&snapshot_for(snapshot)).is_err());
+    }
+
+    #[test]
+    fn legacy_recovery_clears_only_when_owner_content_and_live_are_original() {
+        let before = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
+            attributes: None,
+            live: None,
+        });
+        let current = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.10\n".to_vec()),
+        });
+        assert!(matches!(
+            legacy_recovery_for_snapshots(&before, &current),
+            LegacyJournalRecovery::Clear
+        ));
+        let stale_live = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.11\n".to_vec()),
+        });
+        assert!(matches!(
+            legacy_recovery_for_snapshots(&before, &stale_live),
+            LegacyJournalRecovery::Unresolved(_)
+        ));
+        let missing_live = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: None,
+        });
+        assert!(matches!(
+            legacy_recovery_for_snapshots(&before, &missing_live),
+            LegacyJournalRecovery::Unresolved(_)
+        ));
+        let options_only = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"options ndots:1\n".to_vec()),
+            attributes: None,
+            live: None,
+        });
+        let current_options_only = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"options ndots:1\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.99\n".to_vec()),
+        });
+        assert!(matches!(
+            legacy_recovery_for_snapshots(&options_only, &current_options_only),
+            LegacyJournalRecovery::Unresolved(_)
+        ));
+        let changed = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 192.0.2.11\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.11\n".to_vec()),
+        });
+        assert!(matches!(
+            legacy_recovery_for_snapshots(&before, &changed),
+            LegacyJournalRecovery::Unresolved(_)
+        ));
+    }
+
+    #[test]
+    fn public_global_state_uses_effective_live_content() {
+        let snapshot = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 127.0.0.1\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.77\nsearch example.test\n".to_vec()),
+        });
+        let state = public_state_from_snapshot(&snapshot, &DnsScope::Global).unwrap();
+        assert_eq!(
+            state.nameservers(),
+            &["192.0.2.77".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(state.search_domains().len(), 1);
+    }
+
+    #[test]
+    fn public_global_state_uses_live_when_owner_key_is_absent() {
+        let snapshot = snapshot_for(ResolvconfSnapshot {
+            content: None,
+            attributes: Some(ResolvconfAttributes::default()),
+            live: Some(b"nameserver 192.0.2.78\n".to_vec()),
+        });
+        let state = public_state_from_snapshot(&snapshot, &DnsScope::Global).unwrap();
+        assert_eq!(
+            state.nameservers(),
+            &["192.0.2.78".parse::<std::net::IpAddr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn public_global_state_requires_live_content() {
+        let snapshot = snapshot_for(ResolvconfSnapshot {
+            content: Some(b"nameserver 127.0.0.1\n".to_vec()),
+            attributes: Some(ResolvconfAttributes::default()),
+            live: None,
+        });
+        assert!(public_state_from_snapshot(&snapshot, &DnsScope::Global).is_err());
+    }
+
+    fn snapshot_for(data: ResolvconfSnapshot) -> PlatformSnapshot {
+        PlatformSnapshot::new(
+            BackendKind::Resolvconf,
+            ResourceId::new("linux:resolvconf:tag:test.global").unwrap(),
+            SnapshotData::Resolvconf(data),
+        )
     }
 
     #[test]

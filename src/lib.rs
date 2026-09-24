@@ -186,9 +186,12 @@
 //! # Platform and backend differences
 //!
 //! Linux selects among systemd-resolved (per-link DNS and routing domains),
-//! NetworkManager (per-interface DNS), resolvconf/openresolv (owner-tagged
-//! global records), and direct `/etc/resolv.conf` manipulation, based on
-//! which component actually owns DNS state on the host.
+//! NetworkManager (per-interface DNS), Openresolv's `resolvconf(8)`
+//! implementation (owner-tagged global records), and direct
+//! `/etc/resolv.conf` manipulation, based on which component actually owns
+//! DNS state on the host. Openresolv 3.9 or newer is required for its version
+//! marker; passthrough mode and classic Debian `resolvconf` are not supported
+//! by `BackendKind::Resolvconf`.
 //!
 //! Windows uses the modern IP Helper APIs for per-interface IPv4/IPv6
 //! settings and the Name Resolution Policy Table (NRPT) for split DNS,
@@ -199,10 +202,12 @@
 //! `/etc/resolver/<domain>` files for split DNS, with SCDynamicStore and
 //! FSEvents notifications for watching.
 //!
-//! FreeBSD and NetBSD select openresolv only when `/etc/resolv.conf` has its
-//! exact generated signature and the openresolv key store can be identified.
+//! FreeBSD and NetBSD select Openresolv only when `/etc/resolv.conf` has its
+//! exact generated signature and the Openresolv key store can be identified.
 //! The backend owns one global input record and verifies that the requested
-//! values are active in the libc resolver. It does not expose openresolv's
+//! values are active in the libc resolver. `snapshot(Global)` reports that
+//! effective generated resolver state, while the owner-tagged source record
+//! remains private transaction state. It does not expose Openresolv's
 //! local-resolver-only private mode as per-interface or split DNS. A direct
 //! `/etc/resolv.conf` backend is used only for an unmanaged regular file; BSD
 //! file flags, ACLs, extended attributes, hard links, and symlinks are refused.

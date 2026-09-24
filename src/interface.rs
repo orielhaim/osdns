@@ -7,7 +7,8 @@ use std::ffi::OsString;
 /// does not expose one, e.g. macOS service enumeration), `name` the OS name,
 /// `friendly_name` a human-readable name when available, `guid` the stable
 /// native identifier when available (Windows GUID, macOS service UUID).
-/// `is_up` reflects the backend's liveness signal and may be approximate.
+/// `is_up` reflects the backend's administrative/resource-readiness signal and
+/// may be approximate; it is not a carrier or connectivity guarantee.
 ///
 /// Names and indexes are convenience selectors only. Their lifetime and
 /// rename/reuse semantics are backend-specific; durable recovery separately

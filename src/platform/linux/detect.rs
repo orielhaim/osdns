@@ -6,6 +6,7 @@ use crate::platform::linux::network_manager::NetworkManager;
 use crate::platform::linux::resolvconf;
 use crate::platform::linux::resolved::SystemdResolved;
 use crate::platform::unix::detect::{self, ResolvConfState};
+use crate::platform::unix::openresolv::configuration_blocks_direct;
 
 const RESOLV_CONF: &str = crate::platform::linux::RESOLV_CONF_PATH;
 
@@ -83,7 +84,7 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn crate::platform::Backend>> {
     if nm_rc_manager == "resolvconf" {
         let probe = resolvconf::probe().ok_or_else(|| {
             Error::BackendUnavailable(
-                "NetworkManager delegates DNS to resolvconf, but its live state directory could not be verified"
+                "NetworkManager delegates DNS to resolvconf, but a verified openresolv backend was not found"
                     .to_string(),
             )
         })?;
@@ -100,7 +101,7 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn crate::platform::Backend>> {
     if file_owner == ResolvConfOwner::Resolvconf {
         let probe = resolvconf::probe().ok_or_else(|| {
             Error::BackendUnavailable(
-                "openresolv owns /etc/resolv.conf, but its live state directory could not be verified"
+                "openresolv owns /etc/resolv.conf, but a verified openresolv backend was not found"
                     .to_string(),
             )
         })?;
@@ -113,7 +114,14 @@ pub(crate) fn select(owner: &str) -> Result<Arc<dyn crate::platform::Backend>> {
             "/etc/resolv.conf has an unknown or foreign DNS manager signature".to_string(),
         )),
         ResolvConfOwner::Unmanaged | ResolvConfOwner::Missing => {
-            Ok(Arc::new(crate::platform::linux::direct::new()))
+            if configuration_blocks_direct(std::path::Path::new(RESOLV_CONF)) {
+                Err(Error::BackendUnavailable(
+                    "an Openresolv configuration is present but cannot be verified; refusing direct resolv.conf mutation"
+                        .to_string(),
+                ))
+            } else {
+                Ok(Arc::new(crate::platform::linux::direct::new()))
+            }
         }
         ResolvConfOwner::Resolvconf => unreachable!(),
     }

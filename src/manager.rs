@@ -17,8 +17,8 @@ use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
 use crate::platform::{
-    Backend, MutationAttempt, OwnershipProof, PlatformSnapshot, ResourceIdentity, ResourceStatus,
-    VerifiedMutation, select_default_backend,
+    Backend, LegacyJournalRecovery, MutationAttempt, OwnershipProof, PlatformSnapshot,
+    ResourceIdentity, ResourceStatus, VerifiedMutation, select_default_backend,
 };
 use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
@@ -1003,6 +1003,24 @@ impl Inner {
             Err(error) => return Err(error),
         };
         self.fire(TxPoint::AfterRecoveryReadback)?;
+        match self.backend.legacy_recovery(&record.before, &current) {
+            LegacyJournalRecovery::Clear => {
+                self.journal.remove(&record.lease_id, &resource)?;
+                self.fire(TxPoint::AfterRecoveryJournal)?;
+                return Ok(RecoveryOutcome::JournalCleared {
+                    resource,
+                    lease_id: record.lease_id,
+                });
+            }
+            LegacyJournalRecovery::Unresolved(detail) => {
+                return Ok(RecoveryOutcome::Failed {
+                    resource,
+                    lease_id: record.lease_id,
+                    detail: detail.to_string(),
+                });
+            }
+            LegacyJournalRecovery::NotLegacy => {}
+        }
         if self.backend.equivalent(&current, &record.before) {
             self.journal.remove(&record.lease_id, &resource)?;
             self.fire(TxPoint::AfterRecoveryJournal)?;
@@ -1065,11 +1083,14 @@ impl Inner {
                             .to_string(),
                     );
                 }
-                Ok(RecoveryOutcome::IdentityMismatch { .. } | RecoveryOutcome::Failed { .. }) => {
+                Ok(RecoveryOutcome::IdentityMismatch { .. }) => {
                     conflict = Some(
                         "the recorded native resource incarnation cannot be recovered safely"
                             .to_string(),
                     );
+                }
+                Ok(RecoveryOutcome::Failed { detail, .. }) => {
+                    conflict = Some(detail);
                 }
                 Ok(_) => {}
                 Err(error @ Error::JournalCorrupt(_)) => {
@@ -1221,7 +1242,10 @@ impl DnsManager {
     ///
     /// Read-only and side-effect free. For multi-resource scopes this reports
     /// the primary resource (for example the network service backing the
-    /// interface), not per-domain scoped state.
+    /// interface), not per-domain scoped state. For the Openresolv backend,
+    /// `Global` reports the effective generated libc resolver state, including
+    /// contributions from all Openresolv records; the owner-tagged source
+    /// record remains private transaction state.
     ///
     /// # Errors
     ///

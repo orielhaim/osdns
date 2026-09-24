@@ -1,0 +1,79 @@
+{
+  "schema_version": 3,
+  "owner": "io.osdns.legacy",
+  "lease_id": "11111111-2222-3333-4444-555555555555",
+  "resource": "linux:resolvconf:tag:legacy.osdns.global",
+  "backend": "resolvconf",
+  "identity": {
+    "backend": "resolvconf",
+    "resource": "linux:resolvconf:tag:legacy.osdns.global",
+    "data": null
+  },
+  "phase": "Applied",
+  "before": {
+    "backend": "resolvconf",
+    "resource": "linux:resolvconf:tag:legacy.osdns.global",
+    "data": {
+      "content": [
+        110,
+        97,
+        109,
+        101,
+        115,
+        101,
+        114,
+        118,
+        101,
+        114,
+        32,
+        49,
+        57,
+        50,
+        46,
+        48,
+        46,
+        50,
+        46,
+        49,
+        48,
+        10
+      ]
+    }
+  },
+  "desired": {
+    "nameservers": ["192.0.2.11"],
+    "search_domains": [],
+    "routing_domains": [],
+    "default_route": null
+  },
+  "applied": {
+    "backend": "resolvconf",
+    "resource": "linux:resolvconf:tag:legacy.osdns.global",
+    "data": {
+      "content": [
+        110,
+        97,
+        109,
+        101,
+        115,
+        101,
+        114,
+        118,
+        101,
+        114,
+        32,
+        49,
+        57,
+        50,
+        46,
+        48,
+        46,
+        50,
+        46,
+        49,
+        49,
+        10
+      ]
+    }
+  }
+}

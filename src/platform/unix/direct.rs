@@ -75,6 +75,10 @@ pub(crate) struct DirectSnapshot {
     pub(crate) metadata: Option<DirectFileMetadata>,
 }
 
+fn snapshot_modes_match(left: &DirectSnapshot, right: &DirectSnapshot) -> bool {
+    left.mode.is_none() || right.mode.is_none() || left.mode == right.mode
+}
+
 pub(crate) struct DirectResolvConf {
     path: PathBuf,
     resource: ResourceId,
@@ -209,35 +213,16 @@ impl Backend for DirectResolvConf {
                 .policy
                 .mutation_metadata_preserved(current.metadata.as_ref(), observed.metadata.as_ref());
         if !preserved {
-            if observed.content.as_deref() != Some(desired.as_slice()) {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail: "resolv.conf changed before write verification completed".to_string(),
-                });
-            }
-            let unchanged = self.read_current()?;
-            if unchanged != observed {
-                return Err(Error::ExternalModification {
-                    resource: resource.clone(),
-                    detail: "resolv.conf changed before verification rollback".to_string(),
-                });
-            }
-            let rollback = match current.content.as_deref() {
-                Some(content) => self.write_content(content, &current, true),
-                None => self.remove_current(),
+            let detail = if observed.content.as_deref() == Some(desired.as_slice()) {
+                "resolv.conf metadata changed before write verification completed"
+            } else {
+                "resolv.conf changed before write verification completed"
             };
-            return match rollback {
-                Ok(()) => Err(Error::platform(
-                    BackendKind::ResolvConfFile,
-                    "resolv.conf write verification failed; the captured state was restored",
-                )),
-                Err(rollback_error) => Err(Error::platform(
-                    BackendKind::ResolvConfFile,
-                    format_args!(
-                        "resolv.conf write verification failed and rollback also failed: {rollback_error}"
-                    ),
-                )),
-            };
+            return Err(Error::ResourcePlatform {
+                backend: BackendKind::ResolvConfFile,
+                resource: resource.clone(),
+                message: detail.to_string(),
+            });
         }
         Ok(ApplyReceipt {
             resource: self.resource.clone(),
@@ -260,6 +245,7 @@ impl Backend for DirectResolvConf {
         match (Self::from_platform(a), Self::from_platform(b)) {
             (Ok(a), Ok(b)) => {
                 a.content == b.content
+                    && snapshot_modes_match(&a, &b)
                     && self
                         .policy
                         .metadata_equivalent(a.metadata.as_ref(), b.metadata.as_ref())
@@ -337,6 +323,139 @@ impl Backend for DirectResolvConf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::MutationAttempt;
+    use crate::platform::unix::ResourceMapper;
+    use crate::watch::{WatchCallback, WatchHandle};
+    use std::sync::Mutex;
+
+    struct MetadataChangingPolicy {
+        resource: ResourceId,
+        mode: Mutex<u32>,
+    }
+
+    impl DirectPolicy for MetadataChangingPolicy {
+        fn check_usable(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+
+        fn metadata(&self, _path: &Path) -> Result<Option<DirectFileMetadata>> {
+            Ok(Some(DirectFileMetadata {
+                mode: *self.mode.lock().unwrap(),
+                owner: None,
+                flags: None,
+                links: None,
+                modified: None,
+            }))
+        }
+
+        fn write(
+            &self,
+            path: &Path,
+            content: &[u8],
+            _mode: Option<u32>,
+            _metadata: Option<&DirectFileMetadata>,
+            _restore_modified_time: bool,
+        ) -> Result<()> {
+            std::fs::write(path, content)?;
+            *self.mode.lock().unwrap() = 0o600;
+            Ok(())
+        }
+
+        fn metadata_equivalent(
+            &self,
+            _left: Option<&DirectFileMetadata>,
+            _right: Option<&DirectFileMetadata>,
+        ) -> bool {
+            true
+        }
+
+        fn mutation_metadata_preserved(
+            &self,
+            _before: Option<&DirectFileMetadata>,
+            _after: Option<&DirectFileMetadata>,
+        ) -> bool {
+            false
+        }
+
+        fn list_interfaces(&self) -> Result<Vec<InterfaceInfo>> {
+            Ok(Vec::new())
+        }
+
+        fn watch_directory(&self) -> WatchDirectory {
+            unsupported_watch
+        }
+
+        fn validate_plan(&self, _plan: &NormalizedConfig) -> Result<()> {
+            Ok(())
+        }
+
+        fn resource(&self) -> &ResourceId {
+            &self.resource
+        }
+    }
+
+    fn unsupported_watch(
+        _backend: BackendKind,
+        _paths: &[PathBuf],
+        _resources: Vec<ResourceId>,
+        _mapper: ResourceMapper,
+        _callback: WatchCallback,
+    ) -> Result<WatchHandle> {
+        Err(Error::unsupported(
+            BackendKind::ResolvConfFile,
+            "test direct policy does not support watching",
+        ))
+    }
+
+    #[test]
+    fn metadata_mismatch_after_commit_is_indeterminate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resolv.conf");
+        std::fs::write(&path, b"nameserver 192.0.2.10\n").unwrap();
+        let resource = ResourceId::new("unix:resolv-conf").unwrap();
+        let backend = DirectResolvConf::new(
+            path.clone(),
+            Arc::new(MetadataChangingPolicy {
+                resource: resource.clone(),
+                mode: Mutex::new(0o100644),
+            }),
+        );
+        let plan = NormalizedConfig {
+            nameservers: vec!["192.0.2.20".parse().unwrap()],
+            ..NormalizedConfig::default()
+        };
+
+        let error = backend.apply(&resource, &plan).unwrap_err();
+        assert!(matches!(&error, Error::ResourcePlatform { .. }));
+        assert!(matches!(
+            MutationAttempt::from_apply_result(Err(error)),
+            MutationAttempt::Indeterminate { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "nameserver 192.0.2.20\n"
+        );
+    }
+
+    #[test]
+    fn snapshot_equality_includes_legacy_top_level_mode() {
+        let left = DirectSnapshot {
+            content: Some(b"nameserver 192.0.2.1\n".to_vec()),
+            mode: Some(0o100640),
+            metadata: None,
+        };
+        let mut right = left.clone();
+        right.mode = Some(0o100600);
+        assert!(!snapshot_modes_match(&left, &right));
+        right.mode = left.mode;
+        assert!(snapshot_modes_match(&left, &right));
+        let legacy = DirectSnapshot {
+            content: left.content.clone(),
+            mode: None,
+            metadata: None,
+        };
+        assert!(snapshot_modes_match(&legacy, &left));
+    }
 
     #[test]
     fn old_direct_snapshots_decode_without_metadata() {
