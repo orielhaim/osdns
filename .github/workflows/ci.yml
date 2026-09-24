@@ -483,6 +483,7 @@ jobs:
         run: |
           sed -i '/^[[:space:]]*resolv_conf[[:space:]]*=/d' /etc/resolvconf.conf
           echo 'resolv_conf=/tmp/osdns-resolv.conf' >> /etc/resolvconf.conf
+          echo 'resolv_conf_local_only=NO' >> /etc/resolvconf.conf
           resolvconf -a osdns-ci < /etc/resolv.conf
 
       - name: Integration / openresolv
@@ -530,7 +531,6 @@ jobs:
           OSDNS_EXPECT_OPENRESOLV_PASSTHROUGH: "1"
 
   classic-resolvconf:
-
     name: Classic resolvconf rejection
     needs: verify
     runs-on: ubuntu-latest
