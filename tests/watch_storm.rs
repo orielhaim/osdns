@@ -185,3 +185,53 @@ fn stop_waits_for_an_in_flight_callback() {
     stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     stopper.join().unwrap();
 }
+#[test]
+fn external_change_during_a_recent_mutation_is_visible() {
+    let fixture = new_fixture("watch-recent-external");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let watch = fixture
+        .manager
+        .watch(Arc::new(move |event| {
+            sender.send(event.clone()).unwrap();
+        }))
+        .unwrap();
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let event = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(
+        matches!(event, osdns::DnsEvent::ResourceChanged { resource } if resource.as_str() == IFACE1)
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    watch.stop();
+    lease.abandon().unwrap();
+}
+
+#[test]
+fn callback_can_stop_its_own_subscription() {
+    let fixture = new_fixture("watch-self-stop");
+    let holder = Arc::new(Mutex::new(None::<osdns::WatchHandle>));
+    let callback_holder = Arc::clone(&holder);
+    let (done, completed) = std::sync::mpsc::channel();
+    let watch = fixture
+        .manager
+        .watch(Arc::new(move |_| {
+            if let Some(handle) = callback_holder.lock().unwrap().take() {
+                handle.stop();
+                done.send(()).unwrap();
+            }
+        }))
+        .unwrap();
+    *holder.lock().unwrap() = Some(watch);
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    completed.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(holder.lock().unwrap().is_none());
+}

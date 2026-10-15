@@ -20,8 +20,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// - [`Error::Unsupported`]: nothing was mutated. The backend cannot
 ///   represent the request. Do not retry without changing the configuration;
 ///   probe [`Capabilities`](crate::Capabilities) first.
-/// - [`Error::RequiresPrivilege`]: nothing was mutated. Re-run with elevated
-///   privileges; `osdns` never escalates on its own.
+/// - [`Error::RequiresPrivilege`]: a native operation lacked permission.
+///   Sequential native writes may already have changed part of a resource;
+///   inspect retained state before retrying. `osdns` never escalates itself.
 /// - [`Error::BackendUnavailable`]: nothing was mutated. The backend or an OS
 ///   resource it depends on is missing. The caller may retry later or select
 ///   a different backend.
@@ -46,9 +47,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///   and the journal record was kept, so [`DnsManager::recover_stale`](crate::DnsManager::recover_stale)
 ///   can finish the work. The lease remains usable.
 /// - [`Error::JournalCorrupt`]: no mutation was attempted. The call fails
-///   closed; inspect or clear the state directory manually.
+///   closed; inspect retained state before choosing a recovery action.
 /// - [`Error::UnsupportedJournalVersion`]: the durable state belongs to an
-///   incompatible osdns journal format. Clear the old state before upgrade.
+///   incompatible journal format. Restore or abandon it with the writing version.
 /// - [`Error::ResourceGone`]: the named native incarnation no longer exists;
 ///   its owned state cannot still affect the OS.
 /// - [`Error::ResourcePlatform`] / [`Error::ResourceIdentity`]: a native
@@ -60,6 +61,51 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Publication failed. Preserve transaction state even if the new record is visible.
+    #[error(
+        "journal publication failed; publication may have occurred: {may_have_published}: {source}"
+    )]
+    JournalPublication {
+        /// Whether the failed operation may have replaced the journal record.
+        may_have_published: bool,
+        /// Native filesystem failure.
+        #[source]
+        source: private_fs::Error,
+    },
+    /// Removal failed. Retry cleanup; absence alone does not prove durable removal.
+    #[error("journal removal failed; removal may have occurred: {may_have_removed}: {source}")]
+    JournalRemoval {
+        /// Whether the failed operation may have removed the journal record.
+        may_have_removed: bool,
+        /// Native filesystem failure.
+        #[source]
+        source: private_fs::Error,
+    },
+    /// The operation failed and recovery or journal cleanup also failed.
+    /// Retained journal state must be reconciled before assuming rollback completed.
+    #[error("transaction failed: {primary}; {} recovery or cleanup operation(s) also failed", cleanup.len())]
+    TransactionFailed {
+        /// Original transaction error.
+        primary: Box<Error>,
+        /// Errors encountered while retaining or cleaning up transaction state.
+        cleanup: Vec<Error>,
+    },
+    /// State storage failed ownership, privacy, type or path-resolution checks.
+    /// Inspect the directory; automatic permission repair is never attempted.
+    #[error("unsafe state filesystem: {0}")]
+    UnsafeFilesystem(String),
+    /// Native mutation may have happened; preserve the journal and inspect
+    /// current state before retrying. Equality with desired values is not proof.
+    #[error("indeterminate mutation on {backend}: {message}")]
+    IndeterminateMutation {
+        /// Backend whose operation could not be completed or verified.
+        backend: BackendKind,
+        /// Native failure or execution bound that interrupted the operation.
+        message: String,
+    },
+    /// Lease teardown has started; only restore or abandon is safe next.
+    #[error("lease teardown has started; retry restore or abandon the remaining resources")]
+    LeaseEnding,
     /// The backend proved that this native resource incarnation is gone and
     /// can no longer carry osdns-owned state.
     #[error("resource is gone on {backend}: {resource}: {message}")]
@@ -114,8 +160,8 @@ pub enum Error {
     },
     /// The current process lacks the privileges required for the operation.
     ///
-    /// Nothing was mutated. `osdns` never elevates privileges on its own;
-    /// re-run with elevated privileges.
+    /// A sequential native mutation may have partially succeeded before failure.
+    /// Inspect retained state before retrying; osdns never elevates privileges.
     #[error("operation requires elevated privileges: {0}")]
     RequiresPrivilege(String),
     /// The backend or an OS resource it depends on is not available.

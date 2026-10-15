@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
-use uuid::Uuid;
+use rustix::event::{PollFd, PollFlags, poll};
+use rustix::pipe::{PipeFlags, pipe_with};
 
 use crate::capability::BackendKind;
 use crate::error::{Error, Result};
@@ -18,7 +19,9 @@ const EVENT_MASK: WatchMask = WatchMask::CLOSE_WRITE
     .union(WatchMask::CREATE)
     .union(WatchMask::DELETE)
     .union(WatchMask::MOVED_FROM)
-    .union(WatchMask::MOVED_TO);
+    .union(WatchMask::MOVED_TO)
+    .union(WatchMask::DELETE_SELF)
+    .union(WatchMask::MOVE_SELF);
 
 pub(crate) fn watch_directories(
     kind: BackendKind,
@@ -43,33 +46,53 @@ pub(crate) fn watch_directories(
         watched.insert(descriptor, directory.clone());
     }
 
-    let wake_dir = std::env::temp_dir().join(format!("osdns-watch-wake-{}", Uuid::new_v4()));
-    fs::create_dir_all(&wake_dir)?;
-    let wake_wd = inotify
-        .watches()
-        .add(&wake_dir, WatchMask::CREATE)
-        .map_err(|error| inotify_error(kind, error))?;
-    watched.insert(wake_wd.clone(), wake_dir.clone());
+    let (cancel_read, cancel_write) =
+        pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).map_err(std::io::Error::from)?;
 
     let flag = Arc::new(AtomicBool::new(false));
     let watch_flag = flag.clone();
-    let thread_wake_dir = wake_dir.clone();
     let watched_dirs = directories.to_vec();
+    let initial_scan = scan(&watched_dirs, &to_resource)?;
     let worker = thread::Builder::new()
         .name("osdns-inotify-watch".to_string())
         .spawn(move || {
+            let _lifetime = crate::watch::WatchWorker(Arc::clone(&watch_flag));
             let _ = watched;
             let mut buffer = [0u8; 4096];
             let seeds: HashSet<ResourceId> = initial_resources.into_iter().collect();
             let mut known = seeds.clone();
-            for resource in scan(&watched_dirs, &to_resource).unwrap_or_default() {
+            for resource in initial_scan {
                 known.insert(resource);
             }
             loop {
-                let Ok(events) = inotify.read_events_blocking(&mut buffer) else {
+                let mut fds = [
+                    PollFd::new(&inotify, PollFlags::IN),
+                    PollFd::new(&cancel_read, PollFlags::IN),
+                ];
+                if let Err(error) = poll(&mut fds, None) {
+                    if error == rustix::io::Errno::INTR {
+                        continue;
+                    }
+                    break;
+                }
+                if !fds[1].revents().is_empty() || watch_flag.load(Ordering::Acquire) {
+                    return;
+                }
+                if fds[0]
+                    .revents()
+                    .intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL)
+                {
+                    break;
+                }
+                let Ok(events) = inotify.read_events(&mut buffer) else {
                     break;
                 };
                 for event in events {
+                    if event.mask.intersects(
+                        EventMask::IGNORED | EventMask::DELETE_SELF | EventMask::MOVE_SELF,
+                    ) {
+                        return;
+                    }
                     if event.mask.contains(EventMask::Q_OVERFLOW) {
                         match scan(&watched_dirs, &to_resource) {
                             Ok(current) => {
@@ -88,15 +111,6 @@ pub(crate) fn watch_directories(
                         }
                         continue;
                     }
-                    if event.wd == wake_wd {
-                        if watch_flag.load(Ordering::Acquire) {
-                            return;
-                        }
-                        if let Some(name) = event.name {
-                            let _ = fs::remove_file(thread_wake_dir.join(name));
-                        }
-                        continue;
-                    }
                     let Some(name) = event.name else {
                         continue;
                     };
@@ -109,7 +123,11 @@ pub(crate) fn watch_directories(
                     let removed = event
                         .mask
                         .intersects(EventMask::DELETE | EventMask::MOVED_FROM);
-                    known.insert(resource.clone());
+                    if removed {
+                        known.remove(&resource);
+                    } else {
+                        known.insert(resource.clone());
+                    }
                     let event = if removed {
                         DnsEvent::ResourceRemoved { resource }
                     } else {
@@ -124,17 +142,11 @@ pub(crate) fn watch_directories(
             message: format!("cannot spawn watch thread: {error}"),
         })?;
 
-    let cancel_flag = flag.clone();
-    let cancel_wake = wake_dir.clone();
-    let wake_name = format!("wake-{}", Uuid::new_v4());
     Ok(WatchHandle::new(flag, move || {
-        cancel_flag.store(true, Ordering::Release);
-        let _ = fs::write(cancel_wake.join(wake_name), b"");
+        let _ = rustix::io::write(&cancel_write, b"x");
         let _ = worker.join();
-        let _ = fs::remove_dir_all(&cancel_wake);
     }))
 }
-
 fn watched_dirs_for_event(
     watched: &HashMap<WatchDescriptor, PathBuf>,
     descriptor: WatchDescriptor,

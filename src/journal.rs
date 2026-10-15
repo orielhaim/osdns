@@ -1,19 +1,22 @@
-use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::capability::BackendKind;
 use crate::error::{Error, Result};
-use crate::fsutil::{ensure_private_dir, fsync_dir};
+use crate::fsutil::{ensure_private_dir, private_error};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::{IdentityData, PlatformSnapshot, ResourceIdentity, SnapshotData};
 
 /// Current journal schema. Records with any other version are rejected
 /// (fail-closed) rather than guessed at.
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
+// A symmetric storage budget, including preserved native fields.
+const MAX_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct JournalEnvelope {
@@ -46,63 +49,66 @@ pub(crate) struct JournalRecord {
 }
 
 #[derive(Deserialize)]
-struct JournalRecordV3 {
+#[serde(deny_unknown_fields)]
+struct JournalRecordV4 {
     #[serde(rename = "schema_version")]
     _schema_version: u32,
     owner: String,
     lease_id: Uuid,
     resource: ResourceId,
     backend: BackendKind,
-    identity: ResourceIdentityV3,
+    identity: ResourceIdentityV4,
     phase: Phase,
-    before: PlatformSnapshotV3,
+    before: PlatformSnapshotV4,
     desired: NormalizedConfig,
-    applied: Option<PlatformSnapshotV3>,
+    applied: Option<PlatformSnapshotV4>,
 }
 
 #[derive(Deserialize)]
-struct PlatformSnapshotV3 {
+#[serde(deny_unknown_fields)]
+struct PlatformSnapshotV4 {
     backend: BackendKind,
     resource: ResourceId,
     data: serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct ResourceIdentityV3 {
+#[serde(deny_unknown_fields)]
+struct ResourceIdentityV4 {
     backend: BackendKind,
     resource: ResourceId,
     data: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct JournalRecordV3Ref<'a> {
+struct JournalRecordV4Ref<'a> {
     schema_version: u32,
     owner: &'a str,
     lease_id: Uuid,
     resource: &'a ResourceId,
     backend: BackendKind,
-    identity: ResourceIdentityV3Ref<'a>,
+    identity: ResourceIdentityV4Ref<'a>,
     phase: Phase,
-    before: PlatformSnapshotV3Ref<'a>,
+    before: PlatformSnapshotV4Ref<'a>,
     desired: &'a NormalizedConfig,
-    applied: Option<PlatformSnapshotV3Ref<'a>>,
+    applied: Option<PlatformSnapshotV4Ref<'a>>,
 }
 
 #[derive(Serialize)]
-struct PlatformSnapshotV3Ref<'a> {
+struct PlatformSnapshotV4Ref<'a> {
     backend: BackendKind,
     resource: &'a ResourceId,
     data: serde_json::Value,
 }
 
 #[derive(Serialize)]
-struct ResourceIdentityV3Ref<'a> {
+struct ResourceIdentityV4Ref<'a> {
     backend: BackendKind,
     resource: &'a ResourceId,
     data: serde_json::Value,
 }
 
-impl<'a> TryFrom<&'a JournalRecord> for JournalRecordV3Ref<'a> {
+impl<'a> TryFrom<&'a JournalRecord> for JournalRecordV4Ref<'a> {
     type Error = String;
 
     fn try_from(record: &'a JournalRecord) -> std::result::Result<Self, Self::Error> {
@@ -112,24 +118,24 @@ impl<'a> TryFrom<&'a JournalRecord> for JournalRecordV3Ref<'a> {
             lease_id: record.lease_id,
             resource: &record.resource,
             backend: record.backend,
-            identity: ResourceIdentityV3Ref {
+            identity: ResourceIdentityV4Ref {
                 backend: record.identity.backend,
                 resource: &record.identity.resource,
                 data: encode_identity(&record.identity.data)?,
             },
             phase: record.phase,
-            before: PlatformSnapshotV3Ref::try_from(&record.before)?,
+            before: PlatformSnapshotV4Ref::try_from(&record.before)?,
             desired: &record.desired,
             applied: record
                 .applied
                 .as_ref()
-                .map(PlatformSnapshotV3Ref::try_from)
+                .map(PlatformSnapshotV4Ref::try_from)
                 .transpose()?,
         })
     }
 }
 
-impl<'a> TryFrom<&'a PlatformSnapshot> for PlatformSnapshotV3Ref<'a> {
+impl<'a> TryFrom<&'a PlatformSnapshot> for PlatformSnapshotV4Ref<'a> {
     type Error = String;
 
     fn try_from(snapshot: &'a PlatformSnapshot) -> std::result::Result<Self, Self::Error> {
@@ -141,20 +147,20 @@ impl<'a> TryFrom<&'a PlatformSnapshot> for PlatformSnapshotV3Ref<'a> {
     }
 }
 
-impl TryFrom<JournalRecordV3> for JournalRecord {
+impl TryFrom<JournalRecordV4> for JournalRecord {
     type Error = String;
 
-    fn try_from(record: JournalRecordV3) -> std::result::Result<Self, Self::Error> {
+    fn try_from(record: JournalRecordV4) -> std::result::Result<Self, Self::Error> {
         Ok(Self {
             owner: record.owner,
             lease_id: record.lease_id,
             resource: record.resource,
             backend: record.backend,
-            identity: ResourceIdentity {
-                backend: record.identity.backend,
-                resource: record.identity.resource,
-                data: decode_identity(record.identity.backend, record.identity.data)?,
-            },
+            identity: ResourceIdentity::new(
+                record.identity.backend,
+                record.identity.resource,
+                decode_identity(record.identity.backend, record.identity.data)?,
+            ),
             phase: record.phase,
             before: record.before.try_into()?,
             desired: record.desired,
@@ -163,10 +169,10 @@ impl TryFrom<JournalRecordV3> for JournalRecord {
     }
 }
 
-impl TryFrom<PlatformSnapshotV3> for PlatformSnapshot {
+impl TryFrom<PlatformSnapshotV4> for PlatformSnapshot {
     type Error = String;
 
-    fn try_from(snapshot: PlatformSnapshotV3) -> std::result::Result<Self, Self::Error> {
+    fn try_from(snapshot: PlatformSnapshotV4) -> std::result::Result<Self, Self::Error> {
         Ok(Self {
             backend: snapshot.backend,
             resource: snapshot.resource,
@@ -311,8 +317,17 @@ fn record_file_name(lease_id: &Uuid, resource: &ResourceId) -> String {
     )
 }
 
-fn record_path(dir: &Path, lease_id: &Uuid, resource: &ResourceId) -> PathBuf {
-    dir.join(record_file_name(lease_id, resource))
+fn publication_error(error: private_fs::Error) -> Error {
+    match error {
+        private_fs::Error::AtomicCommit {
+            may_have_published,
+            source,
+        } => Error::JournalPublication {
+            may_have_published,
+            source: *source,
+        },
+        error => private_error(error),
+    }
 }
 
 /// Durable store of journal records, one file per (lease, resource).
@@ -322,26 +337,47 @@ fn record_path(dir: &Path, lease_id: &Uuid, resource: &ResourceId) -> PathBuf {
 #[derive(Debug)]
 pub(crate) struct JournalStore {
     dir: PathBuf,
+    handle: OnceLock<private_fs::PrivateDir>,
     #[cfg(feature = "test-util")]
     fail_writes: std::sync::atomic::AtomicBool,
     #[cfg(feature = "test-util")]
     fail_writes_skip: std::sync::atomic::AtomicU32,
     #[cfg(feature = "test-util")]
     fail_removes: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "test-util")]
+    fail_after_io: std::sync::atomic::AtomicBool,
 }
 
 impl JournalStore {
+    #[cfg(feature = "test-util")]
     pub(crate) fn open(dir: PathBuf) -> Result<Self> {
-        ensure_private_dir(&dir)?;
-        Ok(Self {
+        let store = Self::new(dir);
+        store.directory()?;
+        Ok(store)
+    }
+
+    pub(crate) fn new(dir: PathBuf) -> Self {
+        Self {
             dir,
+            handle: OnceLock::new(),
             #[cfg(feature = "test-util")]
             fail_writes: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "test-util")]
             fail_writes_skip: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "test-util")]
             fail_removes: std::sync::atomic::AtomicBool::new(false),
-        })
+            #[cfg(feature = "test-util")]
+            fail_after_io: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn directory(&self) -> Result<&private_fs::PrivateDir> {
+        if let Some(handle) = self.handle.get() {
+            return Ok(handle);
+        }
+        let handle = ensure_private_dir(&self.dir)?;
+        let _ = self.handle.set(handle);
+        Ok(self.handle.get().expect("directory initialized"))
     }
 
     #[cfg(feature = "test-util")]
@@ -368,6 +404,12 @@ impl JournalStore {
             .store(fail, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(feature = "test-util")]
+    pub(crate) fn set_fail_after_io(&self, fail: bool) {
+        self.fail_after_io
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn write(&self, record: &JournalRecord) -> Result<()> {
         #[cfg(feature = "test-util")]
         if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
@@ -384,27 +426,43 @@ impl JournalStore {
                 ));
             }
         }
-        let path = record_path(&self.dir, &record.lease_id, &record.resource);
-        let durable = JournalRecordV3Ref::try_from(record).map_err(|e| {
+        let durable = JournalRecordV4Ref::try_from(record).map_err(|e| {
             Error::platform(
                 record.backend,
                 format_args!("journal record conversion failed: {e}"),
             )
         })?;
-        let mut file = atomic_write_file::AtomicWriteFile::open(&path)?;
-        serde_json::to_writer_pretty(&mut file, &durable).map_err(|e| {
+        let bytes = serde_json::to_vec(&durable).map_err(|e| {
             Error::platform(
                 record.backend,
                 format_args!("journal record serialization failed: {e}"),
             )
         })?;
-        file.sync_all()?;
-        file.commit()?;
-        fsync_dir(&self.dir)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(Error::JournalCorrupt(
+                "journal record exceeds the 16 MiB storage budget".to_string(),
+            ));
+        }
+        self.directory()?
+            .write_atomic_with_durability(
+                record_file_name(&record.lease_id, &record.resource),
+                &bytes,
+                private_fs::Durability::Full,
+            )
+            .map_err(publication_error)?;
+        #[cfg(feature = "test-util")]
+        if self.fail_after_io.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::JournalPublication {
+                may_have_published: true,
+                source: private_fs::Error::Io(std::io::Error::other(
+                    "injected post-publication failure",
+                )),
+            });
+        }
         Ok(())
     }
 
-    pub(crate) fn remove(&self, lease_id: &Uuid, resource: &ResourceId) -> Result<bool> {
+    pub(crate) fn remove(&self, lease_id: &Uuid, resource: &ResourceId) -> Result<()> {
         #[cfg(feature = "test-util")]
         if self.fail_removes.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::platform(
@@ -412,42 +470,76 @@ impl JournalStore {
                 "injected journal removal failure",
             ));
         }
-        let path = record_path(&self.dir, lease_id, resource);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                fsync_dir(&self.dir)?;
-                Ok(true)
+        let directory = self.directory()?;
+        match directory.remove_file(
+            record_file_name(lease_id, resource),
+            private_fs::Durability::Full,
+        ) {
+            Ok(()) => {}
+            Err(private_fs::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Absence can follow a removal whose directory flush failed.
+                directory
+                    .sync_all()
+                    .map_err(|source| Error::JournalRemoval {
+                        may_have_removed: true,
+                        source,
+                    })?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e.into()),
+            Err(private_fs::Error::Removal {
+                may_have_removed,
+                source,
+            }) => {
+                return Err(Error::JournalRemoval {
+                    may_have_removed,
+                    source: *source,
+                });
+            }
+            Err(error) => return Err(private_error(error)),
         }
+        #[cfg(feature = "test-util")]
+        if self.fail_after_io.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(Error::JournalRemoval {
+                may_have_removed: true,
+                source: private_fs::Error::Io(std::io::Error::other(
+                    "injected post-cleanup failure",
+                )),
+            });
+        }
+        Ok(())
     }
 
     pub(crate) fn records(&self) -> Result<Vec<JournalRecord>> {
         let mut out = Vec::new();
-        let entries = match fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
+        let directory = self.directory()?;
+        for name in directory.entries().map_err(private_error)? {
+            let path = self.dir.join(&name);
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = fs::read(&path)?;
+            let file = directory
+                .open_file(Path::new(&name))
+                .map_err(private_error)?;
+            let mut bytes = Vec::new();
+            file.take(MAX_RECORD_BYTES + 1).read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_RECORD_BYTES {
+                return Err(Error::JournalCorrupt(format!(
+                    "{}: journal record exceeds the 16 MiB storage budget",
+                    path.display()
+                )));
+            }
             let record = decode_record(&path, &bytes)?;
-            if record.backend != record.before.backend
-                || record.backend != record.identity.backend
-                || record.resource != record.before.resource
-                || record.resource != record.identity.resource
-                || record.applied.as_ref().is_some_and(|snapshot| {
-                    snapshot.backend != record.backend || snapshot.resource != record.resource
-                })
+            if name != record_file_name(&record.lease_id, &record.resource).as_str() {
+                return Err(Error::JournalCorrupt(format!(
+                    "{}: filename does not match the lease and resource",
+                    path.display()
+                )));
+            }
+            if out
+                .iter()
+                .any(|other: &JournalRecord| other.resource == record.resource)
             {
                 return Err(Error::JournalCorrupt(format!(
-                    "{}: record, identity, and snapshots name different resources or backends",
+                    "{}: multiple records claim one resource",
                     path.display()
                 )));
             }
@@ -471,47 +563,6 @@ mod snapshot_codec {
 
     #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
     #[test]
-    fn legacy_unix_resolver_payloads_decode_without_optional_fields() {
-        let resolvconf = decode_snapshot(
-            BackendKind::Resolvconf,
-            serde_json::json!({"content": null}),
-        )
-        .unwrap();
-        assert!(matches!(resolvconf, SnapshotData::Resolvconf(_)));
-        let direct = decode_snapshot(
-            BackendKind::ResolvConfFile,
-            serde_json::json!({"content": null}),
-        )
-        .unwrap();
-        assert!(matches!(direct, SnapshotData::ResolvConfFile(_)));
-    }
-
-    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
-    #[test]
-    fn schema_3_openresolv_0_2_fixture_decodes_without_current_metadata() {
-        let record = decode_record(
-            Path::new("journal-openresolv-0.2-applied.json"),
-            include_bytes!("../tests/fixtures/journal-openresolv-0.2-applied.json"),
-        )
-        .unwrap();
-        assert_eq!(record.backend, BackendKind::Resolvconf);
-        let SnapshotData::Resolvconf(before) = &record.before.data else {
-            panic!("unexpected snapshot kind");
-        };
-        let applied_snapshot = record.applied.as_ref().unwrap();
-        let SnapshotData::Resolvconf(applied) = &applied_snapshot.data else {
-            panic!("unexpected snapshot kind");
-        };
-        assert!(before.attributes.is_none());
-        assert!(before.live.is_none());
-        assert!(applied.attributes.is_none());
-        assert!(applied.live.is_none());
-        assert!(before.content.is_some());
-        assert!(applied.content.is_some());
-    }
-
-    #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "netbsd"))]
-    #[test]
     fn missing_openresolv_content_is_not_a_legacy_empty_snapshot() {
         let error = decode_snapshot(BackendKind::Resolvconf, serde_json::json!({}))
             .expect_err("missing content must remain malformed");
@@ -527,6 +578,11 @@ mod snapshot_codec {
 }
 
 fn decode_record(path: &Path, bytes: &[u8]) -> Result<JournalRecord> {
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(Error::JournalCorrupt(
+            "journal record exceeds the 16 MiB storage budget".to_string(),
+        ));
+    }
     let envelope: JournalEnvelope = serde_json::from_slice(bytes)
         .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
     if envelope.schema_version != SCHEMA_VERSION {
@@ -536,10 +592,78 @@ fn decode_record(path: &Path, bytes: &[u8]) -> Result<JournalRecord> {
             supported: SCHEMA_VERSION,
         });
     }
-    let durable: JournalRecordV3 = serde_json::from_slice(bytes)
+    let durable: JournalRecordV4 = serde_json::from_slice(bytes)
         .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
-    JournalRecord::try_from(durable)
-        .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))
+    let record = JournalRecord::try_from(durable)
+        .map_err(|e| Error::JournalCorrupt(format!("{}: {e}", path.display())))?;
+    validate_record(path, &record)
+        .map_err(|error| Error::JournalCorrupt(format!("{}: {error}", path.display())))?;
+    Ok(record)
+}
+
+fn validate_record(path: &Path, record: &JournalRecord) -> Result<()> {
+    if record
+        .desired
+        .nameservers
+        .iter()
+        .any(|server| server.is_unspecified())
+    {
+        return Err(Error::JournalCorrupt(
+            "desired configuration contains an unspecified nameserver".to_string(),
+        ));
+    }
+    crate::manager::validate_owner(&record.owner)
+        .map_err(|error| Error::JournalCorrupt(error.to_string()))?;
+    if record.phase == Phase::Applied && record.applied.is_none() {
+        return Err(Error::JournalCorrupt(format!(
+            "{}: Applied record has no applied snapshot",
+            path.display()
+        )));
+    }
+    if record.backend != record.before.backend
+        || record.backend != record.identity.backend
+        || record.resource != record.before.resource
+        || record.resource != record.identity.resource
+        || record.applied.as_ref().is_some_and(|snapshot| {
+            snapshot.backend != record.backend || snapshot.resource != record.resource
+        })
+    {
+        return Err(Error::JournalCorrupt(format!(
+            "{}: record, identity, and snapshots name different resources or backends",
+            path.display()
+        )));
+    }
+    for snapshot in std::iter::once(&record.before).chain(record.applied.iter()) {
+        #[cfg(windows)]
+        if snapshot.backend == BackendKind::WindowsIpHelper {
+            crate::platform::windows::WindowsBackend::validate_snapshot(snapshot, &record.owner)?;
+        }
+        #[cfg(target_os = "macos")]
+        if snapshot.backend == BackendKind::MacosSystemConfiguration {
+            crate::platform::macos::MacosBackend::validate_snapshot(snapshot, &record.owner)?;
+        }
+        #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
+        if let SnapshotData::ResolvConfFile(data) = &snapshot.data {
+            data.validate()?;
+            if snapshot.resource.as_str().strip_suffix(":resolv-conf") != Some(std::env::consts::OS)
+                || data
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.owner.is_none() || metadata.links != Some(1))
+            {
+                return Err(Error::JournalCorrupt(
+                    "resolver file snapshot has an invalid native resource or ownership metadata"
+                        .to_string(),
+                ));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let SnapshotData::SystemdResolved(data) = &snapshot.data {
+            data.validate()?;
+        }
+        let _ = snapshot;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "test-util")]

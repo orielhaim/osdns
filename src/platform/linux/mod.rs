@@ -15,6 +15,71 @@ use crate::interface::InterfaceInfo;
 pub(crate) const SYS_CLASS_NET: &str = "/sys/class/net";
 pub(crate) const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 
+pub(crate) struct BusConnection(parking_lot::Mutex<zbus::blocking::Connection>);
+
+impl BusConnection {
+    pub(crate) fn new(connection: zbus::blocking::Connection) -> Self {
+        Self(parking_lot::Mutex::new(connection))
+    }
+
+    pub(crate) fn verify_namespace(
+        &self,
+        service: &'static str,
+        backend: crate::BackendKind,
+    ) -> Result<()> {
+        let connection = self
+            .get()
+            .map_err(|error| Error::platform(backend, error))?;
+        let bus = zbus::blocking::fdo::DBusProxy::new(&connection)
+            .map_err(|error| Error::platform(backend, error))?;
+        let name = zbus::names::BusName::try_from(service)
+            .map_err(|error| Error::platform(backend, error))?;
+        let owner = bus
+            .get_name_owner(name)
+            .map_err(|error| Error::platform(backend, error))?;
+        let pid = bus
+            .get_connection_unix_process_id(owner.into())
+            .map_err(|error| Error::platform(backend, error))?;
+        let current = std::fs::read_link("/proc/thread-self/ns/net")?;
+        let native = std::fs::read_link(format!("/proc/{pid}/ns/net"))?;
+        if current != native {
+            return Err(Error::unsupported(
+                backend,
+                "the DNS service controls a different network namespace",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get(&self) -> zbus::Result<zbus::blocking::Connection> {
+        let mut connection = self.0.lock();
+        if connection.is_closed() {
+            *connection = zbus::blocking::Connection::system()?;
+        }
+        Ok(connection.clone())
+    }
+}
+
+pub(crate) fn watch_signals(
+    connection: &zbus::blocking::Connection,
+    rule: zbus::MatchRule<'static>,
+    service: &'static str,
+) -> zbus::Result<zbus::blocking::MessageIterator> {
+    let iterator = zbus::blocking::MessageIterator::from(connection);
+    let bus = zbus::blocking::fdo::DBusProxy::new(connection)?;
+    bus.add_match_rule(rule)?;
+    bus.add_match_rule(
+        zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .sender("org.freedesktop.DBus")?
+            .interface("org.freedesktop.DBus")?
+            .member("NameOwnerChanged")?
+            .arg(0, service)?
+            .build(),
+    )?;
+    Ok(iterator)
+}
+
 pub(crate) fn interface_names() -> Result<Vec<String>> {
     let mut names = Vec::new();
     let entries = std::fs::read_dir(SYS_CLASS_NET)?;

@@ -17,6 +17,51 @@ fn resolver_id(domain: &str) -> osdns::ResourceId {
 }
 
 #[rstest]
+#[case("restore")]
+#[case("abandon")]
+#[case("drop")]
+fn partial_restore_releases_completed_resources_and_teardown_never_revisits_them(
+    #[case] teardown: &str,
+) {
+    let fixture = new_multi_fixture("multi-partial-lifecycle");
+    let lease = fixture
+        .manager
+        .apply(&routing_config(&["corp.example"]))
+        .unwrap();
+    fixture
+        .fake
+        .external_change("fake:resolver:corp.example", state_with("9.9.9.9"))
+        .unwrap();
+    let failed = lease.restore().unwrap_err().lease;
+    assert!(matches!(
+        failed.update(&routing_config(&["corp.example"])),
+        Err(Error::LeaseEnding)
+    ));
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    let next = fixture.manager.apply(&iface_config(1, "8.8.8.8")).unwrap();
+    match teardown {
+        "restore" => {
+            fixture
+                .fake
+                .external_change(
+                    "fake:resolver:corp.example",
+                    osdns::testing::FakeState::Empty,
+                )
+                .unwrap();
+            failed.restore().unwrap();
+        }
+        "abandon" => failed.abandon().unwrap(),
+        "drop" => drop(failed),
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("8.8.8.8"))
+    );
+    next.restore().unwrap();
+}
+
+#[rstest]
 #[case(1)]
 #[case(3)]
 fn apply_spans_service_and_resolver_resources(#[case] domain_count: usize) {
@@ -203,4 +248,49 @@ fn update_touches_every_resource() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(osdns::testing::FakeState::Empty)
     );
+}
+
+#[rstest]
+#[case(false)]
+#[case(true)]
+fn failed_apply_rollback_retains_verified_evidence_for_conservative_recovery(
+    #[case] external_change: bool,
+) {
+    let fixture = new_multi_fixture("multi-failed-rollback");
+    fixture.fake.inject_backend_failure_after(
+        osdns::testing::FakeOp::Apply,
+        1,
+        1,
+        "later apply failed",
+    );
+    fixture
+        .fake
+        .inject_backend_failure(osdns::testing::FakeOp::Restore, 1, "rollback failed");
+    assert!(matches!(
+        fixture.manager.apply(&routing_config(&["corp.example"])),
+        Err(Error::TransactionFailed { .. })
+    ));
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
+    if external_change {
+        fixture
+            .fake
+            .external_change(IFACE1, state_with("9.9.9.9"))
+            .unwrap();
+    }
+    let outcomes = fixture.manager.recover_stale().unwrap();
+    assert!(matches!(&outcomes[0], RecoveryOutcome::ExternalConflict { .. }) == external_change);
+    if external_change {
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(state_with("9.9.9.9"))
+        );
+        assert_eq!(journal_files(&fixture.dir).len(), 1);
+    } else {
+        assert!(matches!(&outcomes[0], RecoveryOutcome::Restored { .. }));
+        assert_eq!(
+            fixture.fake.current_state(IFACE1).unwrap(),
+            Some(osdns::testing::FakeState::Empty)
+        );
+        assert!(journal_files(&fixture.dir).is_empty());
+    }
 }

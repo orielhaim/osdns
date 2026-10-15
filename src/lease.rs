@@ -30,6 +30,13 @@ pub(crate) struct LiveRecord {
 pub(crate) struct LiveLease {
     live: Vec<Arc<Mutex<LiveRecord>>>,
     _locks: Vec<ResourceLock>,
+    phase: LeasePhase,
+}
+
+enum LeasePhase {
+    Active,
+    Restoring,
+    Abandoning,
 }
 
 /// Exclusive, transactional ownership over DNS state.
@@ -111,12 +118,32 @@ impl Lease {
             state: Mutex::new(Some(LiveLease {
                 live,
                 _locks: locks,
+                phase: LeasePhase::Active,
             })),
         }
     }
 
-    /// The resources this lease owns. Empty only for a lease that was
-    /// restored or abandoned; otherwise fixed at apply time.
+    /// Resources whose latest verified state still needs durable journal finalization.
+    /// Live ownership proof remains usable, but a crash may leave an ambiguous journal.
+    /// A later update or restore retries finalization; Enforce retries automatically.
+    pub fn pending_durability(&self) -> Vec<ResourceId> {
+        let state = self.state.lock();
+        let mut resources = state
+            .as_ref()
+            .into_iter()
+            .flat_map(|state| &state.live)
+            .filter_map(|entry| {
+                let live = entry.lock();
+                (live.verified.is_some() || live.record.phase == crate::journal::Phase::Prepared)
+                    .then(|| live.record.resource.clone())
+            })
+            .collect::<Vec<_>>();
+        resources.sort();
+        resources
+    }
+
+    /// The original resource set, fixed at apply time. After a partial restore,
+    /// only the unresolved resources remain owned.
     pub fn resources(&self) -> &[ResourceId] {
         &self.resources
     }
@@ -139,9 +166,11 @@ impl Lease {
     /// Transactionally moves this lease to a new desired configuration.
     ///
     /// The update is one logical transaction across every owned resource:
-    /// either all resources move to the new configuration or all remain on
-    /// the old one (rolled back to their immediately previous applied state
-    /// with journals restored). The original `before` snapshots are
+    /// successful updates move every resource to the new configuration.
+    /// Failures attempt rollback to each immediately previous applied state.
+    /// If rollback also fails, [`Error::TransactionFailed`] retains the failure
+    /// details and the lease tracks the state that remains owned.
+    /// The original `before` snapshots are
     /// preserved, so a later [`Lease::restore`] still returns the machine to
     /// the pre-lease state (or to the rebased external base under
     /// [`ConflictPolicy::Enforce`](crate::ConflictPolicy::Enforce)).
@@ -151,6 +180,8 @@ impl Lease {
     /// resolves to different resources fails with
     /// [`Error::UpdateRequiresRebind`]: restore or abandon this lease and
     /// apply fresh.
+    /// Once restoration has started, updates are rejected even if only some
+    /// resources were restored. Retry restore or abandon the remaining state.
     pub fn update(&self, config: &DnsConfig) -> Result<()> {
         let caps = self.inner.backend.capabilities();
         let plan = validate_against(config, &caps)?;
@@ -166,33 +197,41 @@ impl Lease {
                 reason: ConflictReason::LeaseNotActive,
             });
         };
-        let LiveLease { live, _locks } = state;
-        let repack = |live: Vec<Arc<Mutex<LiveRecord>>>| LiveLease { live, _locks };
+        if !matches!(state.phase, LeasePhase::Active)
+            || state.live.iter().any(|entry| {
+                let resource = entry.lock().record.resource.clone();
+                !self.inner.active.lock().contains_key(&resource)
+            })
+        {
+            *guard = Some(state);
+            return Err(Error::LeaseEnding);
+        }
+        let LiveLease {
+            live,
+            _locks,
+            phase,
+        } = state;
+        let repack = |live: Vec<Arc<Mutex<LiveRecord>>>| LiveLease {
+            live,
+            _locks,
+            phase,
+        };
         for entry in &live {
             let record = entry.lock().record.clone();
             match self.inner.backend.resource_status(&record.identity) {
                 Ok(ResourceStatus::Same) => {}
                 Ok(status @ (ResourceStatus::Gone | ResourceStatus::Replaced)) => {
-                    if let Err(error) = self
-                        .inner
-                        .journal
-                        .remove(&record.lease_id, &record.resource)
-                    {
-                        *guard = Some(repack(live));
-                        return Err(error);
-                    }
-                    self.inner.unregister_active(&record.resource);
                     *guard = Some(repack(live));
                     return Err(match status {
                         ResourceStatus::Gone => Error::ResourceGone {
                             backend: self.inner.backend.kind(),
                             resource: record.resource,
-                            message: "the leased native resource incarnation is gone; its journal was cleared and a fresh lease is required".to_string(),
+                            message: "the leased native resource incarnation is gone; restore or abandon the lease".to_string(),
                         },
                         ResourceStatus::Replaced => Error::ResourceIdentity {
                             backend: self.inner.backend.kind(),
                             resource: record.resource,
-                            message: "the lease target was replaced; its journal was cleared and a fresh lease is required".to_string(),
+                            message: "the lease target was replaced; restore or abandon the lease".to_string(),
                         },
                         _ => unreachable!(),
                     });
@@ -243,6 +282,7 @@ impl Lease {
         drop(token_guards);
         drop(tokens);
         *guard = Some(repack(live));
+        self.inner.rescan_enforce();
         result
     }
 
@@ -253,7 +293,7 @@ impl Lease {
     /// current state ([`crate::OwnershipIdentity::Durable`] identity, or
     /// best-effort DNS comparison). Resources whose state was externally modified keep their
     /// journal record, and the first failure is reported through
-    /// [`RestoreFailure`] together with the still-usable lease so it can be
+    /// [`LeaseFailure`] together with the still-usable lease so it can be
     /// retried or explicitly given up with [`Lease::abandon`]. A no-op lease
     /// (desired already in effect) restores trivially by clearing its
     /// journal without touching the system, unless an external change
@@ -277,10 +317,10 @@ impl Lease {
     /// # }
     /// ```
     #[allow(clippy::result_large_err)]
-    pub fn restore(self) -> std::result::Result<(), RestoreFailure> {
+    pub fn restore(self) -> std::result::Result<(), LeaseFailure> {
         match self.restore_state() {
             Ok(()) => Ok(()),
-            Err(error) => Err(RestoreFailure { error, lease: self }),
+            Err(error) => Err(LeaseFailure { error, lease: self }),
         }
     }
 
@@ -296,19 +336,22 @@ impl Lease {
                 reason: ConflictReason::LeaseNotActive,
             });
         };
-        let LiveLease { live, _locks } = state;
+        let LiveLease {
+            mut live,
+            mut _locks,
+            phase,
+        } = state;
         let mut first_error = None;
-        for record in &live {
+        live.retain(|record| {
+            let mut keep = true;
             self.inner.with_live_record(record, |live| {
                 let resource = live.record.resource.clone();
-                if let Err(error) = self.inner.finalize_live(live, None) {
-                    if first_error.is_none() {
-                        first_error = Some(error);
+                self.inner.unregister_active(&resource);
+                match self.inner.restore_live_state(live) {
+                    Ok(()) => {
+                        _locks.retain(|lock| lock.resource() != &resource);
+                        keep = false;
                     }
-                    return;
-                }
-                match self.inner.restore_lease_state(&live.record) {
-                    Ok(()) => self.inner.unregister_active(&resource),
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -316,15 +359,22 @@ impl Lease {
                     }
                 }
             });
+            keep
+        });
+        if matches!(phase, LeasePhase::Active) {
+            self.inner.release_enforce_watch();
         }
         match first_error {
             None => {
                 drop(_locks);
-                self.inner.release_enforce_watch();
                 Ok(())
             }
             Some(error) => {
-                *guard = Some(LiveLease { live, _locks });
+                *guard = Some(LiveLease {
+                    live,
+                    _locks,
+                    phase: LeasePhase::Restoring,
+                });
                 Err(error)
             }
         }
@@ -333,34 +383,62 @@ impl Lease {
     /// Ends the lease without touching the system: the ownership claims are
     /// released and the journal records removed.
     ///
-    /// Consumes the lease and releases its locks. Use this when the current
+    /// On failure, returns the lease with unresolved records and locks for retry.
+    /// Dropping that returned lease retries journal removal without restoring DNS.
+    /// A record that still cannot be removed remains eligible for crash recovery.
+    /// Use this when the current
     /// (externally modified) state should win - typically after
     /// [`Error::ExternalModification`] from [`Lease::restore`]. Never fails
     /// due to external state; only journal I/O errors are reported.
-    pub fn abandon(self) -> Result<()> {
-        let mut guard = self.state.lock();
-        if let Some(LiveLease { live, _locks }) = guard.take() {
-            let mut failure = None;
-            for record in &live {
-                self.inner.with_live_record(record, |live| {
-                    let resource = live.record.resource.clone();
-                    if failure.is_none()
-                        && let Err(error) =
-                            self.inner.journal.remove(&live.record.lease_id, &resource)
-                    {
-                        failure = Some(error);
-                    }
-                    self.inner.unregister_active(&resource);
-                });
-            }
-            drop(_locks);
-            // Every live lease holds one Enforce reference.
-            self.inner.release_enforce_watch();
-            if let Some(error) = failure {
-                return Err(error);
-            }
+    #[allow(clippy::result_large_err)]
+    pub fn abandon(self) -> std::result::Result<(), LeaseFailure> {
+        match self.abandon_state() {
+            Ok(()) => Ok(()),
+            Err(error) => Err(LeaseFailure { error, lease: self }),
         }
-        Ok(())
+    }
+
+    fn abandon_state(&self) -> Result<()> {
+        let mut guard = self.state.lock();
+        let Some(LiveLease {
+            mut live,
+            mut _locks,
+            phase,
+        }) = guard.take()
+        else {
+            return Ok(());
+        };
+        let mut failure = None;
+        live.retain(|record| {
+            let mut keep = true;
+            self.inner.with_live_record(record, |live| {
+                let resource = &live.record.resource;
+                self.inner.unregister_active(resource);
+                match self.inner.journal.remove(&live.record.lease_id, resource) {
+                    Ok(()) => {
+                        _locks.retain(|lock| lock.resource() != resource);
+                        keep = false;
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            });
+            keep
+        });
+        if matches!(phase, LeasePhase::Active) {
+            self.inner.release_enforce_watch();
+        }
+        if let Some(error) = failure {
+            *guard = Some(LiveLease {
+                live,
+                _locks,
+                phase: LeasePhase::Abandoning,
+            });
+            Err(error)
+        } else {
+            Ok(())
+        }
     }
 
     /// Releases locks and live registration without restoring or removing
@@ -369,7 +447,12 @@ impl Lease {
     #[cfg(feature = "test-util")]
     pub fn debug_release_locks_keep_journal(self) {
         let mut guard = self.state.lock();
-        if let Some(LiveLease { live, _locks }) = guard.take() {
+        if let Some(LiveLease {
+            live,
+            _locks,
+            phase,
+        }) = guard.take()
+        {
             for record in &live {
                 self.inner.with_live_record(record, |live| {
                     let resource = live.record.resource.clone();
@@ -377,12 +460,14 @@ impl Lease {
                 });
             }
             drop(_locks);
-            self.inner.release_enforce_watch();
+            if matches!(phase, LeasePhase::Active) {
+                self.inner.release_enforce_watch();
+            }
         }
     }
 }
 
-/// Failure returned by [`Lease::restore`]; carries the still-usable lease.
+/// Failure returned by [`Lease::restore`] or [`Lease::abandon`]; retains the lease.
 ///
 /// `error` is typically [`Error::ExternalModification`]: nothing was mutated
 /// for the conflicting resource and its journal record was kept. The lease
@@ -390,23 +475,23 @@ impl Lease {
 /// external state settles, or call [`Lease::abandon`] to leave the external
 /// state in place. Convert to [`Error`] with `failure.error` or `into()`
 /// when the lease should simply be dropped (dropping performs best-effort
-/// restoration per resource).
-pub struct RestoreFailure {
-    /// Why the restore failed. Typically [`Error::ExternalModification`].
+/// restoration per resource, or journal cleanup after a failed abandon).
+pub struct LeaseFailure {
+    /// Why restoration or journal abandonment failed.
     pub error: Error,
     /// The lease, still holding its resource locks and journal records.
     pub lease: Lease,
 }
 
-impl From<RestoreFailure> for Error {
-    fn from(failure: RestoreFailure) -> Self {
+impl From<LeaseFailure> for Error {
+    fn from(failure: LeaseFailure) -> Self {
         failure.error
     }
 }
 
-impl fmt::Debug for RestoreFailure {
+impl fmt::Debug for LeaseFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RestoreFailure")
+        f.debug_struct("LeaseFailure")
             .field("error", &self.error)
             .field("lease", &self.lease)
             .finish()
@@ -426,17 +511,31 @@ impl fmt::Debug for Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(LiveLease { live, _locks }) = self.state.lock().take() {
+        if let Some(LiveLease {
+            live,
+            _locks,
+            phase,
+        }) = self.state.lock().take()
+        {
             for record in &live {
                 self.inner.with_live_record(record, |live| {
                     let resource = live.record.resource.clone();
-                    let _ = self.inner.finalize_live(live, None);
-                    self.inner.best_effort_restore(&live.record);
+                    if matches!(phase, LeasePhase::Abandoning) {
+                        if let Err(_error) = self.inner.journal.remove(&live.record.lease_id, &resource) {
+                            osdns_warn!(resource = %resource, error = %_error, "abandon cleanup remains journaled for explicit recovery");
+                        }
+                    } else {
+                        if let Err(_error) = self.inner.restore_live_state(live) {
+                            osdns_warn!(resource = %resource, error = %_error, "lease drop could not restore; journal remains available for recovery");
+                        }
+                    }
                     self.inner.unregister_active(&resource);
                 });
             }
             drop(_locks);
-            self.inner.release_enforce_watch();
+            if matches!(phase, LeasePhase::Active) {
+                self.inner.release_enforce_watch();
+            }
         }
     }
 }

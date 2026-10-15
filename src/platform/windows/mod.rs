@@ -111,6 +111,12 @@ impl WindowsBackend {
             return Ok(ResourceKind::Interface(interface::parse_guid(text)?));
         }
         if let Some(key) = resource.as_str().strip_prefix("windows:nrpt:") {
+            let guid = interface::parse_guid(key)?;
+            if interface::guid_to_string(&guid) != key {
+                return Err(Error::JournalCorrupt(
+                    "noncanonical NRPT resource key".to_string(),
+                ));
+            }
             return Ok(ResourceKind::Nrpt {
                 key: key.to_string(),
             });
@@ -140,10 +146,8 @@ impl WindowsBackend {
     }
 
     /// Applies both stacks in sequence. When the second call fails the
-    /// first stack may already be mutated: per the backend apply contract
-    /// the error means indeterminate state, and the transaction engine
-    /// always reads back and rolls back under guard rather than assuming
-    /// nothing changed.
+    /// first stack may already be mutated. Without backend-issued ownership
+    /// proof the engine retains the journal rather than guessing rollback ownership.
     fn interface_present(guid: &GUID) -> Result<bool> {
         let want = guid_to_string(guid);
         Ok(list_adapters()?
@@ -206,6 +210,7 @@ impl WindowsBackend {
     }
 
     fn parse_snapshot(&self, snapshot: &PlatformSnapshot) -> Result<WindowsSnapshot> {
+        Self::validate_snapshot(snapshot, &self.owner)?;
         #[cfg(not(feature = "test-util"))]
         {
             let SnapshotData::WindowsIpHelper(data) = &snapshot.data;
@@ -216,6 +221,34 @@ impl WindowsBackend {
             SnapshotData::WindowsIpHelper(data) => Ok(data.clone()),
             _ => Err(Error::JournalCorrupt(
                 "Windows snapshot has the wrong backend data".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn validate_snapshot(snapshot: &PlatformSnapshot, owner: &str) -> Result<()> {
+        #[cfg(not(feature = "test-util"))]
+        let SnapshotData::WindowsIpHelper(data) = &snapshot.data;
+        #[cfg(feature = "test-util")]
+        let SnapshotData::WindowsIpHelper(data) = &snapshot.data else {
+            return Err(Error::JournalCorrupt(
+                "Windows snapshot has the wrong backend data".to_string(),
+            ));
+        };
+        match (Self::parse_resource(&snapshot.resource)?, data) {
+            (ResourceKind::Interface(_), WindowsSnapshot::Interface(_)) => Ok(()),
+            (ResourceKind::Nrpt { key }, WindowsSnapshot::Nrpt(snapshot)) => {
+                if let Some(rule) = &snapshot.rule {
+                    nrpt::validate_rule(rule, owner)?;
+                    if rule.key != key {
+                        return Err(Error::JournalCorrupt(
+                            "NRPT snapshot key differs from its record".to_string(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::JournalCorrupt(
+                "Windows snapshot kind differs from its resource".to_string(),
             )),
         }
     }
@@ -391,6 +424,11 @@ impl Backend for WindowsBackend {
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
+        if resource != &snapshot.resource {
+            return Err(Error::JournalCorrupt(
+                "restore snapshot names a different resource".to_string(),
+            ));
+        }
         match (
             Self::parse_resource(resource)?,
             self.parse_snapshot(snapshot)?,
@@ -517,15 +555,14 @@ impl Backend for WindowsBackend {
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ip_cancel = notify::start_ip_interface_watch(flag.clone(), callback.clone())?;
-        let nrpt_cancel = match notify::start_nrpt_registry_watch(flag, callback) {
+        let nrpt_cancel = match notify::start_nrpt_registry_watch(flag.clone(), callback) {
             Ok(cancel) => cancel,
             Err(error) => {
                 ip_cancel();
                 return Err(error);
             }
         };
-        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        Ok(WatchHandle::new(done, move || {
+        Ok(WatchHandle::new(flag, move || {
             ip_cancel();
             nrpt_cancel();
         }))

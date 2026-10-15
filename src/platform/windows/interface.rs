@@ -14,9 +14,8 @@ use crate::platform::windows::ffi::{
     self, ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, DNS_INTERFACE_SETTINGS,
     DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
     DNS_SETTING_SEARCHLIST, ERROR_BUFFER_OVERFLOW, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-    GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GUID, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0,
-    IN6_ADDR, IN6_ADDR_0, IP_ADAPTER_ADDRESSES_LH, IfOperStatusUp, PCHAR, PWSTR, SOCKADDR,
-    SOCKADDR_IN, SOCKADDR_IN6_LH, SOCKADDR_IN6_LH_0, open_hklm, wide_to_string,
+    GAA_FLAG_SKIP_MULTICAST, GAA_FLAG_SKIP_UNICAST, GUID, IP_ADAPTER_ADDRESSES_LH, IfOperStatusUp,
+    PCHAR, PWSTR, open_hklm, wide_to_string,
 };
 
 pub(crate) struct AdapterInfo {
@@ -33,13 +32,18 @@ pub(crate) fn guid_to_string(guid: &GUID) -> String {
 }
 
 pub(crate) fn parse_guid(text: &str) -> Result<GUID> {
-    let cleaned: String = text
-        .chars()
-        .filter(|c| *c != '{' && *c != '}' && *c != '-')
-        .collect();
-    let value = u128::from_str_radix(&cleaned, 16)
+    let text = text
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .unwrap_or(text);
+    let uuid = Uuid::parse_str(text)
         .map_err(|_| Error::invalid_config(format_args!("invalid interface GUID {text:?}")))?;
-    Ok(guid_from_u128(value))
+    if text.len() != 36 || uuid.hyphenated().to_string() != text.to_ascii_lowercase() {
+        return Err(Error::invalid_config(format_args!(
+            "invalid interface GUID {text:?}"
+        )));
+    }
+    Ok(guid_from_u128(uuid.as_u128()))
 }
 
 pub(crate) fn guid_from_u128(value: u128) -> GUID {
@@ -56,7 +60,11 @@ pub(crate) fn guid_from_u128(value: u128) -> GUID {
 pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
     let mut size: u32 = 16 * 1024;
     loop {
-        let mut buffer = vec![0u8; size as usize];
+        let mut buffer = vec![
+            std::mem::MaybeUninit::<IP_ADAPTER_ADDRESSES_LH>::uninit();
+            (size as usize)
+                .div_ceil(std::mem::size_of::<IP_ADAPTER_ADDRESSES_LH>())
+        ];
         let result = unsafe {
             ffi::GetAdaptersAddresses(
                 AF_UNSPEC as u32,
@@ -87,7 +95,9 @@ pub(crate) fn list_adapters() -> Result<Vec<AdapterInfo>> {
     }
 }
 
-unsafe fn adapters_from_buffer(buffer: &[u8]) -> Result<Vec<AdapterInfo>> {
+unsafe fn adapters_from_buffer(
+    buffer: &[std::mem::MaybeUninit<IP_ADAPTER_ADDRESSES_LH>],
+) -> Result<Vec<AdapterInfo>> {
     let mut adapters = Vec::new();
     let mut current = buffer.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
     while !current.is_null() {
@@ -247,69 +257,73 @@ pub(crate) fn parse_address_list(text: &str) -> Vec<IpAddr> {
         .collect()
 }
 
-fn v4_sockaddr(bytes: [u8; 4]) -> SOCKADDR_IN {
-    SOCKADDR_IN {
-        sin_family: AF_INET as ADDRESS_FAMILY,
-        sin_port: 0,
-        sin_addr: IN_ADDR {
-            S_un: IN_ADDR_0 {
-                S_un_b: IN_ADDR_0_0 {
-                    s_b1: bytes[0],
-                    s_b2: bytes[1],
-                    s_b3: bytes[2],
-                    s_b4: bytes[3],
-                },
-            },
-        },
-        sin_zero: [0; 8],
+fn select_default(routes: &[(u16, u64, String)]) -> Result<&str> {
+    let mut selected = std::collections::BTreeSet::new();
+    for family in [AF_INET as u16, AF_INET6 as u16] {
+        let minimum = routes.iter().filter(|r| r.0 == family).map(|r| r.1).min();
+        if let Some(minimum) = minimum {
+            selected.extend(
+                routes
+                    .iter()
+                    .filter(|r| r.0 == family && r.1 == minimum)
+                    .map(|r| r.2.as_str()),
+            );
+        }
     }
-}
-
-fn v6_sockaddr(bytes: [u8; 16]) -> SOCKADDR_IN6_LH {
-    SOCKADDR_IN6_LH {
-        sin6_family: AF_INET6 as ADDRESS_FAMILY,
-        sin6_port: 0,
-        sin6_flowinfo: 0,
-        sin6_addr: IN6_ADDR {
-            u: IN6_ADDR_0 { Byte: bytes },
-        },
-        Anonymous: SOCKADDR_IN6_LH_0 { sin6_scope_id: 0 },
+    match selected.len() {
+        0 => Err(Error::invalid_config("no default route is available")),
+        1 => Ok(selected.into_iter().next().unwrap()),
+        _ => Err(Error::invalid_config(
+            "default routes select multiple interfaces; select an interface explicitly",
+        )),
     }
 }
 
 pub(crate) fn default_route_adapter() -> Result<AdapterInfo> {
-    const PROBE_V4: [u8; 4] = [8, 8, 8, 8];
-    const PROBE_V6: [u8; 16] = [
-        0x20, 0x01, 0x48, 0x60, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88,
-    ];
-    let adapters = list_adapters()?;
-    let mut best_index: u32 = 0;
-    let v4_addr = v4_sockaddr(PROBE_V4);
-    // SAFETY: sockaddr is fully initialized; best_index receives the result.
-    let v4 = unsafe {
-        ffi::GetBestInterfaceEx(
-            (&v4_addr as *const SOCKADDR_IN).cast::<SOCKADDR>(),
-            &mut best_index,
-        )
-    };
-    let status = if v4 != 0 {
-        let v6_addr = v6_sockaddr(PROBE_V6);
-        // SAFETY: as above for the IPv6 probe address.
-        unsafe {
-            ffi::GetBestInterfaceEx(
-                (&v6_addr as *const SOCKADDR_IN6_LH).cast::<SOCKADDR>(),
-                &mut best_index,
-            )
+    struct RouteTable(*mut ffi::MIB_IPFORWARD_TABLE2);
+    impl Drop for RouteTable {
+        fn drop(&mut self) {
+            unsafe { ffi::FreeMibTable(self.0.cast()) };
         }
-    } else {
-        v4
-    };
-    if status == 0
-        && let Some(adapter) = adapters.into_iter().find(|a| a.index == best_index)
-    {
-        return Ok(adapter);
     }
-    Err(Error::invalid_config("no default route is available"))
+    let mut table = std::ptr::null_mut();
+    let status = unsafe { ffi::GetIpForwardTable2(AF_UNSPEC as ADDRESS_FAMILY, &mut table) };
+    check_status(status as i32, "GetIpForwardTable2")?;
+    let table = RouteTable(table);
+    // SAFETY: IP Helper owns this variable-length table until FreeMibTable.
+    let rows = unsafe {
+        std::slice::from_raw_parts((*table.0).Table.as_ptr(), (*table.0).NumEntries as usize)
+    };
+    let mut candidates = Vec::new();
+    for route in rows {
+        if route.DestinationPrefix.PrefixLength != 0 || route.Loopback || route.ValidLifetime == 0 {
+            continue;
+        }
+        let family = unsafe { route.DestinationPrefix.Prefix.si_family };
+        let mut interface = ffi::MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceLuid: route.InterfaceLuid,
+            ..Default::default()
+        };
+        let status = unsafe { ffi::GetIpInterfaceEntry(&mut interface) };
+        check_status(status as i32, "GetIpInterfaceEntry (default route)")?;
+        if !interface.Connected || interface.DisableDefaultRoutes {
+            continue;
+        }
+        let mut guid = GUID::default();
+        let status = unsafe { ffi::ConvertInterfaceLuidToGuid(&route.InterfaceLuid, &mut guid) };
+        check_status(status as i32, "ConvertInterfaceLuidToGuid (default route)")?;
+        candidates.push((
+            family,
+            u64::from(route.Metric) + u64::from(interface.Metric),
+            guid_to_string(&guid),
+        ));
+    }
+    let selected = select_default(&candidates)?;
+    list_adapters()?
+        .into_iter()
+        .find(|a| a.guid_string == selected)
+        .ok_or_else(|| Error::invalid_config("default-route interface disappeared"))
 }
 
 pub(crate) fn adapter_for_selector(selector: &InterfaceSelector) -> Result<AdapterInfo> {
@@ -440,5 +454,30 @@ mod tests {
         )
         .unwrap_err();
         assert!(registry_not_found(&error));
+    }
+    #[rstest::rstest]
+    #[case(vec![(2, 10, "a"), (2, 20, "b")], Some("a"))]
+    #[case(vec![(2, 10, "a"), (23, 10, "a")], Some("a"))]
+    #[case(vec![(2, 10, "a"), (23, 10, "b")], None)]
+    #[case(vec![(2, 10, "a"), (2, 10, "b")], None)]
+    #[case(vec![], None)]
+    fn defaults_use_metrics_and_reject_ambiguity(
+        #[case] routes: Vec<(u16, u64, &str)>,
+        #[case] expected: Option<&str>,
+    ) {
+        let routes: Vec<_> = routes
+            .into_iter()
+            .map(|(family, metric, guid)| (family, metric, guid.to_string()))
+            .collect();
+        assert_eq!(select_default(&routes).ok(), expected);
+    }
+
+    #[test]
+    fn native_default_routes_are_read_only() {
+        match default_route_adapter() {
+            Ok(adapter) => assert!(adapter.is_up),
+            Err(Error::InvalidConfig(_)) => {}
+            Err(error) => panic!("{error:?}"),
+        }
     }
 }

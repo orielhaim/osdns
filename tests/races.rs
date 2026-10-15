@@ -430,7 +430,7 @@ fn same_dns_rewrite_blocks_rollback_of_earlier_resource() {
         .unwrap();
     let err = lease.update(&updated).unwrap_err();
     assert!(
-        matches!(err, Error::Platform { .. }) || err.is_external_modification(),
+        matches!(err, Error::TransactionFailed { .. }) || err.is_external_modification(),
         "{err:?}"
     );
     let generation = fixture.fake.generation(IFACE1).unwrap().unwrap();

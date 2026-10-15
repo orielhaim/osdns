@@ -79,6 +79,10 @@ impl std::fmt::Debug for FakeDns {
 }
 
 impl FakeDns {
+    /// Simulates an unexpected loss of all native subscriptions, with no event.
+    pub fn fail_watches(&self) {
+        self.backend.fail_watches();
+    }
     /// Creates a fake backend with every capability enabled.
     pub fn new() -> Self {
         Self {

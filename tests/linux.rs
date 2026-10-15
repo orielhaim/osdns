@@ -38,11 +38,15 @@ fn resolved_backend_roundtrip_when_available() {
         return;
     }
     let dir = temp_dir("linux-resolved");
-    let manager = osdns::DnsManager::builder()
+    let manager = match osdns::DnsManager::builder()
         .owner("io.osdns.test")
         .state_dir(&dir)
         .build()
-        .unwrap();
+    {
+        Ok(manager) => manager,
+        Err(osdns::Error::BackendUnavailable(_)) => return,
+        Err(error) => panic!("{error:?}"),
+    };
     let caps = manager.capabilities().unwrap();
     if caps.backend != BackendKind::SystemdResolved {
         return;

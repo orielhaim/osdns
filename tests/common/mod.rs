@@ -9,29 +9,32 @@ use std::time::Duration;
 pub use osdns::testing::{FakeDns, manager_for_testing};
 use osdns::{BackendKind, Capabilities, DnsConfig, DnsManager, DnsScope, InterfaceSelector};
 
-pub struct TestDir(tempfile::TempDir);
+pub struct TestDir {
+    _temp: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
 
 impl std::ops::Deref for TestDir {
     type Target = Path;
 
     fn deref(&self) -> &Self::Target {
-        self.0.path()
+        &self.path
     }
 }
 
 impl AsRef<std::ffi::OsStr> for TestDir {
     fn as_ref(&self) -> &std::ffi::OsStr {
-        self.0.path().as_os_str()
+        self.path.as_os_str()
     }
 }
 
 pub fn temp_dir(tag: &str) -> TestDir {
-    TestDir(
-        tempfile::Builder::new()
-            .prefix(&format!("osdns-{tag}-"))
-            .tempdir()
-            .unwrap(),
-    )
+    let temp = tempfile::Builder::new()
+        .prefix(&format!("osdns-{tag}-"))
+        .tempdir()
+        .unwrap();
+    let path = temp.path().join("state");
+    TestDir { _temp: temp, path }
 }
 
 pub struct Fixture {
@@ -102,6 +105,22 @@ pub fn journal_record_json(dir: &Path) -> serde_json::Value {
     assert_eq!(files.len(), 1, "expected exactly one journal record");
     let bytes = fs::read(dir.join("journal").join(&files[0])).unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+pub fn write_journal(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+    let path = path.as_ref();
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        private_fs::PrivateDir::open(path.parent().unwrap())
+            .and_then(|dir| dir.write_atomic_durable(path.file_name().unwrap(), bytes.as_ref()))
+            .map_err(std::io::Error::other)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, bytes)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
 }
 
 pub fn state_with(ns: &str) -> osdns::testing::FakeState {

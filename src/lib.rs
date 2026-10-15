@@ -279,8 +279,10 @@ pub use capability::{
 pub use config::{DnsConfig, DnsConfigBuilder, DnsScope, InterfaceSelector};
 pub use error::{ConflictReason, Error, Result};
 pub use interface::InterfaceInfo;
-pub use lease::{Lease, RestoreFailure};
-pub use manager::{ConflictPolicy, DnsManager, DnsManagerBuilder, RecoveryOutcome};
+pub use lease::{Lease, LeaseFailure};
+pub use manager::{
+    ConflictPolicy, DnsManager, DnsManagerBuilder, ObservationHealth, RecoveryOutcome,
+};
 pub use normalize::DnsSuffix;
 pub use ownership::ResourceId;
 pub use watch::{DnsEvent, WatchCallback, WatchHandle};

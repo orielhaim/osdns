@@ -1,18 +1,17 @@
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashSet;
 use std::fmt;
-use std::fs::{File, OpenOptions};
-use std::io;
+use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{ConflictReason, Error, Result};
-use crate::fsutil::ensure_private_dir;
+use crate::fsutil::{ensure_private_dir, private_error};
 
 /// The current locking and mutation target for one OS DNS resource.
 ///
@@ -21,7 +20,8 @@ use crate::fsutil::ensure_private_dir;
 /// mutation holds an exclusive inter-process lock on its resource id, journals
 /// are keyed by it. It is not necessarily a durable native-incarnation
 /// identity: interface indices, names, and similar selectors can be reused.
-/// Ids are lowercase `:`-separated segments (max 128 characters).
+/// Ids are lowercase `:`-separated segments. Backend selectors impose their
+/// native length limits; filesystem names use a bounded label and full hash.
 /// Obtain them from [`Lease::resources`](crate::Lease::resources) or [`RecoveryOutcome`](crate::RecoveryOutcome);
 /// parse with `"<id>".parse::<ResourceId>()`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -42,12 +42,10 @@ impl ResourceId {
         &self.0
     }
 
-    /// Filesystem escaping: `:` becomes `+`, which cannot appear in a
-    /// valid id, so distinct ids never share a slug. Callers append
-    /// [`ResourceId::stable_hash`] for uniqueness on case-insensitive
-    /// filesystems.
+    /// Bounded filename label. Callers append the full resource's stable hash
+    /// for uniqueness, including on case-insensitive filesystems.
     pub(crate) fn slug(&self) -> String {
-        self.0.replace(':', "+")
+        self.0[..self.0.len().min(128)].replace(':', "+")
     }
 
     /// Stable content hash of this id. It covers the id only, never the
@@ -63,9 +61,6 @@ impl ResourceId {
 fn validate_resource_id(value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::invalid_config("resource id must not be empty"));
-    }
-    if value.len() > 128 {
-        return Err(Error::invalid_config("resource id exceeds 128 characters"));
     }
     for c in value.chars() {
         if !(c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, ':' | '-' | '_' | '.')) {
@@ -160,6 +155,7 @@ pub(crate) struct ResourceLockManager {
     lock_dir: PathBuf,
     lock_timeout: Duration,
     namespace: String,
+    directory: OnceLock<private_fs::PrivateDir>,
 }
 
 impl ResourceLockManager {
@@ -176,11 +172,16 @@ impl ResourceLockManager {
             lock_dir,
             lock_timeout,
             namespace: namespace.into(),
+            directory: OnceLock::new(),
         }
     }
 
     pub(crate) fn ensure_dir(&self) -> Result<()> {
-        ensure_private_dir(&self.lock_dir)
+        if self.directory.get().is_none() {
+            let directory = ensure_private_dir(&self.lock_dir)?;
+            let _ = self.directory.set(directory);
+        }
+        Ok(())
     }
 
     pub(crate) fn acquire(&self, resource: &ResourceId) -> Result<ResourceLock> {
@@ -261,24 +262,54 @@ impl ResourceLockManager {
     fn open_lock_file(&self, resource: &ResourceId) -> Result<File> {
         // The name excludes the ownership namespace so every manager
         // sharing this directory contends on the same file.
-        let path = self.lock_dir.join(format!(
-            "{}-{}.lock",
-            resource.slug(),
-            resource.stable_hash()
-        ));
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
+        let name = format!("{}-{}.lock", resource.slug(), resource.stable_hash());
+        let private = self
+            .directory
+            .get()
+            .expect("lock directory initialized")
+            .open_file_with(
+                &name,
+                private_fs::OpenOptions {
+                    access: private_fs::FileAccess::ReadWrite,
+                    creation: private_fs::FileCreation::OpenOrCreate,
+                    ..Default::default()
+                },
+            )
+            .map_err(private_error)?;
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd"
+        ))]
+        let file = {
+            use std::os::fd::AsFd;
+            File::from(private.as_fd().try_clone_to_owned()?)
+        };
+        #[cfg(windows)]
+        let file = {
+            use std::os::windows::io::AsHandle;
+            File::from(private.as_handle().try_clone_to_owned()?)
+        };
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            windows
+        )))]
         {
-            Ok(file) => Ok(file),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(Error::RequiresPrivilege(
-                format!("cannot open lock file {}: {e}", path.display()),
-            )),
-            Err(e) => Err(e.into()),
+            let _ = private;
+            return Err(Error::unsupported_platform());
         }
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            windows
+        ))]
+        Ok(file)
     }
 }
 
@@ -290,7 +321,6 @@ pub(crate) struct ResourceLock {
 }
 
 impl ResourceLock {
-    #[allow(dead_code)]
     pub(crate) fn resource(&self) -> &ResourceId {
         &self.key.resource
     }
@@ -299,7 +329,6 @@ impl ResourceLock {
 impl Drop for ResourceLock {
     fn drop(&mut self) {
         registry_remove(&self.key);
-        let _ = self._file.unlock();
     }
 }
 

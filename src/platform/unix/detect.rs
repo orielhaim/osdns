@@ -30,12 +30,38 @@ pub(crate) fn classify(path: &Path) -> ResolvConfState {
     if !target_is_file {
         return ResolvConfState::Foreign;
     }
-    let content = match std::fs::read(path) {
+    let content = match read_config(path) {
         Ok(content) => Some(content),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return ResolvConfState::Foreign,
     };
     classify_parts(link.as_deref(), content.as_deref())
+}
+
+pub(crate) fn read_config(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file: std::fs::File = fd.into();
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "configuration is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "configuration exceeds the storage budget",
+        ));
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn classify_parts(link: Option<&Path>, content: Option<&[u8]>) -> ResolvConfState {

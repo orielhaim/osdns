@@ -63,10 +63,7 @@ pub(crate) const IDENTITY_RETRY: Duration = Duration::from_secs(5);
 const BREAKER_WINDOW: Duration = Duration::from_secs(5);
 const BREAKER_THRESHOLD: usize = 6;
 const BREAKER_COOLDOWN: Duration = Duration::from_secs(2);
-/// A resource whose reconciliation keeps hard-failing is dropped from the
-/// pending set after this many consecutive errors (with a warning); the next
-/// watcher event for it restarts the cycle.
-const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+const MAX_ERROR_RETRY: Duration = Duration::from_secs(30);
 
 /// What a single reconciliation pass decided. Returned by the testing-only
 /// entry point so Enforce semantics can be tested deterministically.
@@ -102,6 +99,11 @@ pub(crate) struct Reconciler {
 }
 
 impl Reconciler {
+    pub(crate) fn pending_resources(&self) -> Vec<ResourceId> {
+        let mut resources: Vec<_> = self.pending.lock().keys().cloned().collect();
+        resources.sort();
+        resources
+    }
     #[cfg(feature = "test-util")]
     pub(crate) fn is_pending(&self, resource: &ResourceId) -> bool {
         self.pending.lock().contains_key(resource)
@@ -123,21 +125,33 @@ impl Reconciler {
     }
 
     fn defer(&self, resource: &ResourceId, delay: Duration, failed: bool) {
+        self.defer_at(resource, delay, failed, Instant::now());
+    }
+
+    fn defer_at(&self, resource: &ResourceId, delay: Duration, failed: bool, now: Instant) {
         let mut pending = self.pending.lock();
-        let now = Instant::now();
         let entry = pending.entry(resource.clone()).or_insert(Pending {
             ready_at: now + delay,
             generation: 0,
             consecutive_errors: 0,
         });
-        entry.ready_at = now + delay;
         if failed {
-            entry.consecutive_errors += 1;
+            entry.consecutive_errors = entry.consecutive_errors.saturating_add(1);
         }
+        let delay = if failed {
+            delay
+                .saturating_mul(1 << entry.consecutive_errors.saturating_sub(1).min(7))
+                .min(MAX_ERROR_RETRY)
+        } else {
+            entry.consecutive_errors = 0;
+            delay
+        };
+        entry.ready_at = entry.ready_at.max(now + delay);
     }
 
     fn remove(&self, resource: &ResourceId) {
         self.pending.lock().remove(resource);
+        self.breaker.lock().remove(resource);
     }
 
     fn generation_of(&self, resource: &ResourceId) -> u64 {
@@ -153,6 +167,7 @@ impl Reconciler {
         match pending.get_mut(resource) {
             Some(p) if p.generation != generation => {
                 p.ready_at = Instant::now();
+                p.consecutive_errors = 0;
             }
             _ => {
                 pending.remove(resource);
@@ -163,6 +178,7 @@ impl Reconciler {
     #[cfg(feature = "test-util")]
     pub(crate) fn clear(&self) {
         self.pending.lock().clear();
+        self.breaker.lock().clear();
     }
 
     pub(crate) fn lock_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
@@ -214,6 +230,7 @@ impl Inner {
     pub(crate) fn unregister_active(&self, resource: &ResourceId) {
         self.active.lock().remove(resource);
         self.lease_tokens.lock().remove(resource);
+        self.reconciler.remove(resource);
     }
 
     /// Runs `f` with one live record locked against reconciliation: the
@@ -259,6 +276,7 @@ impl Inner {
                     reconciler.remove(resource);
                     return ReconcileOutcome::NoActiveLease;
                 }
+                reconciler.defer(resource, ERROR_RETRY, true);
                 return ReconcileOutcome::Failed;
             }
             Ok(ResourceStatus::Ambiguous) => {
@@ -270,7 +288,10 @@ impl Inner {
                 return ReconcileOutcome::IdentityAmbiguous;
             }
             Ok(ResourceStatus::Same) => {}
-            Err(_) => return ReconcileOutcome::Failed,
+            Err(_) => {
+                reconciler.defer(resource, ERROR_RETRY, true);
+                return ReconcileOutcome::Failed;
+            }
         }
 
         let outcome = self.reconcile_pass(resource, &entry, reconciler);
@@ -288,20 +309,7 @@ impl Inner {
                 // retry. Keep the lease registered and the journal intact.
             }
             ReconcileOutcome::Failed => {
-                let pending = self.reconciler.pending.lock();
-                let exhausted = pending
-                    .get(resource)
-                    .is_some_and(|p| p.consecutive_errors + 1 >= MAX_CONSECUTIVE_ERRORS);
-                drop(pending);
-                if exhausted {
-                    osdns_warn!(
-                        resource = %resource,
-                        "reconciliation keeps failing for this resource; dropping it from the pending set until the next watcher event"
-                    );
-                    reconciler.remove(resource);
-                } else {
-                    reconciler.defer(resource, ERROR_RETRY, true);
-                }
+                reconciler.defer(resource, ERROR_RETRY, true);
             }
         }
         outcome
@@ -330,7 +338,7 @@ impl Inner {
                     error = %error,
                     "reconciliation could not read the current state; deferring"
                 );
-                return ReconcileOutcome::Deferred;
+                return ReconcileOutcome::Failed;
             }
         };
         std::thread::sleep(STABLE_WINDOW);
@@ -350,7 +358,7 @@ impl Inner {
                     error = %error,
                     "reconciliation could not re-read the current state; deferring"
                 );
-                return ReconcileOutcome::Deferred;
+                return ReconcileOutcome::Failed;
             }
         };
         if !self.backend.equivalent(&first, &second) {
@@ -368,19 +376,25 @@ impl Inner {
                     return ReconcileOutcome::Deferred;
                 }
             }
-            Err(_) => return ReconcileOutcome::Deferred,
+            Err(_) => return ReconcileOutcome::Failed,
         }
 
         if let Some(applied) = &guard.record.applied
             && self.backend.owns_current(applied, &second)
         {
-            return ReconcileOutcome::StillOurs;
+            if self.backend.matches_desired(&second, &guard.record.desired) {
+                return ReconcileOutcome::StillOurs;
+            }
+            let desired = guard.record.desired.clone();
+            drop(guard);
+            return self.apply_overlay(resource, entry, &second, &desired, &second);
         }
 
         if let Some(applied) = &guard.record.applied
             && self.backend.matches_desired(&second, &guard.record.desired)
             && !self.backend.owns_current(applied, &second)
         {
+            reconciler.defer(resource, IDENTITY_RETRY, false);
             return ReconcileOutcome::Deferred;
         }
 
@@ -393,6 +407,7 @@ impl Inner {
 
         drop(guard);
         if let Some(cooldown) = reconciler.breaker_gate(resource) {
+            reconciler.defer(resource, cooldown, false);
             osdns_warn!(
                 resource = %resource,
                 "reconciliation circuit breaker is open; deferring for {:?}",
@@ -426,7 +441,7 @@ impl Inner {
                 if residue.leftover.is_some() {
                     lock_live(entry).verified = residue.leftover;
                 }
-                ReconcileOutcome::Deferred
+                ReconcileOutcome::Failed
             }
         }
     }
@@ -460,7 +475,7 @@ impl Inner {
                     .or(Some(crate::platform::OwnershipProof::issued(persisted)));
                 live.record.applied = None;
                 live.record.phase = Phase::Prepared;
-                ReconcileOutcome::Deferred
+                ReconcileOutcome::Failed
             }
         }
     }
@@ -488,8 +503,11 @@ impl Inner {
                 );
                 live.record = old;
                 live.verified = old_verified;
-                let _ = self.journal.write(&live.record);
-                return ReconcileOutcome::Deferred;
+                if let Err(cleanup) = self.journal.write(&live.record) {
+                    osdns_warn!(resource = %resource, error = %error, cleanup = %cleanup,
+                        "rebase failed to restore its previous durable journal; retrying");
+                }
+                return ReconcileOutcome::Failed;
             }
         }
         if self.fire(TxPoint::AfterPrepared).is_err() {
@@ -532,6 +550,10 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error
         .name("osdns-reconciler".to_string())
         .spawn(move || {
             loop {
+                if matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                    break;
+                }
+                worker_inner.refresh_enforce_watch();
                 let now = Instant::now();
                 let due: Vec<ResourceId> = {
                     let pending = worker_inner.reconciler.pending.lock();
@@ -550,7 +572,9 @@ pub(crate) fn spawn_reconciler(inner: Arc<Inner>) -> Result<ReconcileFeed, Error
                             .map(|p| p.ready_at.saturating_duration_since(now))
                             .min()
                     };
-                    let timeout = timeout.unwrap_or(Duration::from_secs(3600));
+                    let timeout = timeout
+                        .unwrap_or(Duration::from_secs(1))
+                        .min(Duration::from_secs(1));
                     if timeout.is_zero() {
                         continue;
                     }
@@ -615,5 +639,23 @@ mod tests {
         let generation = reconciler.generation_of(&resource);
         reconciler.complete_unless_touched(&resource, generation);
         assert!(!reconciler.pending.lock().contains_key(&resource));
+    }
+    #[test]
+    fn repeated_errors_keep_a_bounded_retry_without_event_reset() {
+        let reconciler = Reconciler::default();
+        let resource = rid();
+        let mut now = Instant::now();
+        for _ in 0..64 {
+            reconciler.defer_at(&resource, ERROR_RETRY, true, now);
+            let ready = reconciler.pending.lock()[&resource].ready_at;
+            assert!(ready > now);
+            assert!(ready.duration_since(now) <= Duration::from_secs(30));
+            reconciler.touch(resource.clone());
+            assert_eq!(reconciler.pending.lock()[&resource].ready_at, ready);
+            now = ready;
+        }
+        reconciler.remove(&resource);
+        assert!(reconciler.pending.lock().is_empty());
+        assert!(reconciler.breaker.lock().is_empty());
     }
 }

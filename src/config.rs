@@ -30,7 +30,10 @@ pub enum DnsScope {
 /// Names and indexes are convenience selectors resolved by the backend at
 /// apply time. The lease separately records backend-native incarnation
 /// evidence; Linux names and ifindices are never treated as durable proof.
-/// `Default` resolves to the backend's notion of
+/// On Linux, `Default` selects lowest-metric main-table default routes; policy
+/// tables and split routes are excluded. Windows includes interface metrics.
+/// Conflicting address-family or equal-cost output interfaces require an explicit
+/// selector. On other platforms, `Default` resolves to the backend's notion of
 /// the primary interface (default route on Linux, primary service on macOS).
 /// macOS rejects [`InterfaceSelector::Index`] with
 /// [`Error::InvalidConfig`](crate::Error); use `Default` or `Name` there.

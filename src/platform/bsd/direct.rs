@@ -3,7 +3,6 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use atomic_write_file::unix::OpenOptionsExt;
@@ -50,21 +49,16 @@ impl DirectPolicy for BsdDirectPolicy {
         }
     }
 
-    fn metadata(&self, path: &Path) -> Result<Option<DirectFileMetadata>> {
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
+    fn metadata(&self, file: &File) -> Result<DirectFileMetadata> {
+        let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.nlink() != 1 {
             return Err(Error::unsupported(
                 BackendKind::ResolvConfFile,
                 "/etc/resolv.conf must be a single-link regular file",
             ));
         }
-        let file = File::open(path)?;
-        let stat = fstat(&file).map_err(io::Error::from)?;
-        Ok(Some(DirectFileMetadata {
+        let stat = fstat(file).map_err(io::Error::from)?;
+        Ok(DirectFileMetadata {
             mode: metadata.permissions().mode(),
             owner: Some(FileOwner {
                 uid: metadata.uid(),
@@ -73,16 +67,16 @@ impl DirectPolicy for BsdDirectPolicy {
             flags: Some(stat.st_flags as u64),
             links: Some(metadata.nlink()),
             modified: Some(system_time(metadata.modified()?)?),
-        }))
+        })
     }
 
     fn write(
         &self,
         path: &Path,
         content: &[u8],
-        mode: Option<u32>,
         metadata: Option<&DirectFileMetadata>,
         restore_modified_time: bool,
+        verify_expected: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if restore_modified_time
             && metadata.is_none_or(|metadata| {
@@ -99,12 +93,7 @@ impl DirectPolicy for BsdDirectPolicy {
         self.reject_protected_metadata(path)?;
         let mut options = atomic_write_file::OpenOptions::new();
         options.preserve_mode(true).preserve_owner(true);
-        options.mode(
-            metadata
-                .map(|metadata| metadata.mode)
-                .or(mode)
-                .unwrap_or(0o644),
-        );
+        options.mode(metadata.map(|metadata| metadata.mode).unwrap_or(0o644));
         let mut file = options.open(path)?;
         clear_file_flags(file.as_file())?;
         std::io::Write::write_all(&mut file, content)?;
@@ -116,6 +105,7 @@ impl DirectPolicy for BsdDirectPolicy {
         }
         file.sync_all()?;
         let committed_file = file.as_file().try_clone()?;
+        verify_expected()?;
         file.commit()?;
         clear_file_flags(&committed_file)?;
         self.reject_protected_file(&committed_file)?;
@@ -259,6 +249,6 @@ fn system_time_value(time: &FileTime) -> Result<SystemTime> {
 pub(crate) fn new() -> DirectResolvConf {
     DirectResolvConf::new(
         PathBuf::from(detect::RESOLV_CONF_PATH),
-        Arc::new(BsdDirectPolicy::new()),
+        Box::new(BsdDirectPolicy::new()),
     )
 }

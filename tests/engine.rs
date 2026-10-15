@@ -348,13 +348,14 @@ fn update_of_vanished_incarnation_requires_a_fresh_lease_without_rebinding() {
     assert!(
         matches!(error, Error::ResourceGone { resource, .. } if resource == resource_id(IFACE1))
     );
-    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
 
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
         .unwrap();
     lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9"))
@@ -362,7 +363,7 @@ fn update_of_vanished_incarnation_requires_a_fresh_lease_without_rebinding() {
 }
 
 #[test]
-fn update_of_replaced_incarnation_clears_ownership_without_mutation() {
+fn update_of_replaced_incarnation_requires_teardown_without_mutation() {
     let fixture = new_fixture("update-replaced");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     fixture.fake.external_remove(IFACE1).unwrap();
@@ -375,13 +376,14 @@ fn update_of_replaced_incarnation_clears_ownership_without_mutation() {
     assert!(
         matches!(error, Error::ResourceIdentity { resource, .. } if resource == resource_id(IFACE1))
     );
-    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(journal_files(&fixture.dir).len(), 1);
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9"))
     );
 
     lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9"))
@@ -485,6 +487,7 @@ fn live_proof_finalizes_cooperative_lease_after_applied_journal_failure() {
     let fixture = new_fixture("engine-live-finalize");
     fixture.manager.set_journal_fail_writes_after(1);
     let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    assert_eq!(lease.pending_durability(), lease.resources());
     fixture.manager.set_journal_fail_writes(false);
     let record = journal_record_json(&fixture.dir);
     assert_eq!(record["phase"], "Prepared");
@@ -495,6 +498,7 @@ fn live_proof_finalizes_cooperative_lease_after_applied_journal_failure() {
         Some(state_with("8.8.8.8"))
     );
     assert_eq!(journal_record_json(&fixture.dir)["phase"], "Applied");
+    assert!(lease.pending_durability().is_empty());
     lease.restore().unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -520,4 +524,38 @@ fn live_proof_does_not_finalize_equivalent_rewritten_generation() {
     assert!(failure.error.is_external_modification());
     assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
     failure.lease.abandon().unwrap();
+}
+
+#[rstest::rstest]
+#[case("gone")]
+#[case("replaced")]
+#[case("reverted")]
+fn unfinalized_lease_teardown_checks_identity_and_original_state_first(#[case] transition: &str) {
+    let fixture = new_fixture("engine-unfinalized-end");
+    fixture.manager.set_journal_fail_writes_after(1);
+    let lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
+    assert!(!lease.pending_durability().is_empty());
+    match transition {
+        "gone" => {
+            fixture.fake.external_remove(IFACE1).unwrap();
+        }
+        "replaced" => {
+            fixture.fake.external_remove(IFACE1).unwrap();
+            fixture
+                .fake
+                .external_change(IFACE1, state_with("9.9.9.9"))
+                .unwrap();
+        }
+        "reverted" => {
+            fixture
+                .fake
+                .external_change(IFACE1, FakeState::Empty)
+                .unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let external = fixture.fake.current_state(IFACE1).unwrap();
+    lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(fixture.fake.current_state(IFACE1).unwrap(), external);
 }

@@ -21,12 +21,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::capability::{BackendKind, Capabilities};
 use crate::config::{DnsConfig, DnsScope, InterfaceSelector};
-use crate::error::{ConflictReason, Error, Result};
+use crate::error::{Error, Result};
 use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::macos::system_configuration as sc;
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
+use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod resolver_files;
@@ -46,8 +46,8 @@ enum ResourceKind {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct MacosSnapshot {
-    pub(crate) service_dns: Option<sc::ScValue>,
-    pub(crate) resolver_content: Option<Vec<u8>>,
+    pub(crate) service_dns: Option<Vec<u8>>,
+    pub(crate) resolver_file: Option<resolver_files::ResolverFile>,
 }
 
 impl MacosBackend {
@@ -78,6 +78,12 @@ impl MacosBackend {
             ));
         }
         if let Some(domain) = resource.as_str().strip_prefix("macos:resolver:") {
+            let suffix = DnsSuffix::parse(domain)?;
+            if suffix.is_root() || suffix.as_str() != domain {
+                return Err(Error::JournalCorrupt(
+                    "invalid scoped resolver resource".to_string(),
+                ));
+            }
             return Ok(ResourceKind::Resolver(domain.to_string()));
         }
         Err(Error::invalid_config(format_args!(
@@ -115,6 +121,8 @@ impl MacosBackend {
 
     fn resolver_content(&self, plan: &NormalizedConfig) -> Vec<u8> {
         let mut content = resolver_files::marker_for(&self.owner).into_bytes();
+        content
+            .extend_from_slice(format!("# osdns generation={}\n", uuid::Uuid::new_v4()).as_bytes());
         for ip in &plan.nameservers {
             content.extend_from_slice(format!("nameserver {ip}\n").as_bytes());
         }
@@ -134,10 +142,36 @@ impl MacosBackend {
     }
 
     fn parse_snapshot(&self, snapshot: &PlatformSnapshot) -> Result<MacosSnapshot> {
+        Self::validate_snapshot(snapshot, &self.owner)?;
         match &snapshot.data {
             SnapshotData::MacosSystemConfiguration(data) => Ok(data.clone()),
             _ => Err(Error::JournalCorrupt(
                 "macOS snapshot has the wrong backend data".to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn validate_snapshot(snapshot: &PlatformSnapshot, owner: &str) -> Result<()> {
+        let SnapshotData::MacosSystemConfiguration(data) = &snapshot.data else {
+            return Err(Error::JournalCorrupt(
+                "macOS snapshot has the wrong backend data".to_string(),
+            ));
+        };
+        match Self::parse_resource(&snapshot.resource)? {
+            ResourceKind::Service(_) if data.resolver_file.is_none() => {
+                if let Some(bytes) = &data.service_dns {
+                    sc::decode(bytes).map_err(|error| Error::JournalCorrupt(error.to_string()))?;
+                }
+                Ok(())
+            }
+            ResourceKind::Resolver(_) if data.service_dns.is_none() => {
+                if let Some(file) = &data.resolver_file {
+                    resolver_files::validate_content(&file.content, owner)?;
+                }
+                Ok(())
+            }
+            _ => Err(Error::JournalCorrupt(
+                "macOS snapshot kind differs from its resource".to_string(),
             )),
         }
     }
@@ -155,25 +189,119 @@ fn expected_search(plan: &NormalizedConfig) -> Vec<String> {
         .collect()
 }
 
-fn dict_string_list(entries: &[(String, sc::ScValue)], key: &str) -> Option<Vec<String>> {
-    for (existing, value) in entries {
-        if existing == key
-            && let sc::ScValue::Array(items) = value
-        {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                match item {
-                    sc::ScValue::String(text) => out.push(text.clone()),
-                    _ => return None,
-                }
-            }
-            return Some(out);
+impl Backend for MacosBackend {
+    fn apply_bound(
+        &self,
+        identity: &crate::platform::ResourceIdentity,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> MutationAttempt {
+        if expected.resource != identity.resource {
+            return MutationAttempt::Rejected {
+                error: Error::JournalCorrupt(
+                    "resolver snapshot names a different resource".to_string(),
+                ),
+            };
+        }
+        let Ok(ResourceKind::Resolver(domain)) = Self::parse_resource(&identity.resource) else {
+            return crate::platform::apply_bound(self, identity, expected, plan);
+        };
+        let before = match self.parse_snapshot(expected) {
+            Ok(before) => before,
+            Err(error) => return MutationAttempt::Rejected { error },
+        };
+        let content = self.resolver_content(plan);
+        match resolver_files::replace(
+            &domain,
+            before.resolver_file.as_ref(),
+            Some(&content),
+            &self.owner,
+        ) {
+            Ok(file) => MutationAttempt::Performed {
+                produced: Some(PlatformSnapshot::new(
+                    self.kind(),
+                    identity.resource.clone(),
+                    SnapshotData::MacosSystemConfiguration(MacosSnapshot {
+                        service_dns: None,
+                        resolver_file: file,
+                    }),
+                )),
+            },
+            Err(error) if error.is_external_modification() => MutationAttempt::Rejected { error },
+            Err(error) => MutationAttempt::Indeterminate {
+                error,
+                produced: None,
+            },
         }
     }
-    None
-}
 
-impl Backend for MacosBackend {
+    fn restore_bound(
+        &self,
+        identity: &crate::platform::ResourceIdentity,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> MutationAttempt {
+        let Ok(ResourceKind::Resolver(domain)) = Self::parse_resource(&identity.resource) else {
+            return crate::platform::restore_bound(self, identity, expected, target);
+        };
+        if expected.resource != identity.resource || target.resource != identity.resource {
+            return MutationAttempt::Rejected {
+                error: Error::JournalCorrupt(
+                    "resolver snapshots name different resources".to_string(),
+                ),
+            };
+        }
+        let (before, target) = match (self.parse_snapshot(expected), self.parse_snapshot(target)) {
+            (Ok(before), Ok(target)) => (before, target),
+            (Err(error), _) | (_, Err(error)) => return MutationAttempt::Rejected { error },
+        };
+        let content = target
+            .resolver_file
+            .as_ref()
+            .map(|file| file.content.as_slice());
+        match resolver_files::replace(&domain, before.resolver_file.as_ref(), content, &self.owner)
+        {
+            Ok(file) => MutationAttempt::Performed {
+                produced: Some(PlatformSnapshot::new(
+                    self.kind(),
+                    identity.resource.clone(),
+                    SnapshotData::MacosSystemConfiguration(MacosSnapshot {
+                        service_dns: None,
+                        resolver_file: file,
+                    }),
+                )),
+            },
+            Err(error) if error.is_external_modification() => MutationAttempt::Rejected { error },
+            Err(error) => MutationAttempt::Indeterminate {
+                error,
+                produced: None,
+            },
+        }
+    }
+
+    fn owns_current(&self, claimed: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
+        if claimed.resource != current.resource {
+            return false;
+        }
+        if matches!(
+            Self::parse_resource(&claimed.resource),
+            Ok(ResourceKind::Resolver(_))
+        ) {
+            match (self.parse_snapshot(claimed), self.parse_snapshot(current)) {
+                (Ok(claimed), Ok(current)) => claimed.resolver_file == current.resolver_file,
+                _ => false,
+            }
+        } else {
+            self.equivalent(claimed, current)
+        }
+    }
+
+    fn proves_current(&self, claimed: &PlatformSnapshot, current: &PlatformSnapshot) -> bool {
+        matches!(
+            Self::parse_resource(&claimed.resource),
+            Ok(ResourceKind::Resolver(_))
+        ) && self.owns_current(claimed, current)
+    }
     fn kind(&self) -> BackendKind {
         BackendKind::MacosSystemConfiguration
     }
@@ -245,13 +373,26 @@ impl Backend for MacosBackend {
                 let store = sc::store()?;
                 MacosSnapshot {
                     service_dns: sc::read_service_dns(&store, &id)?,
-                    resolver_content: None,
+                    resolver_file: None,
                 }
             }
-            ResourceKind::Resolver(domain) => MacosSnapshot {
-                service_dns: None,
-                resolver_content: resolver_files::read(&domain)?,
-            },
+            ResourceKind::Resolver(domain) => {
+                let file = resolver_files::read(&domain)?;
+                if let Some(file) = &file {
+                    resolver_files::validate_content(&file.content, &self.owner).map_err(
+                        |error| Error::Conflict {
+                            resource: resource.clone(),
+                            reason: crate::ConflictReason::ResourceOccupied {
+                                detail: error.to_string(),
+                            },
+                        },
+                    )?;
+                }
+                MacosSnapshot {
+                    service_dns: None,
+                    resolver_file: file,
+                }
+            }
         };
         self.to_platform(resource, &snapshot)
     }
@@ -268,15 +409,11 @@ impl Backend for MacosBackend {
                     &expected_search(plan),
                 )?;
             }
-            ResourceKind::Resolver(domain) => {
-                if let Some(detail) = resolver_files::foreign_claim(&domain, &self.owner)? {
-                    return Err(Error::Conflict {
-                        resource: resource.clone(),
-                        reason: ConflictReason::ResourceOccupied { detail },
-                    });
-                }
-                let content = self.resolver_content(plan);
-                resolver_files::write(&domain, &content)?;
+            ResourceKind::Resolver(_) => {
+                return Err(Error::unsupported(
+                    self.kind(),
+                    "resolver mutations require the bound operation",
+                ));
             }
         }
         Ok(ApplyReceipt {
@@ -289,20 +426,24 @@ impl Backend for MacosBackend {
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
+        if resource != &snapshot.resource {
+            return Err(Error::JournalCorrupt(
+                "restore snapshot names a different resource".to_string(),
+            ));
+        }
         let kind = Self::parse_resource(resource)?;
         let before = self.parse_snapshot(snapshot)?;
         match kind {
             ResourceKind::Service(id) => {
                 let store = sc::store()?;
-                match before.service_dns {
-                    Some(dict) => sc::rewrite_service_dns(&store, &id, dict)?,
-                    None => sc::remove_service_dns(&store, &id)?,
-                }
+                sc::restore_service_dns(&store, &id, before.service_dns.as_deref())?;
             }
-            ResourceKind::Resolver(domain) => match before.resolver_content {
-                Some(content) => resolver_files::write(&domain, &content)?,
-                None => resolver_files::delete(&domain)?,
-            },
+            ResourceKind::Resolver(_) => {
+                return Err(Error::unsupported(
+                    self.kind(),
+                    "resolver restoration requires the bound operation",
+                ));
+            }
         }
         Ok(())
     }
@@ -337,7 +478,11 @@ impl Backend for MacosBackend {
 
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         match (self.parse_snapshot(a), self.parse_snapshot(b)) {
-            (Ok(x), Ok(y)) => x == y,
+            (Ok(x), Ok(y)) => {
+                x.resolver_file.as_ref().map(|file| &file.content)
+                    == y.resolver_file.as_ref().map(|file| &file.content)
+                    && sc::equivalent(x.service_dns.as_deref(), y.service_dns.as_deref())
+            }
             _ => false,
         }
     }
@@ -351,28 +496,33 @@ impl Backend for MacosBackend {
         };
         match kind {
             ResourceKind::Service(_) => {
-                let Some(sc::ScValue::Dictionary(entries)) = current.service_dns.clone() else {
+                let Some(entries) = current.service_dns.clone() else {
                     return false;
                 };
-                dict_string_list(&entries, "ServerAddresses") == Some(expected_servers(plan))
-                    && dict_string_list(&entries, "SearchDomains") == Some(expected_search(plan))
+                sc::string_list(&entries, "ServerAddresses") == Some(expected_servers(plan))
+                    && sc::string_list(&entries, "SearchDomains") == Some(expected_search(plan))
             }
-            ResourceKind::Resolver(_) => {
-                current.resolver_content.as_deref() == Some(self.resolver_content(plan).as_slice())
-            }
+            ResourceKind::Resolver(_) => current.resolver_file.as_ref().is_some_and(|file| {
+                file.content
+                    .starts_with(resolver_files::marker_for(&self.owner).as_bytes())
+                    && crate::platform::text_config::parse_resolv_conf_content(&file.content)
+                        .is_ok_and(|(servers, search)| {
+                            servers == plan.nameservers && search.is_empty()
+                        })
+            }),
         }
     }
 
     fn public_state(&self, snapshot: &PlatformSnapshot, scope: &DnsScope) -> Result<DnsConfig> {
         let snapshot = self.parse_snapshot(snapshot)?;
         let (nameservers, search) = match snapshot.service_dns {
-            Some(sc::ScValue::Dictionary(entries)) => (
-                dict_string_list(&entries, "ServerAddresses")
+            Some(entries) => (
+                sc::string_list(&entries, "ServerAddresses")
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|entry| entry.parse().ok())
                     .collect(),
-                dict_string_list(&entries, "SearchDomains")
+                sc::string_list(&entries, "SearchDomains")
                     .unwrap_or_default()
                     .into_iter()
                     .filter_map(|entry| DnsSuffix::parse(&entry).ok())

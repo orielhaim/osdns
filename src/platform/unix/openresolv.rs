@@ -16,9 +16,7 @@ use crate::ownership::ResourceId;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
 use crate::platform::unix::detect::{self, RESOLV_CONF_PATH};
 use crate::platform::unix::{ResourceMapper, WatchDirectory};
-use crate::platform::{
-    ApplyReceipt, Backend, LegacyJournalRecovery, MutationAttempt, PlatformSnapshot, SnapshotData,
-};
+use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 const STANDARD_STATE_DIRS: [&str; 2] = ["/run/resolvconf", "/var/run/resolvconf"];
@@ -101,8 +99,14 @@ fn parse_openresolv_version_component(component: &str) -> Option<u64> {
     component.parse().ok()
 }
 
+fn read_resolvconf_config() -> std::io::Result<String> {
+    let bytes = super::detect::read_config(Path::new("/etc/resolvconf.conf"))?;
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 fn configured_resolv_conf_matches(resolv_conf: &Path) -> bool {
-    match std::fs::read_to_string("/etc/resolvconf.conf") {
+    match read_resolvconf_config() {
         Ok(config) => parse_resolvconf_config(&config).is_ok_and(|config| config == *resolv_conf),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             resolv_conf == Path::new(RESOLV_CONF_PATH)
@@ -119,7 +123,7 @@ fn config_blocks_direct(resolv_conf: &Path, config: &str) -> bool {
 }
 
 pub(crate) fn configuration_blocks_direct(resolv_conf: &Path) -> bool {
-    match std::fs::read_to_string("/etc/resolvconf.conf") {
+    match read_resolvconf_config() {
         Ok(config) => config_blocks_direct(resolv_conf, &config),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => true,
@@ -293,51 +297,106 @@ fn key_dir_contents(path: &Path) -> Option<HashSet<String>> {
     Some(files)
 }
 
+use std::io::{Read, Seek, SeekFrom};
+use std::os::unix::process::CommandExt;
+use std::time::{Duration, Instant};
+
 fn run(binary: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+    run_bounded(
+        binary,
+        args,
+        stdin,
+        Duration::from_secs(30),
+        16 * 1024 * 1024,
+    )
+}
+
+fn run_bounded(
+    binary: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    limit: u64,
+) -> Result<Vec<u8>> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
     let mut command = Command::new(binary);
     command
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = match stdin {
-        Some(bytes) => {
-            command.stdin(Stdio::piped());
-            let mut child = command.spawn().map_err(|error| {
-                Error::platform(
-                    BackendKind::Resolvconf,
-                    format_args!("cannot spawn resolvconf: {error}"),
-                )
-            })?;
-            let write_error = child
-                .stdin
-                .take()
-                .and_then(|mut handle| handle.write_all(bytes).err());
-            let output = child.wait_with_output().map_err(|error| {
-                Error::platform(
-                    BackendKind::Resolvconf,
-                    format_args!("resolvconf failed: {error}"),
-                )
-            })?;
-            if let Some(error) = write_error
-                && error.kind() != std::io::ErrorKind::BrokenPipe
-                && output.status.success()
-            {
-                return Err(Error::platform(
-                    BackendKind::Resolvconf,
-                    format_args!("cannot write to resolvconf stdin: {error}"),
-                ));
-            }
-            output
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0);
+    if let Some(bytes) = stdin {
+        let mut input = tempfile::tempfile()?;
+        input.write_all(bytes)?;
+        input.seek(SeekFrom::Start(0))?;
+        command.stdin(input);
+    }
+    let mut child = command.spawn().map_err(|error| {
+        Error::platform(
+            BackendKind::Resolvconf,
+            format_args!("cannot spawn resolvconf: {error}"),
+        )
+    })?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        let overflow = match (stdout.metadata(), stderr.metadata()) {
+            (Ok(out), Ok(err)) => out.len() > limit || err.len() > limit,
+            _ => true,
+        };
+        if overflow || Instant::now() >= deadline {
+            terminate_child(&mut child);
+            return Err(Error::IndeterminateMutation {
+                backend: BackendKind::Resolvconf,
+                message: if overflow {
+                    "resolvconf exceeded its output budget"
+                } else {
+                    "resolvconf exceeded its execution deadline"
+                }
+                .to_string(),
+            });
         }
-        None => command.output().map_err(|error| {
-            Error::platform(
-                BackendKind::Resolvconf,
-                format_args!("cannot spawn resolvconf: {error}"),
-            )
-        })?,
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                terminate_child(&mut child);
+                return Err(Error::IndeterminateMutation {
+                    backend: BackendKind::Resolvconf,
+                    message: format!("cannot reap resolvconf: {error}"),
+                });
+            }
+        }
     };
-    finish(output, args)
+    stdout.seek(SeekFrom::Start(0))?;
+    stderr.seek(SeekFrom::Start(0))?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    stdout.take(limit + 1).read_to_end(&mut out)?;
+    stderr.take(limit + 1).read_to_end(&mut err)?;
+    if out.len() as u64 > limit || err.len() as u64 > limit {
+        return Err(Error::IndeterminateMutation {
+            backend: BackendKind::Resolvconf,
+            message: "resolvconf exceeded its output budget".to_string(),
+        });
+    }
+    finish(
+        std::process::Output {
+            status,
+            stdout: out,
+            stderr: err,
+        },
+        args,
+    )
+}
+
+fn terminate_child(child: &mut std::process::Child) {
+    if let Some(group) = rustix::process::Pid::from_raw(child.id() as i32) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn finish(output: std::process::Output, args: &[&str]) -> Result<Vec<u8>> {
@@ -439,7 +498,7 @@ impl Resolvconf {
                 BackendKind::Resolvconf,
                 format_args!("openresolv key {} is not a regular file", path.display()),
             )),
-            Ok(_) => Ok(Some(std::fs::read(path)?)),
+            Ok(_) => Ok(Some(crate::platform::unix::detect::read_config(&path)?)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -599,7 +658,7 @@ impl Resolvconf {
                 ),
             });
         }
-        Ok(std::fs::read(path)?)
+        Ok(crate::platform::unix::detect::read_config(path)?)
     }
 
     fn to_platform(
@@ -613,7 +672,7 @@ impl Resolvconf {
             resource.clone(),
             SnapshotData::Resolvconf(ResolvconfSnapshot {
                 content: record.content,
-                attributes: Some(record.attributes),
+                attributes: record.attributes,
                 live,
             }),
         )
@@ -623,14 +682,7 @@ impl Resolvconf {
         match &snapshot.data {
             SnapshotData::Resolvconf(data) => {
                 let content = data.content.clone();
-                let attributes = match data.attributes.clone() {
-                    Some(attributes) => attributes,
-                    None => {
-                        return Err(Error::JournalCorrupt(
-                            "legacy openresolv snapshot lacks key attributes".to_string(),
-                        ));
-                    }
-                };
+                let attributes = data.attributes.clone();
                 Ok(ResolvconfRecord {
                     content,
                     attributes,
@@ -639,15 +691,6 @@ impl Resolvconf {
             _ => Err(Error::JournalCorrupt(
                 "resolvconf snapshot has the wrong backend data".to_string(),
             )),
-        }
-    }
-
-    fn legacy_content(snapshot: &PlatformSnapshot) -> Option<Option<Vec<u8>>> {
-        match &snapshot.data {
-            SnapshotData::Resolvconf(data) if data.attributes.is_none() && data.live.is_none() => {
-                Some(data.content.clone())
-            }
-            _ => None,
         }
     }
 
@@ -776,8 +819,7 @@ struct ResolvconfRecord {
 pub(crate) struct ResolvconfSnapshot {
     #[serde(deserialize_with = "deserialize_required_content")]
     pub(crate) content: Option<Vec<u8>>,
-    #[serde(default)]
-    pub(crate) attributes: Option<ResolvconfAttributes>,
+    pub(crate) attributes: ResolvconfAttributes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) live: Option<Vec<u8>>,
 }
@@ -828,53 +870,6 @@ fn public_state_from_snapshot(snapshot: &PlatformSnapshot, scope: &DnsScope) -> 
         Vec::new(),
         None,
     ))
-}
-
-fn legacy_live_contains_original(live: &[u8], original: &[u8]) -> bool {
-    let Ok((wanted_nameservers, wanted_search)) = parse_resolv_conf_content(original) else {
-        return false;
-    };
-    let Ok((nameservers, search)) = parse_resolv_conf_content(live) else {
-        return false;
-    };
-    if wanted_nameservers.is_empty() && wanted_search.is_empty() {
-        return false;
-    }
-    ordered_subsequence(&wanted_nameservers, &nameservers)
-        && ordered_subsequence(&wanted_search, &search)
-}
-
-fn legacy_recovery_for_snapshots(
-    before: &PlatformSnapshot,
-    current: &PlatformSnapshot,
-) -> LegacyJournalRecovery {
-    let Some(legacy_content) = Resolvconf::legacy_content(before) else {
-        return LegacyJournalRecovery::NotLegacy;
-    };
-    let Some(original) = legacy_content.as_ref() else {
-        return LegacyJournalRecovery::Unresolved(
-            "the legacy openresolv journal lacks the original owner content and effective resolver state; restore the owner key manually, then abandon the journal",
-        );
-    };
-    let SnapshotData::Resolvconf(current_data) = &current.data else {
-        return LegacyJournalRecovery::Unresolved(
-            "the legacy openresolv journal has no matching current backend state",
-        );
-    };
-    let Some(live) = current_data.live.as_deref() else {
-        return LegacyJournalRecovery::Unresolved(
-            "the legacy openresolv journal lacks key attributes and effective resolver state; restore the owner key manually, then abandon the journal",
-        );
-    };
-    if current_data.content.as_deref() == Some(original.as_slice())
-        && legacy_live_contains_original(live, original)
-    {
-        LegacyJournalRecovery::Clear
-    } else {
-        LegacyJournalRecovery::Unresolved(
-            "the legacy openresolv journal lacks key attributes and effective resolver state; restore the owner key manually, then abandon the journal",
-        )
-    }
 }
 
 impl Backend for Resolvconf {
@@ -1120,14 +1115,6 @@ impl Backend for Resolvconf {
         self.restore_record(&tag, &Self::record_from_snapshot(snapshot)?)
     }
 
-    fn legacy_recovery(
-        &self,
-        before: &PlatformSnapshot,
-        current: &PlatformSnapshot,
-    ) -> LegacyJournalRecovery {
-        legacy_recovery_for_snapshots(before, current)
-    }
-
     fn equivalent(&self, a: &PlatformSnapshot, b: &PlatformSnapshot) -> bool {
         Self::records_equivalent(a, b)
     }
@@ -1345,103 +1332,10 @@ mod tests {
     }
 
     #[test]
-    fn schema_v3_resolvconf_payloads_remain_readable() {
-        let snapshot: ResolvconfSnapshot = serde_json::from_str(r#"{"content":null}"#).unwrap();
-        assert_eq!(snapshot.content, None);
-        assert_eq!(snapshot.attributes, None);
-        assert_eq!(snapshot.live, None);
-    }
-
-    #[test]
-    fn legacy_resolvconf_snapshot_is_not_defaulted_to_current_state() {
-        let snapshot: ResolvconfSnapshot = serde_json::from_str(
-            r#"{"content":[110,97,109,101,115,101,114,118,101,114,32,49,46,1,49,10]}"#,
-        )
-        .unwrap();
-        assert!(snapshot.attributes.is_none());
-        assert!(snapshot.live.is_none());
-        assert!(Resolvconf::record_from_snapshot(&snapshot_for(snapshot)).is_err());
-    }
-
-    #[test]
-    fn legacy_recovery_clears_only_when_owner_content_and_live_are_original() {
-        let before = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
-            attributes: None,
-            live: None,
-        });
-        let current = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: Some(b"nameserver 192.0.2.10\n".to_vec()),
-        });
-        assert!(matches!(
-            legacy_recovery_for_snapshots(&before, &current),
-            LegacyJournalRecovery::Clear
-        ));
-        let stale_live = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: Some(b"nameserver 192.0.2.11\n".to_vec()),
-        });
-        assert!(matches!(
-            legacy_recovery_for_snapshots(&before, &stale_live),
-            LegacyJournalRecovery::Unresolved(_)
-        ));
-        let missing_live = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 192.0.2.10\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: None,
-        });
-        assert!(matches!(
-            legacy_recovery_for_snapshots(&before, &missing_live),
-            LegacyJournalRecovery::Unresolved(_)
-        ));
-        let options_only = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"options ndots:1\n".to_vec()),
-            attributes: None,
-            live: None,
-        });
-        let current_options_only = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"options ndots:1\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: Some(b"nameserver 192.0.2.99\n".to_vec()),
-        });
-        assert!(matches!(
-            legacy_recovery_for_snapshots(&options_only, &current_options_only),
-            LegacyJournalRecovery::Unresolved(_)
-        ));
-        let changed = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 192.0.2.11\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: Some(b"nameserver 192.0.2.11\n".to_vec()),
-        });
-        assert!(matches!(
-            legacy_recovery_for_snapshots(&before, &changed),
-            LegacyJournalRecovery::Unresolved(_)
-        ));
-    }
-
-    #[test]
-    fn public_global_state_uses_effective_live_content() {
-        let snapshot = snapshot_for(ResolvconfSnapshot {
-            content: Some(b"nameserver 127.0.0.1\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
-            live: Some(b"nameserver 192.0.2.77\nsearch example.test\n".to_vec()),
-        });
-        let state = public_state_from_snapshot(&snapshot, &DnsScope::Global).unwrap();
-        assert_eq!(
-            state.nameservers(),
-            &["192.0.2.77".parse::<std::net::IpAddr>().unwrap()]
-        );
-        assert_eq!(state.search_domains().len(), 1);
-    }
-
-    #[test]
     fn public_global_state_uses_live_when_owner_key_is_absent() {
         let snapshot = snapshot_for(ResolvconfSnapshot {
             content: None,
-            attributes: Some(ResolvconfAttributes::default()),
+            attributes: ResolvconfAttributes::default(),
             live: Some(b"nameserver 192.0.2.78\n".to_vec()),
         });
         let state = public_state_from_snapshot(&snapshot, &DnsScope::Global).unwrap();
@@ -1455,7 +1349,7 @@ mod tests {
     fn public_global_state_requires_live_content() {
         let snapshot = snapshot_for(ResolvconfSnapshot {
             content: Some(b"nameserver 127.0.0.1\n".to_vec()),
-            attributes: Some(ResolvconfAttributes::default()),
+            attributes: ResolvconfAttributes::default(),
             live: None,
         });
         assert!(public_state_from_snapshot(&snapshot, &DnsScope::Global).is_err());
@@ -1474,5 +1368,45 @@ mod tests {
         assert!(ordered_subsequence(&[1, 3], &[0, 1, 2, 3, 4]));
         assert!(!ordered_subsequence(&[3, 1], &[0, 1, 2, 3, 4]));
         assert!(ordered_subsequence::<u8>(&[], &[1, 2]));
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case("sleep 10", Duration::from_millis(50), 1024)]
+    #[case(
+        "while :; do printf 12345678901234567890; done",
+        Duration::from_secs(2),
+        1024
+    )]
+    fn interrupted_children_are_indeterminate_and_reaped(
+        #[case] script: &str,
+        #[case] timeout: Duration,
+        #[case] limit: u64,
+    ) {
+        let started = std::time::Instant::now();
+        let result = run_bounded(Path::new("/bin/sh"), &["-c", script], None, timeout, limit);
+        assert!(
+            matches!(result, Err(Error::IndeterminateMutation { .. })),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn output_before_stdin_does_not_deadlock() {
+        let output = run_bounded(
+            Path::new("/bin/sh"),
+            &["-c", "head -c 131072 /dev/zero; cat >/dev/null"],
+            Some(&vec![b'x'; 1024 * 1024]),
+            Duration::from_secs(2),
+            2 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(output, vec![0; 131072]);
     }
 }

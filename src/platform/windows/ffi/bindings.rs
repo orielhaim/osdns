@@ -4,16 +4,21 @@ windows_link::link!("ole32.dll" "system" fn CoTaskMemFree(pv : *mut core::ffi::c
 windows_link::link!("iphlpapi.dll" "system" fn ConvertInterfaceLuidToGuid(interfaceluid : *const NET_LUID, interfaceguid : *mut GUID) -> NTSTATUS);
 windows_link::link!("kernel32.dll" "system" fn CreateEventW(lpeventattributes : *const SECURITY_ATTRIBUTES, bmanualreset : BOOL, binitialstate : BOOL, lpname : PCWSTR) -> HANDLE);
 windows_link::link!("iphlpapi.dll" "system" fn FreeInterfaceDnsSettings(settings : *mut DNS_INTERFACE_SETTINGS));
+windows_link::link!("iphlpapi.dll" "system" fn FreeMibTable(memory : *const core::ffi::c_void));
 windows_link::link!("iphlpapi.dll" "system" fn GetAdaptersAddresses(family : u32, flags : u32, reserved : *const core::ffi::c_void, adapteraddresses : *mut IP_ADAPTER_ADDRESSES_LH, sizepointer : *mut u32) -> u32);
-windows_link::link!("iphlpapi.dll" "system" fn GetBestInterfaceEx(destinationaddress : *const SOCKADDR, bestifindex : *mut u32) -> NTSTATUS);
 windows_link::link!("iphlpapi.dll" "system" fn GetInterfaceDnsSettings(interface : GUID, settings : *mut DNS_INTERFACE_SETTINGS) -> NTSTATUS);
+windows_link::link!("iphlpapi.dll" "system" fn GetIpForwardTable2(family : ADDRESS_FAMILY, table : *mut PMIB_IPFORWARD_TABLE2) -> NTSTATUS);
+windows_link::link!("iphlpapi.dll" "system" fn GetIpInterfaceEntry(row : *mut MIB_IPINTERFACE_ROW) -> NTSTATUS);
 windows_link::link!("iphlpapi.dll" "system" fn NotifyIpInterfaceChange(family : ADDRESS_FAMILY, callback : PIPINTERFACE_CHANGE_CALLBACK, callercontext : *const core::ffi::c_void, initialnotification : bool, notificationhandle : *mut HANDLE) -> NTSTATUS);
+windows_link::link!("advapi32.dll" "system" fn RegCreateKeyExW(hkey : HKEY, lpsubkey : PCWSTR, reserved : u32, lpclass : PCWSTR, dwoptions : u32, samdesired : REGSAM, lpsecurityattributes : *const SECURITY_ATTRIBUTES, phkresult : *mut HKEY, lpdwdisposition : *mut u32) -> LSTATUS);
+windows_link::link!("advapi32.dll" "system" fn RegEnumKeyExW(hkey : HKEY, dwindex : u32, lpname : PWSTR, lpcchname : *mut u32, lpreserved : *const u32, lpclass : PWSTR, lpcchclass : *mut u32, lpftlastwritetime : *mut FILETIME) -> LSTATUS);
 windows_link::link!("advapi32.dll" "system" fn RegNotifyChangeKeyValue(hkey : HKEY, bwatchsubtree : BOOL, dwnotifyfilter : u32, hevent : HANDLE, fasynchronous : BOOL) -> LSTATUS);
 windows_link::link!("shell32.dll" "system" fn SHGetFolderPathW(hwnd : HWND, csidl : i32, htoken : HANDLE, dwflags : u32, pszpath : PWSTR) -> HRESULT);
 windows_link::link!("shell32.dll" "system" fn SHGetKnownFolderPath(rfid : *const KNOWNFOLDERID, dwflags : u32, htoken : HANDLE, ppszpath : *mut PWSTR) -> HRESULT);
 windows_link::link!("kernel32.dll" "system" fn SetEvent(hevent : HANDLE) -> BOOL);
 windows_link::link!("iphlpapi.dll" "system" fn SetInterfaceDnsSettings(interface : GUID, settings : *const DNS_INTERFACE_SETTINGS) -> NTSTATUS);
 windows_link::link!("kernel32.dll" "system" fn WaitForMultipleObjects(ncount : u32, lphandles : *const HANDLE, bwaitall : BOOL, dwmilliseconds : u32) -> u32);
+pub type ACCESS_MASK = u32;
 pub type ADDRESS_FAMILY = u16;
 pub const AF_INET: i32 = 2;
 pub const AF_INET6: i32 = 23;
@@ -41,7 +46,14 @@ pub const DNS_SETTING_SEARCHLIST: i32 = 4;
 pub const ERROR_ACCESS_DENIED: i32 = 5;
 pub const ERROR_BUFFER_OVERFLOW: i32 = 111;
 pub const ERROR_FILE_NOT_FOUND: i32 = 2;
+pub const ERROR_NO_MORE_ITEMS: i32 = 259;
 pub const ERROR_SUCCESS: i32 = 0;
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FILETIME {
+    pub dwLowDateTime: u32,
+    pub dwHighDateTime: u32,
+}
 pub const GAA_FLAG_SKIP_ANYCAST: i32 = 2;
 pub const GAA_FLAG_SKIP_DNS_SERVER: i32 = 8;
 pub const GAA_FLAG_SKIP_MULTICAST: i32 = 4;
@@ -420,17 +432,66 @@ pub struct IP_ADAPTER_WINS_SERVER_ADDRESS_LH_0_0 {
     pub Length: u32,
     pub Reserved: u32,
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IP_ADDRESS_PREFIX {
+    pub Prefix: SOCKADDR_INET,
+    pub PrefixLength: u8,
+}
+impl Default for IP_ADDRESS_PREFIX {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 pub type IP_DAD_STATE = NL_DAD_STATE;
 pub type IP_PREFIX_ORIGIN = NL_PREFIX_ORIGIN;
 pub type IP_SUFFIX_ORIGIN = NL_SUFFIX_ORIGIN;
 pub const IfOperStatusUp: IF_OPER_STATUS = 1;
 pub const KEY_NOTIFY: i32 = 16;
+pub const KEY_READ: i32 = 131097;
+pub const KEY_WOW64_64KEY: i32 = 256;
+pub const KEY_WRITE: i32 = 131078;
 pub const KF_FLAG_DEFAULT: KNOWN_FOLDER_FLAG = 0;
 pub type KNOWNFOLDERID = GUID;
 pub type KNOWN_FOLDER_FLAG = u32;
 pub type LPSOCKADDR = *mut SOCKADDR;
 pub type LSTATUS = i32;
 pub const MAX_PATH: i32 = 260;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MIB_IPFORWARD_ROW2 {
+    pub InterfaceLuid: NET_LUID,
+    pub InterfaceIndex: NET_IFINDEX,
+    pub DestinationPrefix: IP_ADDRESS_PREFIX,
+    pub NextHop: SOCKADDR_INET,
+    pub SitePrefixLength: u8,
+    pub ValidLifetime: u32,
+    pub PreferredLifetime: u32,
+    pub Metric: u32,
+    pub Protocol: NL_ROUTE_PROTOCOL,
+    pub Loopback: bool,
+    pub AutoconfigureAddress: bool,
+    pub Publish: bool,
+    pub Immortal: bool,
+    pub Age: u32,
+    pub Origin: NL_ROUTE_ORIGIN,
+}
+impl Default for MIB_IPFORWARD_ROW2 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MIB_IPFORWARD_TABLE2 {
+    pub NumEntries: u32,
+    pub Table: [MIB_IPFORWARD_ROW2; 1],
+}
+impl Default for MIB_IPFORWARD_TABLE2 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MIB_IPINTERFACE_ROW {
@@ -510,6 +571,8 @@ pub struct NL_INTERFACE_OFFLOAD_ROD {
 pub type NL_LINK_LOCAL_ADDRESS_BEHAVIOR = i32;
 pub type NL_PREFIX_ORIGIN = i32;
 pub type NL_ROUTER_DISCOVERY_BEHAVIOR = i32;
+pub type NL_ROUTE_ORIGIN = i32;
+pub type NL_ROUTE_PROTOCOL = i32;
 pub type NL_SUFFIX_ORIGIN = i32;
 pub const NO_ERROR: i32 = 0;
 pub type NTSTATUS = i32;
@@ -530,10 +593,14 @@ pub type PIP_ADAPTER_MULTICAST_ADDRESS_XP = *mut IP_ADAPTER_MULTICAST_ADDRESS_XP
 pub type PIP_ADAPTER_PREFIX_XP = *mut IP_ADAPTER_PREFIX_XP;
 pub type PIP_ADAPTER_UNICAST_ADDRESS_LH = *mut IP_ADAPTER_UNICAST_ADDRESS_LH;
 pub type PIP_ADAPTER_WINS_SERVER_ADDRESS_LH = *mut IP_ADAPTER_WINS_SERVER_ADDRESS_LH;
+pub type PMIB_IPFORWARD_TABLE2 = *mut MIB_IPFORWARD_TABLE2;
 pub type PWCHAR = *mut u16;
 pub type PWSTR = *mut u16;
+pub type REGSAM = ACCESS_MASK;
+pub const REG_CREATED_NEW_KEY: i32 = 1;
 pub const REG_NOTIFY_CHANGE_LAST_SET: i32 = 4;
 pub const REG_NOTIFY_CHANGE_NAME: i32 = 1;
+pub const REG_OPTION_NON_VOLATILE: i32 = 0;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SCOPE_ID {
@@ -613,6 +680,18 @@ pub union SOCKADDR_IN6_LH_0 {
     pub sin6_scope_struct: SCOPE_ID,
 }
 impl Default for SOCKADDR_IN6_LH_0 {
+    fn default() -> Self {
+        unsafe { core::mem::zeroed() }
+    }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union SOCKADDR_INET {
+    pub Ipv4: SOCKADDR_IN,
+    pub Ipv6: SOCKADDR_IN6,
+    pub si_family: ADDRESS_FAMILY,
+}
+impl Default for SOCKADDR_INET {
     fn default() -> Self {
         unsafe { core::mem::zeroed() }
     }

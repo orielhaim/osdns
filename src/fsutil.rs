@@ -1,60 +1,34 @@
-use std::fs;
 use std::io;
 use std::path::Path;
 
 use crate::error::{Error, Result};
 
-pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
-    match fs::create_dir_all(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            return Err(Error::RequiresPrivilege(format!(
-                "cannot create directory {}: {e}",
-                path.display()
-            )));
-        }
-        Err(e) => return Err(e.into()),
+pub(crate) fn private_error(error: private_fs::Error) -> Error {
+    match error {
+        private_fs::Error::Io(error) => error.into(),
+        error => Error::UnsafeFilesystem(error.to_string()),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = fs::metadata(path)?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                    return Err(Error::RequiresPrivilege(format!(
-                        "directory {} is accessible to other users and could not be restricted: {e}",
-                        path.display()
-                    )));
-                }
-                Err(e) => return Err(e.into()),
-            }
-            let meta = fs::metadata(path)?;
-            if meta.permissions().mode() & 0o077 != 0 {
-                return Err(Error::RequiresPrivilege(format!(
-                    "directory {} is accessible to other users and could not be restricted",
-                    path.display()
-                )));
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
 }
 
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<private_fs::PrivateDir> {
+    match private_fs::PrivateDir::ensure(path) {
+        Ok(dir) => Ok(dir),
+        Err(private_fs::Error::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .ok_or_else(|| Error::invalid_config("state directory has no parent"))?;
+            let parent = ensure_private_dir(parent)?;
+            let name = path
+                .file_name()
+                .ok_or_else(|| Error::invalid_config("invalid state directory"))?;
+            parent.ensure_dir(name).map_err(private_error)
+        }
+        Err(error) => Err(private_error(error)),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
 pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let file = fs::File::open(path)?;
-        file.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+    std::fs::File::open(path)?.sync_all()
 }

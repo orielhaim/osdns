@@ -66,11 +66,13 @@ pub(crate) enum SnapshotData {
 /// Backend-defined evidence naming the native resource incarnation that a
 /// journal record was created against.  This is deliberately separate from
 /// [`ResourceId`], which is only the current mutation/locking target.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub(crate) struct ResourceIdentity {
     pub(crate) backend: BackendKind,
     pub(crate) resource: ResourceId,
     pub(crate) data: IdentityData,
+    #[cfg(target_os = "linux")]
+    pub(crate) live_handle: Option<std::sync::Arc<std::fs::File>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +92,8 @@ impl ResourceIdentity {
             backend,
             resource,
             data,
+            #[cfg(target_os = "linux")]
+            live_handle: None,
         }
     }
 }
@@ -211,13 +215,6 @@ impl MutationAttempt {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) enum LegacyJournalRecovery {
-    NotLegacy,
-    Clear,
-    Unresolved(&'static str),
-}
-
 /// The boundary between the transaction engine and platform-specific code.
 ///
 /// Implementations are crate-internal; the public API never exposes
@@ -281,50 +278,7 @@ pub(crate) trait Backend: Send + Sync {
         expected: &PlatformSnapshot,
         plan: &NormalizedConfig,
     ) -> MutationAttempt {
-        match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => match self.mutation_guard() {
-                MutationGuard::CompareAndMutate => {
-                    self.apply_guarded(&identity.resource, expected, plan)
-                }
-                MutationGuard::Unconditional => match self.readback(&identity.resource) {
-                    Ok(current) if self.equivalent(expected, &current) => {
-                        match self.resource_status(identity) {
-                            Ok(ResourceStatus::Same) => MutationAttempt::from_apply_result(
-                                self.apply(&identity.resource, plan),
-                            ),
-                            Ok(status) => MutationAttempt::Rejected {
-                                error: Error::ResourceIdentity {
-                                    backend: self.kind(),
-                                    resource: identity.resource.clone(),
-                                    message: format!(
-                                        "resource incarnation became {status:?} before mutation"
-                                    ),
-                                },
-                            },
-                            Err(error) => MutationAttempt::Rejected { error },
-                        }
-                    }
-                    Ok(_) => MutationAttempt::Rejected {
-                        error: Error::ExternalModification {
-                            resource: identity.resource.clone(),
-                            detail: "the current state changed since it was captured".to_string(),
-                        },
-                    },
-                    Err(error) => MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    },
-                },
-            },
-            Ok(status) => MutationAttempt::Rejected {
-                error: Error::ResourceIdentity {
-                    backend: self.kind(),
-                    resource: identity.resource.clone(),
-                    message: format!("resource incarnation is {status:?}; refusing mutation"),
-                },
-            },
-            Err(error) => MutationAttempt::Rejected { error },
-        }
+        apply_bound(self, identity, expected, plan)
     }
 
     /// Restores through the authoritative incarnation-checked operation path.
@@ -334,57 +288,7 @@ pub(crate) trait Backend: Send + Sync {
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
     ) -> MutationAttempt {
-        match self.resource_status(identity) {
-            Ok(ResourceStatus::Same) => match self.mutation_guard() {
-                MutationGuard::CompareAndMutate => {
-                    self.restore_guarded(&identity.resource, expected, target)
-                }
-                MutationGuard::Unconditional => match self.readback(&identity.resource) {
-                    Ok(current) if self.owns_current(expected, &current) => {
-                        match self.resource_status(identity) {
-                            Ok(ResourceStatus::Same) => {
-                                match self.restore(&identity.resource, target) {
-                                    Ok(()) => MutationAttempt::Performed { produced: None },
-                                    Err(error) => MutationAttempt::Indeterminate {
-                                        error,
-                                        produced: None,
-                                    },
-                                }
-                            }
-                            Ok(status) => MutationAttempt::Rejected {
-                                error: Error::ResourceIdentity {
-                                    backend: self.kind(),
-                                    resource: identity.resource.clone(),
-                                    message: format!(
-                                        "resource incarnation became {status:?} before restore"
-                                    ),
-                                },
-                            },
-                            Err(error) => MutationAttempt::Rejected { error },
-                        }
-                    }
-                    Ok(_) => MutationAttempt::Rejected {
-                        error: Error::ExternalModification {
-                            resource: identity.resource.clone(),
-                            detail: "the current state changed since ownership was verified"
-                                .to_string(),
-                        },
-                    },
-                    Err(error) => MutationAttempt::Indeterminate {
-                        error,
-                        produced: None,
-                    },
-                },
-            },
-            Ok(status) => MutationAttempt::Rejected {
-                error: Error::ResourceIdentity {
-                    backend: self.kind(),
-                    resource: identity.resource.clone(),
-                    message: format!("resource incarnation is {status:?}; refusing restore"),
-                },
-            },
-            Err(error) => MutationAttempt::Rejected { error },
-        }
+        restore_bound(self, identity, expected, target)
     }
 
     /// Reads the authoritative current state of `resource`.
@@ -396,7 +300,12 @@ pub(crate) trait Backend: Send + Sync {
     /// When any step fails the backend returns `Err`, and the resource may
     /// already be partially mutated. That is
     /// [`MutationAttempt::Indeterminate`], never proof that nothing changed.
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt>;
+    fn apply(&self, _resource: &ResourceId, _plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+        Err(Error::unsupported(
+            self.kind(),
+            "mutation requires a bound resource identity",
+        ))
+    }
 
     /// Reads the state back after a mutation for verification.
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;
@@ -419,18 +328,6 @@ pub(crate) trait Backend: Send + Sync {
             OwnershipIdentity::Durable => self.proves_current(claimed, current),
             OwnershipIdentity::BestEffort => self.equivalent(claimed, current),
         }
-    }
-
-    /// Classifies a backend-local legacy journal during recovery. A legacy
-    /// backend may clear only when no native mutation is needed; unresolved
-    /// records remain retained and block subsequent apply rather than being
-    /// reconstructed.
-    fn legacy_recovery(
-        &self,
-        _before: &PlatformSnapshot,
-        _current: &PlatformSnapshot,
-    ) -> LegacyJournalRecovery {
-        LegacyJournalRecovery::NotLegacy
     }
 
     /// Applies `plan` only while current state still matches `expected`.
@@ -458,7 +355,12 @@ pub(crate) trait Backend: Send + Sync {
     /// with unrelated native state where the platform requires it, so that
     /// restoration never destroys changes made by other actors to unmanaged
     /// fields.
-    fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()>;
+    fn restore(&self, _resource: &ResourceId, _snapshot: &PlatformSnapshot) -> Result<()> {
+        Err(Error::unsupported(
+            self.kind(),
+            "restoration requires a bound resource identity",
+        ))
+    }
 
     /// Restores `target` only while current state still matches `expected`.
     ///
@@ -524,6 +426,110 @@ pub(crate) trait Backend: Send + Sync {
             self.kind(),
             "this backend does not support cache flushing",
         ))
+    }
+}
+
+pub(crate) fn apply_bound<B: Backend + ?Sized>(
+    backend: &B,
+    identity: &ResourceIdentity,
+    expected: &PlatformSnapshot,
+    plan: &NormalizedConfig,
+) -> MutationAttempt {
+    match backend.resource_status(identity) {
+        Ok(ResourceStatus::Same) => match backend.mutation_guard() {
+            MutationGuard::CompareAndMutate => {
+                backend.apply_guarded(&identity.resource, expected, plan)
+            }
+            MutationGuard::Unconditional => match backend.readback(&identity.resource) {
+                Ok(current) if backend.equivalent(expected, &current) => {
+                    match backend.resource_status(identity) {
+                        Ok(ResourceStatus::Same) => MutationAttempt::from_apply_result(
+                            backend.apply(&identity.resource, plan),
+                        ),
+                        Ok(status) => MutationAttempt::Rejected {
+                            error: Error::ResourceIdentity {
+                                backend: backend.kind(),
+                                resource: identity.resource.clone(),
+                                message: format!(
+                                    "resource incarnation became {status:?} before mutation"
+                                ),
+                            },
+                        },
+                        Err(error) => MutationAttempt::Rejected { error },
+                    }
+                }
+                Ok(_) => MutationAttempt::Rejected {
+                    error: Error::ExternalModification {
+                        resource: identity.resource.clone(),
+                        detail: "the current state changed since it was captured".to_string(),
+                    },
+                },
+                Err(error) => MutationAttempt::Rejected { error },
+            },
+        },
+        Ok(status) => MutationAttempt::Rejected {
+            error: Error::ResourceIdentity {
+                backend: backend.kind(),
+                resource: identity.resource.clone(),
+                message: format!("resource incarnation is {status:?}; refusing mutation"),
+            },
+        },
+        Err(error) => MutationAttempt::Rejected { error },
+    }
+}
+pub(crate) fn restore_bound<B: Backend + ?Sized>(
+    backend: &B,
+    identity: &ResourceIdentity,
+    expected: &PlatformSnapshot,
+    target: &PlatformSnapshot,
+) -> MutationAttempt {
+    match backend.resource_status(identity) {
+        Ok(ResourceStatus::Same) => match backend.mutation_guard() {
+            MutationGuard::CompareAndMutate => {
+                backend.restore_guarded(&identity.resource, expected, target)
+            }
+            MutationGuard::Unconditional => match backend.readback(&identity.resource) {
+                Ok(current) if backend.owns_current(expected, &current) => {
+                    match backend.resource_status(identity) {
+                        Ok(ResourceStatus::Same) => {
+                            match backend.restore(&identity.resource, target) {
+                                Ok(()) => MutationAttempt::Performed { produced: None },
+                                Err(error) => MutationAttempt::Indeterminate {
+                                    error,
+                                    produced: None,
+                                },
+                            }
+                        }
+                        Ok(status) => MutationAttempt::Rejected {
+                            error: Error::ResourceIdentity {
+                                backend: backend.kind(),
+                                resource: identity.resource.clone(),
+                                message: format!(
+                                    "resource incarnation became {status:?} before restore"
+                                ),
+                            },
+                        },
+                        Err(error) => MutationAttempt::Rejected { error },
+                    }
+                }
+                Ok(_) => MutationAttempt::Rejected {
+                    error: Error::ExternalModification {
+                        resource: identity.resource.clone(),
+                        detail: "the current state changed since ownership was verified"
+                            .to_string(),
+                    },
+                },
+                Err(error) => MutationAttempt::Rejected { error },
+            },
+        },
+        Ok(status) => MutationAttempt::Rejected {
+            error: Error::ResourceIdentity {
+                backend: backend.kind(),
+                resource: identity.resource.clone(),
+                message: format!("resource incarnation is {status:?}; refusing restore"),
+            },
+        },
+        Err(error) => MutationAttempt::Rejected { error },
     }
 }
 

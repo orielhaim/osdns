@@ -16,14 +16,14 @@ use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) trait DirectPolicy: Send + Sync {
     fn check_usable(&self, path: &Path) -> Result<()>;
-    fn metadata(&self, path: &Path) -> Result<Option<DirectFileMetadata>>;
+    fn metadata(&self, file: &std::fs::File) -> Result<DirectFileMetadata>;
     fn write(
         &self,
         path: &Path,
         content: &[u8],
-        mode: Option<u32>,
         metadata: Option<&DirectFileMetadata>,
         restore_modified_time: bool,
+        verify_expected: &dyn Fn() -> Result<()>,
     ) -> Result<()>;
     fn metadata_equivalent(
         &self,
@@ -67,27 +67,42 @@ pub(crate) struct FileTime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DirectSnapshot {
     pub(crate) content: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) mode: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) metadata: Option<DirectFileMetadata>,
 }
 
-fn snapshot_modes_match(left: &DirectSnapshot, right: &DirectSnapshot) -> bool {
-    left.mode.is_none() || right.mode.is_none() || left.mode == right.mode
+impl DirectSnapshot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let valid = match (&self.content, &self.metadata) {
+            (None, None) => true,
+            (Some(_), Some(metadata)) => metadata
+                .modified
+                .as_ref()
+                .is_none_or(|time| time.nanoseconds < 1_000_000_000),
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::JournalCorrupt(
+                "resolver file snapshot has inconsistent content or metadata".to_string(),
+            ))
+        }
+    }
 }
 
 pub(crate) struct DirectResolvConf {
     path: PathBuf,
     resource: ResourceId,
     caps: Capabilities,
-    policy: Arc<dyn DirectPolicy>,
+    policy: Box<dyn DirectPolicy>,
 }
 
 impl DirectResolvConf {
-    pub(crate) fn new(path: PathBuf, policy: Arc<dyn DirectPolicy>) -> Self {
+    pub(crate) fn new(path: PathBuf, policy: Box<dyn DirectPolicy>) -> Self {
         Self {
             path,
             resource: policy.resource().clone(),
@@ -97,19 +112,98 @@ impl DirectResolvConf {
     }
 
     fn read_current(&self) -> Result<DirectSnapshot> {
+        use std::io::Read;
         self.policy.check_usable(&self.path)?;
-        let content = match std::fs::read(&self.path) {
-            Ok(content) => Some(content),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+        let mut file: std::fs::File = match rustix::fs::open(
+            &self.path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(file) => file.into(),
+            Err(rustix::io::Errno::NOENT) => {
+                return Ok(DirectSnapshot {
+                    content: None,
+                    metadata: None,
+                });
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
         };
-        let metadata = self.policy.metadata(&self.path)?;
-        let mode = metadata.as_ref().map(|metadata| metadata.mode);
+        let before = file.metadata()?;
+        if !before.is_file() {
+            return Err(Error::UnsafeFilesystem(
+                "resolver configuration is not a regular file".to_string(),
+            ));
+        }
+        let metadata = self.policy.metadata(&file)?;
+        let mut content = Vec::new();
+        Read::by_ref(&mut file)
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_end(&mut content)?;
+        if content.len() > 16 * 1024 * 1024 {
+            return Err(Error::unsupported(
+                self.kind(),
+                "resolver configuration exceeds the storage budget",
+            ));
+        }
+        let after = file.metadata()?;
+        use std::os::unix::fs::MetadataExt;
+        if before.len() != after.len()
+            || before.modified()? != after.modified()?
+            || (before.ctime(), before.ctime_nsec()) != (after.ctime(), after.ctime_nsec())
+            || metadata != self.policy.metadata(&file)?
+        {
+            return Err(Error::ResourcePlatform {
+                backend: self.kind(),
+                resource: self.resource.clone(),
+                message: "resolver configuration changed during capture".to_string(),
+            });
+        }
         Ok(DirectSnapshot {
-            content,
-            mode,
-            metadata,
+            content: Some(content),
+            metadata: Some(metadata),
         })
+    }
+
+    fn apply_snapshot(
+        &self,
+        current: &DirectSnapshot,
+        plan: &NormalizedConfig,
+    ) -> Result<ApplyReceipt> {
+        let desired = build_resolv_conf_content(plan);
+        self.write_content(&desired, current, false, current)?;
+        let observed = self.read_current()?;
+        let preserved = observed.content.as_deref() == Some(desired.as_slice())
+            && self
+                .policy
+                .mutation_metadata_preserved(current.metadata.as_ref(), observed.metadata.as_ref());
+        if !preserved {
+            let detail = if observed.content.as_deref() == Some(desired.as_slice()) {
+                "resolv.conf metadata changed before write verification completed"
+            } else {
+                "resolv.conf changed before write verification completed"
+            };
+            return Err(Error::ResourcePlatform {
+                backend: BackendKind::ResolvConfFile,
+                resource: self.resource.clone(),
+                message: detail.to_string(),
+            });
+        }
+        Ok(ApplyReceipt {
+            resource: self.resource.clone(),
+        })
+    }
+
+    fn verify_expected(&self, expected: &DirectSnapshot) -> Result<()> {
+        if self.read_current()? != *expected {
+            return Err(Error::ExternalModification {
+                resource: self.resource.clone(),
+                detail: "resolv.conf changed before publication".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn write_content(
@@ -117,14 +211,15 @@ impl DirectResolvConf {
         content: &[u8],
         snapshot: &DirectSnapshot,
         restore_modified_time: bool,
+        expected: &DirectSnapshot,
     ) -> Result<()> {
         self.policy.check_usable(&self.path)?;
         self.policy.write(
             &self.path,
             content,
-            snapshot.mode,
             snapshot.metadata.as_ref(),
             restore_modified_time,
+            &|| self.verify_expected(expected),
         )
     }
 
@@ -138,7 +233,10 @@ impl DirectResolvConf {
 
     fn from_platform(snapshot: &PlatformSnapshot) -> Result<DirectSnapshot> {
         match &snapshot.data {
-            SnapshotData::ResolvConfFile(data) => Ok(data.clone()),
+            SnapshotData::ResolvConfFile(data) => {
+                data.validate()?;
+                Ok(data.clone())
+            }
             _ => Err(Error::JournalCorrupt(
                 "resolv.conf snapshot has the wrong backend data".to_string(),
             )),
@@ -199,45 +297,92 @@ impl Backend for DirectResolvConf {
         self.policy.list_interfaces()
     }
 
-    fn capture(&self, _resource: &ResourceId) -> Result<PlatformSnapshot> {
-        Ok(self.to_platform(&self.read_current()?))
+    fn resource_status(
+        &self,
+        identity: &crate::platform::ResourceIdentity,
+    ) -> Result<crate::platform::ResourceStatus> {
+        if identity.backend != self.kind()
+            || identity.resource != self.resource
+            || !matches!(identity.data, crate::platform::IdentityData::Untracked)
+        {
+            return Err(Error::JournalCorrupt(
+                "resolver identity does not name this backend's file resource".to_string(),
+            ));
+        }
+        Ok(crate::platform::ResourceStatus::Same)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
-        let current = self.read_current()?;
-        let desired = build_resolv_conf_content(plan);
-        self.write_content(&desired, &current, false)?;
-        let observed = self.read_current()?;
-        let preserved = observed.content.as_deref() == Some(desired.as_slice())
-            && self
-                .policy
-                .mutation_metadata_preserved(current.metadata.as_ref(), observed.metadata.as_ref());
-        if !preserved {
-            let detail = if observed.content.as_deref() == Some(desired.as_slice()) {
-                "resolv.conf metadata changed before write verification completed"
-            } else {
-                "resolv.conf changed before write verification completed"
-            };
-            return Err(Error::ResourcePlatform {
-                backend: BackendKind::ResolvConfFile,
-                resource: resource.clone(),
-                message: detail.to_string(),
-            });
-        }
-        Ok(ApplyReceipt {
-            resource: self.resource.clone(),
-        })
+    fn capture(&self, _resource: &ResourceId) -> Result<PlatformSnapshot> {
+        Ok(self.to_platform(&self.read_current()?))
     }
 
     fn readback(&self, _resource: &ResourceId) -> Result<PlatformSnapshot> {
         Ok(self.to_platform(&self.read_current()?))
     }
 
-    fn restore(&self, _resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
-        let before = Self::from_platform(snapshot)?;
-        match before.content.as_deref() {
-            Some(content) => self.write_content(content, &before, true),
-            None => self.remove_current(),
+    fn apply_bound(
+        &self,
+        identity: &crate::platform::ResourceIdentity,
+        expected: &PlatformSnapshot,
+        plan: &NormalizedConfig,
+    ) -> crate::platform::MutationAttempt {
+        let preparation = (|| {
+            self.resource_status(identity)?;
+            if expected.resource != self.resource || expected.backend != self.kind() {
+                return Err(Error::JournalCorrupt(
+                    "resolver snapshot targets a different resource".to_string(),
+                ));
+            }
+            let expected = Self::from_platform(expected)?;
+            self.verify_expected(&expected)?;
+            Ok(expected)
+        })();
+        match preparation {
+            Ok(expected) => crate::platform::MutationAttempt::from_apply_result(
+                self.apply_snapshot(&expected, plan),
+            ),
+            Err(error) => crate::platform::MutationAttempt::Rejected { error },
+        }
+    }
+
+    fn restore_bound(
+        &self,
+        identity: &crate::platform::ResourceIdentity,
+        expected: &PlatformSnapshot,
+        target: &PlatformSnapshot,
+    ) -> crate::platform::MutationAttempt {
+        let preparation = (|| {
+            self.resource_status(identity)?;
+            if [expected, target]
+                .iter()
+                .any(|s| s.resource != self.resource || s.backend != self.kind())
+            {
+                return Err(Error::JournalCorrupt(
+                    "resolver snapshot targets a different resource".to_string(),
+                ));
+            }
+            let expected = Self::from_platform(expected)?;
+            let target = Self::from_platform(target)?;
+            self.verify_expected(&expected)?;
+            Ok((expected, target))
+        })();
+        match preparation {
+            Ok((expected, target)) => {
+                let result = match target.content.as_deref() {
+                    Some(content) => self.write_content(content, &target, true, &expected),
+                    None => self
+                        .verify_expected(&expected)
+                        .and_then(|()| self.remove_current()),
+                };
+                match result {
+                    Ok(()) => crate::platform::MutationAttempt::Performed { produced: None },
+                    Err(error) => crate::platform::MutationAttempt::Indeterminate {
+                        error,
+                        produced: None,
+                    },
+                }
+            }
+            Err(error) => crate::platform::MutationAttempt::Rejected { error },
         }
     }
 
@@ -245,7 +390,6 @@ impl Backend for DirectResolvConf {
         match (Self::from_platform(a), Self::from_platform(b)) {
             (Ok(a), Ok(b)) => {
                 a.content == b.content
-                    && snapshot_modes_match(&a, &b)
                     && self
                         .policy
                         .metadata_equivalent(a.metadata.as_ref(), b.metadata.as_ref())
@@ -338,24 +482,25 @@ mod tests {
             Ok(())
         }
 
-        fn metadata(&self, _path: &Path) -> Result<Option<DirectFileMetadata>> {
-            Ok(Some(DirectFileMetadata {
+        fn metadata(&self, _file: &std::fs::File) -> Result<DirectFileMetadata> {
+            Ok(DirectFileMetadata {
                 mode: *self.mode.lock().unwrap(),
                 owner: None,
                 flags: None,
                 links: None,
                 modified: None,
-            }))
+            })
         }
 
         fn write(
             &self,
             path: &Path,
             content: &[u8],
-            _mode: Option<u32>,
             _metadata: Option<&DirectFileMetadata>,
             _restore_modified_time: bool,
+            verify_expected: &dyn Fn() -> Result<()>,
         ) -> Result<()> {
+            verify_expected()?;
             std::fs::write(path, content)?;
             *self.mode.lock().unwrap() = 0o600;
             Ok(())
@@ -415,7 +560,7 @@ mod tests {
         let resource = ResourceId::new("unix:resolv-conf").unwrap();
         let backend = DirectResolvConf::new(
             path.clone(),
-            Arc::new(MetadataChangingPolicy {
+            Box::new(MetadataChangingPolicy {
                 resource: resource.clone(),
                 mode: Mutex::new(0o100644),
             }),
@@ -425,7 +570,8 @@ mod tests {
             ..NormalizedConfig::default()
         };
 
-        let error = backend.apply(&resource, &plan).unwrap_err();
+        let current = backend.read_current().unwrap();
+        let error = backend.apply_snapshot(&current, &plan).unwrap_err();
         assert!(matches!(&error, Error::ResourcePlatform { .. }));
         assert!(matches!(
             MutationAttempt::from_apply_result(Err(error)),
@@ -435,33 +581,5 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "nameserver 192.0.2.20\n"
         );
-    }
-
-    #[test]
-    fn snapshot_equality_includes_legacy_top_level_mode() {
-        let left = DirectSnapshot {
-            content: Some(b"nameserver 192.0.2.1\n".to_vec()),
-            mode: Some(0o100640),
-            metadata: None,
-        };
-        let mut right = left.clone();
-        right.mode = Some(0o100600);
-        assert!(!snapshot_modes_match(&left, &right));
-        right.mode = left.mode;
-        assert!(snapshot_modes_match(&left, &right));
-        let legacy = DirectSnapshot {
-            content: left.content.clone(),
-            mode: None,
-            metadata: None,
-        };
-        assert!(snapshot_modes_match(&legacy, &left));
-    }
-
-    #[test]
-    fn old_direct_snapshots_decode_without_metadata() {
-        let snapshot: DirectSnapshot = serde_json::from_str(r#"{"content":null}"#).unwrap();
-        assert_eq!(snapshot.content, None);
-        assert_eq!(snapshot.mode, None);
-        assert_eq!(snapshot.metadata, None);
     }
 }

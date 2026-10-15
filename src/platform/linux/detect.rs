@@ -31,7 +31,7 @@ fn resolv_conf_owner() -> ResolvConfOwner {
             return ResolvConfOwner::NetworkManager;
         }
     }
-    if let Ok(bytes) = std::fs::read(path) {
+    if let Ok(bytes) = detect::read_config(path) {
         if detect::has_openresolv_signature(&bytes) {
             return ResolvConfOwner::Resolvconf;
         }

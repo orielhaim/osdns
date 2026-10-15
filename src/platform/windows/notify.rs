@@ -36,6 +36,7 @@ fn resource_from_row(row: &MIB_IPINTERFACE_ROW) -> Option<ResourceId> {
 
 struct IpNotifyContext {
     callback: Arc<dyn Fn(&DnsEvent) + Send + Sync>,
+    flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe extern "system" fn ip_interface_callback(
@@ -46,6 +47,9 @@ unsafe extern "system" fn ip_interface_callback(
     // SAFETY: context came from Box::into_raw and lives until cancel completes
     // on a different thread.
     let context = unsafe { &*(caller_context as *const IpNotifyContext) };
+    if context.flag.load(Ordering::Acquire) {
+        return;
+    }
     // SAFETY: the OS passes a valid row for the duration of the callback.
     let row = unsafe { &*row };
     if let Some(resource) = resource_from_row(row) {
@@ -93,7 +97,10 @@ pub(crate) fn start_ip_interface_watch(
     flag: Arc<std::sync::atomic::AtomicBool>,
     callback: Arc<dyn Fn(&DnsEvent) + Send + Sync>,
 ) -> Result<Box<dyn FnOnce() + Send>> {
-    let context = Box::into_raw(Box::new(IpNotifyContext { callback }));
+    let context = Box::into_raw(Box::new(IpNotifyContext {
+        callback,
+        flag: flag.clone(),
+    }));
 
     let mut notification: HANDLE = std::ptr::null_mut();
     let status = unsafe {
@@ -116,10 +123,9 @@ pub(crate) fn start_ip_interface_watch(
     struct SendHandle(HANDLE);
     unsafe impl Send for SendHandle {}
     impl SendHandle {
-        fn cancel(self) {
-            unsafe {
-                let _ = ffi::CancelMibChangeNotify2(self.0);
-            }
+        fn cancel(self) -> bool {
+            // SAFETY: this registration handle was returned by IP Helper and is cancelled once.
+            unsafe { ffi::CancelMibChangeNotify2(self.0) == 0 }
         }
     }
     struct SendContext(*mut IpNotifyContext);
@@ -133,8 +139,12 @@ pub(crate) fn start_ip_interface_watch(
     let context = SendContext(context);
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
-        wrapped.cancel();
-        context.release();
+        if wrapped.cancel() {
+            context.release();
+        } else {
+            // The OS may still dereference this context; retain it with delivery disabled.
+            osdns_warn!("IP Helper refused cancellation; callback storage must remain allocated");
+        }
     }))
 }
 
@@ -189,11 +199,13 @@ pub(crate) fn start_nrpt_registry_watch(
     }
 
     let worker_flag = flag.clone();
+    let initial = snapshot_nrpt_rule_states()?;
     let worker = match thread::Builder::new()
         .name("osdns-nrpt-watch".to_string())
         .spawn(move || {
+            let _lifetime = crate::watch::WatchWorker(Arc::clone(&worker_flag));
             let watch = watch;
-            let mut seen = snapshot_nrpt_rule_states();
+            let mut seen = initial;
             loop {
                 if !watch.wait() {
                     break;
@@ -201,14 +213,21 @@ pub(crate) fn start_nrpt_registry_watch(
                 if worker_flag.load(Ordering::Acquire) {
                     break;
                 }
-                let current = snapshot_nrpt_rule_states();
+                if let Err(_error) = rearm_notify(&watch) {
+                    osdns_warn!(error = %_error, "NRPT notification rearm failed");
+                    break;
+                }
+                let current = match snapshot_nrpt_rule_states() {
+                    Ok(current) => current,
+                    Err(_error) => {
+                        osdns_warn!(error = %_error, "NRPT authoritative observation failed");
+                        break;
+                    }
+                };
                 for (key, removed) in diff_rule_states(&seen, &current) {
                     continue_with(&callback, &key, removed);
                 }
                 seen = current;
-                if rearm_notify(&watch).is_err() {
-                    break;
-                }
             }
             // Key + notify_event drop here after the wait loop exits.
         }) {
@@ -268,41 +287,81 @@ fn continue_with(callback: &Arc<dyn Fn(&DnsEvent) + Send + Sync>, key: &str, rem
     callback(&event);
 }
 
-fn rule_fingerprint(key: &Key) -> Option<String> {
-    let name = key.get_multi_string("Name").ok()?.join("\u{1}");
-    let servers = key.get_string("GenericDNSServers").ok()?;
-    let config_options = key.get_u32("ConfigOptions").ok()?;
-    let version = key.get_u32("Version").ok()?;
-    Some(format!(
-        "{name}\u{1}{servers}\u{1}{config_options}\u{1}{version}"
-    ))
+type RuleValues = Vec<Option<(windows_registry::Type, Vec<u8>)>>;
+
+fn rule_fingerprint(key: &Key) -> Result<RuleValues> {
+    [
+        "Name",
+        "GenericDNSServers",
+        "ConfigOptions",
+        "Version",
+        "Comment",
+        "DisplayName",
+    ]
+    .into_iter()
+    .map(|name| match key.get_value(name) {
+        Ok(value) => Ok(Some((value.ty(), value.to_vec()))),
+        Err(error) if super::error::registry_not_found(&error) => Ok(None),
+        Err(error) => Err(map_error(error, "NRPT watch value")),
+    })
+    .collect()
 }
 
-fn snapshot_nrpt_rule_states() -> std::collections::BTreeMap<String, String> {
+type RuleStates = std::collections::BTreeMap<String, RuleValues>;
+
+fn snapshot_nrpt_rule_states() -> Result<RuleStates> {
     use super::nrpt::NRPT_BASE;
     let base = match open_hklm(NRPT_BASE, false) {
         Ok(base) => base,
-        Err(_) => return Default::default(),
+        Err(error) if super::error::registry_not_found(&error) => return Ok(Default::default()),
+        Err(error) => return Err(map_error(error, "NRPT watch snapshot")),
     };
     let mut out = std::collections::BTreeMap::new();
-    let key_names = match base.keys() {
-        Ok(keys) => keys,
-        Err(_) => return out,
-    };
+    let key_names = key_names(&base)?;
     for key_name in key_names {
-        let Ok(rule_key) = base.open(&key_name) else {
-            continue;
-        };
-        if let Some(fingerprint) = rule_fingerprint(&rule_key) {
-            out.insert(key_name, fingerprint);
-        }
+        let rule_key = base
+            .open(&key_name)
+            .map_err(|error| map_error(error, "NRPT watch rule"))?;
+        let fingerprint = rule_fingerprint(&rule_key)?;
+        out.insert(key_name, fingerprint);
     }
-    out
+    Ok(out)
 }
 
-fn diff_rule_states(
-    previous: &std::collections::BTreeMap<String, String>,
-    current: &std::collections::BTreeMap<String, String>,
+fn key_names(key: &Key) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for index in 0.. {
+        // Registry key names are limited to 255 UTF-16 code units.
+        let mut name = [0u16; 256];
+        let mut len = name.len() as u32;
+        let status = unsafe {
+            ffi::RegEnumKeyExW(
+                key.as_raw().cast(),
+                index,
+                name.as_mut_ptr(),
+                &mut len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status == ffi::ERROR_NO_MORE_ITEMS {
+            return Ok(names);
+        }
+        check_status(status, "RegEnumKeyExW (NRPT watch)")?;
+        let name = String::from_utf16(&name[..len as usize]).map_err(|_| Error::Platform {
+            backend: BackendKind::WindowsIpHelper,
+            message: "NRPT key has an invalid UTF-16 name".to_string(),
+        })?;
+        names.push(name);
+    }
+    unreachable!()
+}
+
+fn diff_rule_states<T: PartialEq>(
+    previous: &std::collections::BTreeMap<String, T>,
+    current: &std::collections::BTreeMap<String, T>,
 ) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     for (key, fingerprint) in current {

@@ -382,10 +382,8 @@ fn update_failure_during_rollback_keeps_recoverable_journal() {
         .fake
         .inject_backend_failure(FakeOp::Restore, 1, "rollback failed");
     let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
-    // Journals are restored to the pre-update Applied form so the failure is
-    // diagnosable and the lease stays usable; the resource whose rollback
-    // failed honestly reports its mixed state.
+    assert!(matches!(err, Error::TransactionFailed { .. }), "{err:?}");
+    // The retained ownership proof describes the state that actually remains.
     assert_eq!(journal_files(&fixture.dir).len(), 3);
     for name in journal_files(&fixture.dir) {
         let bytes = std::fs::read(fixture.dir.join("journal").join(name)).unwrap();
@@ -393,17 +391,24 @@ fn update_failure_during_rollback_keeps_recoverable_journal() {
         assert_eq!(record["phase"], "Applied");
         assert_eq!(
             record["applied"]["data"]["state"]["Configured"]["nameservers"][0],
-            "1.1.1.1"
+            if record["resource"] == IFACE1 {
+                "8.8.8.8"
+            } else {
+                "1.1.1.1"
+            }
         );
     }
-    // The first resource kept its new state (rollback failed); the lease can
-    // no longer cleanly restore it, so abandon instead of silently dropping.
+    // A failed rollback retains the new state and can still restore its original base.
     let first = lease.resources()[0].as_str().to_string();
     assert_eq!(
         configured_nameservers(fixture.fake.current_state(&first).unwrap()),
         vec![ip("8.8.8.8")]
     );
-    lease.abandon().unwrap();
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
@@ -412,7 +417,7 @@ fn update_failure_during_journal_transition_changes_nothing() {
     let (fixture, lease) = three_resource_lease();
     fixture.manager.set_journal_fail_writes(true);
     let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    assert!(matches!(err, Error::TransactionFailed { .. }), "{err:?}");
     fixture.manager.set_journal_fail_writes(false);
     for resource in lease.resources() {
         assert_eq!(
@@ -423,4 +428,44 @@ fn update_failure_during_journal_transition_changes_nothing() {
     }
     assert_eq!(journal_files(&fixture.dir).len(), 3);
     lease.restore().unwrap();
+}
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn failed_abandon_retains_a_retryable_lease_without_restoration(#[case] drop_after_retry: bool) {
+    let (fixture, lease) = three_resource_lease();
+    let resources = lease.resources().to_vec();
+    fixture.manager.set_journal_fail_removes(true);
+    let failure = lease.abandon().unwrap_err();
+    assert!(matches!(
+        failure.lease.update(&updated_three("8.8.8.8")),
+        Err(Error::LeaseEnding)
+    ));
+    assert!(fixture.manager.apply(&updated_three("8.8.8.8")).is_err());
+    fixture.manager.set_journal_fail_removes(false);
+    if drop_after_retry {
+        drop(failure.lease);
+    } else {
+        failure.lease.abandon().unwrap();
+    }
+    assert!(journal_files(&fixture.dir).is_empty());
+    for resource in resources {
+        assert_eq!(
+            configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
+            vec![ip("1.1.1.1")]
+        );
+    }
+}
+
+#[test]
+fn partial_preparation_failure_cleans_all_unmutated_records() {
+    let fixture = new_multi_fixture("partial-prepare");
+    fixture.manager.set_journal_fail_writes_after(1);
+    assert!(fixture.manager.apply(&updated_three("1.1.1.1")).is_err());
+    assert!(journal_files(&fixture.dir).is_empty());
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
 }

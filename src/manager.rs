@@ -10,15 +10,14 @@ use crate::capability::{Capabilities, OwnershipIdentity};
 use crate::config::{DnsConfig, DnsScope, validate_against};
 use crate::error::{ConflictReason, Error, Result};
 use crate::fault::{CrashSignal, FaultAction, FaultHook, TxPoint};
-use crate::fsutil::ensure_private_dir;
 use crate::interface::InterfaceInfo;
 use crate::journal::{JournalRecord, JournalStore, Phase};
 use crate::lease::{Lease, LiveRecord};
 use crate::normalize::NormalizedConfig;
 use crate::ownership::{ResourceId, ResourceLockManager};
 use crate::platform::{
-    Backend, LegacyJournalRecovery, MutationAttempt, OwnershipProof, PlatformSnapshot,
-    ResourceIdentity, ResourceStatus, VerifiedMutation, select_default_backend,
+    Backend, MutationAttempt, OwnershipProof, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    VerifiedMutation, select_default_backend,
 };
 use crate::reconciliation::Reconciler;
 use crate::watch::SuppressionRegistry;
@@ -65,6 +64,13 @@ pub enum ConflictPolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RecoveryOutcome {
+    /// A different application owner must recover or abandon this record.
+    ForeignOwner {
+        /// Resource still claimed by the journal.
+        resource: ResourceId,
+        /// Application ownership tag, not an OS authorization identity.
+        owner: String,
+    },
     /// The recorded transaction was still in effect; the original state was
     /// restored and verified, and the journal record was removed.
     Restored {
@@ -128,6 +134,20 @@ pub enum RecoveryOutcome {
     },
 }
 
+/// Operational state of a manager's internal Enforce observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObservationHealth {
+    /// No active lease currently needs internal observation.
+    Idle,
+    /// Native subscriptions are operational.
+    Operational,
+    /// Observation was interrupted; scheduled resubscription and rescans continue.
+    Degraded {
+        /// Most recent subscription failure, when available.
+        detail: String,
+    },
+}
+
 pub(crate) struct Inner {
     pub(crate) owner: String,
     pub(crate) backend: Arc<dyn Backend>,
@@ -154,6 +174,13 @@ pub(crate) struct EnforceState {
     handle: Option<WatchHandle>,
     feed: Option<crate::reconciliation::ReconcileFeed>,
     parked: bool,
+    recovery: Option<WatchRecovery>,
+}
+
+struct WatchRecovery {
+    next_retry: std::time::Instant,
+    failures: u32,
+    error: String,
 }
 
 impl std::fmt::Debug for EnforceState {
@@ -220,6 +247,53 @@ impl Inner {
             enforce.handle = None;
             enforce.feed = None;
             enforce.parked = false;
+            enforce.recovery = None;
+        }
+    }
+
+    pub(crate) fn refresh_enforce_watch(&self) {
+        let mut enforce = self.enforce.lock();
+        if enforce.refs == 0
+            || enforce.parked
+            || enforce.handle.as_ref().is_some_and(WatchHandle::is_active)
+        {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if enforce
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| now < recovery.next_retry)
+        {
+            return;
+        }
+        enforce.handle = None;
+        let Some(feed) = enforce.feed.clone() else {
+            return;
+        };
+        let callback_feed = feed.clone();
+        let callback: WatchCallback =
+            Arc::new(move |event| callback_feed.notify(event.resource().clone()));
+        match self.backend.start_watch(callback) {
+            Ok(handle) => {
+                enforce.handle = Some(handle);
+                enforce.recovery = None;
+            }
+            Err(error) => {
+                let failures = enforce
+                    .recovery
+                    .as_ref()
+                    .map_or(1, |recovery| recovery.failures.saturating_add(1));
+                enforce.recovery = Some(WatchRecovery {
+                    next_retry: now + Duration::from_secs(1 << failures.saturating_sub(1).min(5)),
+                    failures,
+                    error: error.to_string(),
+                });
+            }
+        }
+        drop(enforce);
+        for resource in self.active.lock().keys() {
+            feed.notify(resource.clone());
         }
     }
 
@@ -331,6 +405,17 @@ enum RecoverBlock {
     Conflict(String),
 }
 
+fn transaction_error(primary: Error, cleanup: Vec<Error>) -> Error {
+    if cleanup.is_empty() {
+        primary
+    } else {
+        Error::TransactionFailed {
+            primary: Box::new(primary),
+            cleanup,
+        }
+    }
+}
+
 impl Inner {
     pub(crate) fn fire(&self, point: TxPoint) -> Result<()> {
         let hook = self.hook.lock().clone();
@@ -368,9 +453,6 @@ impl Inner {
         let resource = &identity.resource;
         residue.leftover = None;
         residue.restored = None;
-        if points.suppress_events {
-            self.suppressions.suppress(resource);
-        }
         match self.apply_attempt(identity, expected_current, plan) {
             MutationAttempt::Rejected { error } => Err(error),
             MutationAttempt::Indeterminate { error, produced } => {
@@ -476,15 +558,23 @@ impl Inner {
                                         },
                                     );
                                 }
+                                if points.suppress_events {
+                                    self.suppressions.record(&produced);
+                                }
                                 Ok(VerifiedMutation {
                                     proof: Some(OwnershipProof::issued(produced)),
                                     observed: actual,
                                 })
                             }
-                            OwnershipIdentity::BestEffort => Ok(VerifiedMutation {
-                                proof: produced.map(OwnershipProof::issued),
-                                observed: actual,
-                            }),
+                            OwnershipIdentity::BestEffort => {
+                                if points.suppress_events {
+                                    self.suppressions.record(&actual);
+                                }
+                                Ok(VerifiedMutation {
+                                    proof: produced.map(OwnershipProof::issued),
+                                    observed: actual,
+                                })
+                            }
                         }
                     }
                     Err(error) => fail(self, residue, produced, error),
@@ -547,7 +637,10 @@ impl Inner {
             }
         };
         match self.backend.readback(resource) {
-            Ok(now) if self.backend.equivalent(&now, target) => Some(produced),
+            Ok(now) if self.backend.equivalent(&now, target) => {
+                self.suppressions.record(&now);
+                Some(produced)
+            }
             Ok(_) => None,
             Err(error) => {
                 osdns_warn!(
@@ -558,6 +651,24 @@ impl Inner {
                 None
             }
         }
+    }
+
+    fn persist_unmutated(&self, records: &[JournalRecord]) -> Result<()> {
+        for (index, record) in records.iter().enumerate() {
+            if let Err(primary) = self.journal.write(record) {
+                // Failed publication may already be visible, but no native mutation has begun.
+                let cleanup = records[..=index]
+                    .iter()
+                    .filter_map(|record| {
+                        self.journal
+                            .remove(&record.lease_id, &record.resource)
+                            .err()
+                    })
+                    .collect();
+                return Err(transaction_error(primary, cleanup));
+            }
+        }
+        Ok(())
     }
 
     /// Runs one apply transaction over already-locked resources.
@@ -597,9 +708,7 @@ impl Inner {
                     applied: Some(before),
                 })
                 .collect();
-            for record in &records {
-                self.journal.write(record)?;
-            }
+            self.persist_unmutated(&records)?;
             self.fire(TxPoint::AfterApplied)?;
             let n = records.len();
             return Ok(PreparedLease {
@@ -625,9 +734,7 @@ impl Inner {
                 applied: None,
             })
             .collect();
-        for record in &records {
-            self.journal.write(record)?;
-        }
+        self.persist_unmutated(&records)?;
         self.fire(TxPoint::AfterPrepared)?;
         let mut mutations: Vec<VerifiedMutation> = Vec::new();
         for index in 0..records.len() {
@@ -643,6 +750,7 @@ impl Inner {
             ) {
                 Ok(mutation) => mutations.push(mutation),
                 Err(error) => {
+                    let mut cleanup = Vec::new();
                     for (record, mutation) in records[..index].iter().zip(&mutations) {
                         if self
                             .rollback_proven(
@@ -653,20 +761,49 @@ impl Inner {
                             )
                             .is_some()
                         {
-                            let _ = self.journal.remove(&record.lease_id, &record.resource);
+                            if let Err(error) =
+                                self.journal.remove(&record.lease_id, &record.resource)
+                            {
+                                cleanup.push(error);
+                            }
+                        } else {
+                            cleanup.push(Error::IndeterminateMutation {
+                                backend: self.backend.kind(),
+                                message: format!(
+                                    "apply rollback could not restore {}",
+                                    record.resource
+                                ),
+                            });
+                            let mut retained = record.clone();
+                            retained.phase = Phase::Applied;
+                            retained.applied = Some(mutation.persist());
+                            if let Err(error) = self.journal.write(&retained) {
+                                cleanup.push(error);
+                            }
                         }
                     }
                     let failed = &records[index];
                     if residue.leftover.is_none()
                         && let Ok(now) = self.backend.readback(&failed.resource)
                         && self.backend.equivalent(&now, &failed.before)
+                        && let Err(error) = self.journal.remove(&failed.lease_id, &failed.resource)
                     {
-                        let _ = self.journal.remove(&failed.lease_id, &failed.resource);
+                        cleanup.push(error);
+                    }
+                    if let Some(proof) = &residue.leftover {
+                        let mut retained = failed.clone();
+                        retained.applied = Some(proof.as_snapshot().clone());
+                        if let Err(error) = self.journal.write(&retained) {
+                            cleanup.push(error);
+                        }
                     }
                     for record in &records[index + 1..] {
-                        let _ = self.journal.remove(&record.lease_id, &record.resource);
+                        if let Err(error) = self.journal.remove(&record.lease_id, &record.resource)
+                        {
+                            cleanup.push(error);
+                        }
                     }
-                    return Err(error);
+                    return Err(transaction_error(error, cleanup));
                 }
             }
         }
@@ -675,7 +812,9 @@ impl Inner {
         for (index, record) in records.iter_mut().enumerate() {
             record.phase = Phase::Applied;
             record.applied = Some(mutations[index].persist());
-            if self.journal.write(record).is_err() {
+            if let Err(_error) = self.journal.write(record) {
+                osdns_warn!(resource = %record.resource, error = %_error,
+                    "verified mutation has only live ownership proof until journal finalization succeeds");
                 verified[index] = mutations[index]
                     .proof
                     .clone()
@@ -758,12 +897,14 @@ impl Inner {
                 // Restore any already-prepared journals to their old form so
                 // the lease is never left half-prepared on a write failure.
                 drop(guard);
+                let mut cleanup = Vec::new();
                 for (old, live_record) in olds.iter().zip(live.iter()) {
                     let mut guard = live_record.lock();
-                    guard.record = old.clone();
-                    let _ = self.journal.write(&guard.record);
+                    if let Err(error) = self.persist_live(&mut guard, old.clone()) {
+                        cleanup.push(error);
+                    }
                 }
-                return Err(error);
+                return Err(transaction_error(error, cleanup));
             }
         }
         self.fire(TxPoint::AfterUpdatePrepared)?;
@@ -784,18 +925,29 @@ impl Inner {
             ) {
                 Ok(mutation) => mutations[index] = Some(mutation),
                 Err(error) => {
+                    let mut cleanup = Vec::new();
                     let mut restored_identity: Vec<Option<PlatformSnapshot>> =
                         vec![None; live.len()];
                     for rollback_index in 0..index {
-                        if let Some(mutation) = &mutations[rollback_index]
-                            && let Some(Some(identity)) = self.rollback_proven(
+                        if let Some(mutation) = &mutations[rollback_index] {
+                            match self.rollback_proven(
                                 &olds[rollback_index].resource,
                                 &olds[rollback_index].identity,
                                 Some(&mutation.persist()),
                                 Some(&applieds[rollback_index]),
-                            )
-                        {
-                            restored_identity[rollback_index] = Some(identity);
+                            ) {
+                                Some(identity) => restored_identity[rollback_index] = identity,
+                                None => {
+                                    cleanup.push(Error::IndeterminateMutation {
+                                        backend: self.backend.kind(),
+                                        message: format!(
+                                            "update rollback could not restore {}",
+                                            olds[rollback_index].resource
+                                        ),
+                                    });
+                                    restored_identity[rollback_index] = Some(mutation.persist());
+                                }
+                            }
                         }
                     }
                     self.fire(TxPoint::AfterUpdateVerify).ok();
@@ -805,22 +957,29 @@ impl Inner {
                         if old_index == index && residue.leftover.is_some() {
                             guard.verified = residue.leftover.take();
                             guard.record.phase = Phase::Prepared;
-                            guard.record.applied = None;
-                            let _ = self.journal.write(&guard.record);
+                            guard.record.applied = guard
+                                .verified
+                                .as_ref()
+                                .map(|proof| proof.as_snapshot().clone());
+                            guard.record.desired = old.desired.clone();
+                            if let Err(error) = self.journal.write(&guard.record) {
+                                cleanup.push(error);
+                            }
                         } else {
-                            guard.record = old.clone();
+                            let mut candidate = old.clone();
                             if old_index == index {
                                 if let Some(identity) = residue.restored.take() {
-                                    guard.record.applied = Some(identity);
+                                    candidate.applied = Some(identity);
                                 }
                             } else if let Some(identity) = restored_identity[old_index].take() {
-                                guard.record.applied = Some(identity);
+                                candidate.applied = Some(identity);
                             }
-                            guard.verified = None;
-                            let _ = self.journal.write(&guard.record);
+                            if let Err(error) = self.persist_live(&mut guard, candidate) {
+                                cleanup.push(error);
+                            }
                         }
                     }
-                    return Err(error);
+                    return Err(transaction_error(error, cleanup));
                 }
             }
         }
@@ -828,21 +987,13 @@ impl Inner {
         for (index, record) in live.iter().enumerate() {
             let mut guard = record.lock();
             let mutation = mutations[index].as_ref().expect("mutation succeeded");
-            let persisted = mutation.persist();
-            guard.record.phase = Phase::Applied;
-            guard.record.applied = Some(persisted.clone());
-            if let Err(error) = self.journal.write(&guard.record) {
-                guard.verified = mutation
-                    .proof
-                    .clone()
-                    .or(Some(OwnershipProof::issued(persisted)));
-                guard.record.applied = None;
-                guard.record.phase = Phase::Prepared;
-                if write_error.is_none() {
-                    write_error = Some(error);
-                }
-            } else {
-                guard.verified = None;
+            let mut candidate = guard.record.clone();
+            candidate.phase = Phase::Applied;
+            candidate.applied = Some(mutation.persist());
+            if let Err(error) = self.persist_live(&mut guard, candidate)
+                && write_error.is_none()
+            {
+                write_error = Some(error);
             }
         }
         if let Some(error) = write_error {
@@ -850,6 +1001,22 @@ impl Inner {
         }
         self.fire(TxPoint::AfterUpdateApplied)?;
         Ok(())
+    }
+
+    fn persist_live(&self, live: &mut LiveRecord, mut candidate: JournalRecord) -> Result<()> {
+        match self.journal.write(&candidate) {
+            Ok(()) => {
+                live.record = candidate;
+                live.verified = None;
+                Ok(())
+            }
+            Err(error) => {
+                live.verified = candidate.applied.take().map(OwnershipProof::issued);
+                candidate.phase = Phase::Prepared;
+                live.record = candidate;
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn finalize_live(
@@ -882,17 +1049,18 @@ impl Inner {
                 detail: "the retained mutation proof no longer names the current state".to_string(),
             });
         }
-        live.record.applied = Some(proof.into_snapshot());
-        live.record.phase = Phase::Applied;
-        self.journal.write(&live.record)?;
-        live.verified = None;
+        let mut candidate = live.record.clone();
+        candidate.applied = Some(proof.into_snapshot());
+        candidate.phase = Phase::Applied;
+        self.persist_live(live, candidate)?;
         Ok(())
     }
 
     /// Restores one live-lease resource to its `before` snapshot, failing
     /// with [`Error::ExternalModification`] when the current state is no
     /// longer the verified applied state.
-    pub(crate) fn restore_lease_state(&self, record: &JournalRecord) -> Result<()> {
+    pub(crate) fn restore_live_state(&self, live: &mut LiveRecord) -> Result<()> {
+        let record = &live.record;
         let resource = &record.resource;
         match self.backend.resource_status(&record.identity)? {
             ResourceStatus::Gone | ResourceStatus::Replaced => {
@@ -908,7 +1076,6 @@ impl Inner {
             }
             ResourceStatus::Same => {}
         }
-        self.suppressions.suppress(resource);
         let current = match self.backend.readback(resource) {
             Ok(current) => current,
             Err(Error::ResourceGone { .. }) => {
@@ -923,6 +1090,9 @@ impl Inner {
             self.fire(TxPoint::AfterRestoreJournal)?;
             return Ok(());
         }
+        self.finalize_live(live, Some(&current))?;
+        let record = &live.record;
+        let resource = &record.resource;
         let applied = record.applied.as_ref().ok_or_else(|| Error::ExternalModification {
             resource: resource.clone(),
             detail: "the lease record carries no verified applied state; refusing to overwrite indeterminate state"
@@ -944,21 +1114,10 @@ impl Inner {
                 detail: "the restored state failed read-back verification".to_string(),
             });
         }
+        self.suppressions.record(&now);
         self.journal.remove(&record.lease_id, resource)?;
         self.fire(TxPoint::AfterRestoreJournal)?;
         Ok(())
-    }
-
-    #[allow(unused_variables)]
-    pub(crate) fn best_effort_restore(&self, record: &JournalRecord) {
-        if let Err(error) = self.restore_lease_state(record) {
-            osdns_warn!(
-                owner = %self.owner,
-                resource = %record.resource,
-                error = %error,
-                "best-effort restore on lease drop failed; the journal record was kept for later recovery"
-            );
-        }
     }
 
     /// Crash recovery for one journal record. Only verified state is acted
@@ -1004,24 +1163,6 @@ impl Inner {
             Err(error) => return Err(error),
         };
         self.fire(TxPoint::AfterRecoveryReadback)?;
-        match self.backend.legacy_recovery(&record.before, &current) {
-            LegacyJournalRecovery::Clear => {
-                self.journal.remove(&record.lease_id, &resource)?;
-                self.fire(TxPoint::AfterRecoveryJournal)?;
-                return Ok(RecoveryOutcome::JournalCleared {
-                    resource,
-                    lease_id: record.lease_id,
-                });
-            }
-            LegacyJournalRecovery::Unresolved(detail) => {
-                return Ok(RecoveryOutcome::Failed {
-                    resource,
-                    lease_id: record.lease_id,
-                    detail: detail.to_string(),
-                });
-            }
-            LegacyJournalRecovery::NotLegacy => {}
-        }
         if self.backend.equivalent(&current, &record.before) {
             self.journal.remove(&record.lease_id, &resource)?;
             self.fire(TxPoint::AfterRecoveryJournal)?;
@@ -1035,7 +1176,6 @@ impl Inner {
             .as_ref()
             .is_some_and(|applied| self.backend.owns_current(applied, &current));
         if owned {
-            self.suppressions.suppress(&resource);
             let applied = record.applied.as_ref().expect("applied snapshot");
             if let Err(error) =
                 self.restore_if_current(&resource, &record.identity, applied, &record.before)
@@ -1057,6 +1197,7 @@ impl Inner {
                         .to_string(),
                 });
             }
+            self.suppressions.record(&now);
             self.journal.remove(&record.lease_id, &resource)?;
             self.fire(TxPoint::AfterRecoveryJournal)?;
             return Ok(RecoveryOutcome::Restored {
@@ -1070,13 +1211,18 @@ impl Inner {
         })
     }
 
-    fn recover_for_resource(&self, resource: &ResourceId) -> std::result::Result<(), RecoverBlock> {
-        let records = self
-            .journal
-            .records_for(resource)
-            .map_err(RecoverBlock::Journal)?;
+    fn recover_for_resource(
+        &self,
+        records: Vec<JournalRecord>,
+    ) -> std::result::Result<(), RecoverBlock> {
         let mut conflict = None;
         for record in records {
+            if record.owner != self.owner {
+                return Err(RecoverBlock::Conflict(format!(
+                    "journal belongs to application owner {}",
+                    record.owner
+                )));
+            }
             match self.recover_record(record) {
                 Ok(RecoveryOutcome::ExternalConflict { .. }) => {
                     conflict = Some(
@@ -1114,6 +1260,13 @@ impl Inner {
         for record in records {
             let resource = record.resource.clone();
             let lease_id = record.lease_id;
+            if record.owner != self.owner {
+                outcomes.push(RecoveryOutcome::ForeignOwner {
+                    resource,
+                    owner: record.owner,
+                });
+                continue;
+            }
             match self.locks.try_acquire(&resource) {
                 Ok(Some(lock)) => {
                     let outcome = self.recover_record(record).unwrap_or_else(|error| {
@@ -1143,6 +1296,14 @@ impl Inner {
     pub(crate) fn abandon_journal(&self, resource: &ResourceId) -> Result<()> {
         let lock = self.locks.acquire(resource)?;
         let records = self.journal.records_for(resource)?;
+        if records.iter().any(|record| record.owner != self.owner) {
+            return Err(Error::Conflict {
+                resource: resource.clone(),
+                reason: ConflictReason::ResourceOccupied {
+                    detail: "journal belongs to another application owner".to_string(),
+                },
+            });
+        }
         let mut result = Ok(());
         for record in records {
             if let Err(error) = self.journal.remove(&record.lease_id, resource) {
@@ -1218,6 +1379,28 @@ impl DnsManager {
     /// The configured conflict policy.
     pub fn conflict_policy(&self) -> ConflictPolicy {
         self.inner.conflict_policy
+    }
+
+    /// Inspects internal Enforce observation without reading or mutating DNS.
+    pub fn observation_health(&self) -> ObservationHealth {
+        let enforce = self.inner.enforce.lock();
+        if enforce.refs == 0 {
+            ObservationHealth::Idle
+        } else if enforce.handle.as_ref().is_some_and(WatchHandle::is_active) {
+            ObservationHealth::Operational
+        } else {
+            ObservationHealth::Degraded {
+                detail: enforce.recovery.as_ref().map_or_else(
+                    || "native observation stopped".to_string(),
+                    |recovery| recovery.error.clone(),
+                ),
+            }
+        }
+    }
+
+    /// Active resources awaiting an authoritative Enforce pass.
+    pub fn pending_reconciliation(&self) -> Vec<ResourceId> {
+        self.inner.reconciler.pending_resources()
     }
 
     /// What the active backend can actually guarantee.
@@ -1328,8 +1511,18 @@ impl DnsManager {
         self.inner.fire(TxPoint::AfterResolve)?;
         let locks = self.inner.locks.acquire_all(&resources)?;
         self.inner.fire(TxPoint::AfterLock)?;
+        let mut journals = self.inner.journal.records()?;
         for resource in &resources {
-            match self.inner.recover_for_resource(resource) {
+            let mut selected = Vec::new();
+            let mut index = 0;
+            while index < journals.len() {
+                if &journals[index].resource == resource {
+                    selected.push(journals.swap_remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            match self.inner.recover_for_resource(selected) {
                 Ok(()) => {}
                 Err(RecoverBlock::Journal(error)) => return Err(error),
                 Err(RecoverBlock::Conflict(detail)) => {
@@ -1369,8 +1562,10 @@ impl DnsManager {
                     was_noop,
                 );
                 if let Err(error) = self.inner.ensure_enforce_watch() {
-                    let _ = lease.restore();
-                    return Err(error);
+                    return Err(match lease.restore() {
+                        Ok(()) => error,
+                        Err(failure) => transaction_error(error, vec![failure.error]),
+                    });
                 }
                 self.inner.rescan_enforce();
                 Ok(lease)
@@ -1387,14 +1582,11 @@ impl DnsManager {
     /// required for [`ConflictPolicy::Enforce`] to work; Enforce keeps its
     /// own internal observation alive while leases are active.
     ///
-    /// Under [`ConflictPolicy::Enforce`] every event observed here is also
-    /// fed to the shared reconciliation worker *before* suppression: the
-    /// worker reads the authoritative state, treats events matching our
-    /// applied overlay as no-ops (state-aware suppression), and
-    /// rebases/reapplies on genuine external changes. Events deferred by the
-    /// worker's scheduler are pending, never dropped. When internal Enforce
-    /// observation is already running, this reuses its worker instead of
-    /// spawning a duplicate.
+    /// Suppression compares authoritative state with this manager's completed
+    /// mutation snapshot on the coalescing worker. External changes remain visible
+    /// even immediately after a mutation. Native delivery can be incomplete;
+    /// check [`WatchHandle::is_active`] and resubscribe after interruption.
+    /// Enforce manages its own resubscription and authoritative rescan.
     ///
     /// The callback must only publish or coalesce events; it must never
     /// perform expensive or mutating work. The returned [`WatchHandle`]
@@ -1402,33 +1594,29 @@ impl DnsManager {
     /// dropped; dropping it never disables Enforce while an active lease
     /// still requires it.
     pub fn watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
-        let feed = if self.inner.conflict_policy == ConflictPolicy::Enforce {
-            match self.inner.enforce_feed() {
-                Some(existing) => Some(existing),
-                None => Some(crate::reconciliation::spawn_reconciler(self.inner.clone())?),
-            }
-        } else {
-            None
-        };
-        let coalescer =
-            crate::watch::spawn_coalescer(self.inner.backend.kind(), callback, COALESCE_WINDOW)?;
-        let coalesced = coalescer.callback();
-        let suppressions = Arc::clone(&self.inner.suppressions);
-        let filtered: WatchCallback = Arc::new(move |event| {
-            if let Some(feed) = &feed {
-                feed.notify(event.resource().clone());
-            }
-            if suppressions.is_suppressed(event.resource()) {
+        let inner = Arc::clone(&self.inner);
+        let verified: WatchCallback = Arc::new(move |event| {
+            if matches!(event, crate::watch::DnsEvent::ResourceChanged { .. })
+                && let Some(ours) = inner.suppressions.snapshot(event.resource())
+                && let Ok(current) = inner.backend.readback(event.resource())
+                && inner.backend.owns_current(&ours, &current)
+            {
                 return;
             }
-            coalesced(event);
+            callback(event);
         });
-        let native = self.inner.backend.start_watch(filtered)?;
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        Ok(WatchHandle::new(flag, move || {
+        let coalescer =
+            crate::watch::spawn_coalescer(self.inner.backend.kind(), verified, COALESCE_WINDOW)?;
+        let coalesced = coalescer.callback();
+        let native = self.inner.backend.start_watch(coalesced)?;
+        let flag = native.flag();
+        let delivery = Arc::clone(&coalescer.flag);
+        let mut handle = WatchHandle::new(flag, move || {
             native.stop();
             coalescer.stop();
-        }))
+        });
+        handle.delivery = Some(delivery);
+        Ok(handle)
     }
     /// Flushes the OS DNS cache, when the backend supports it.
     ///
@@ -1489,6 +1677,12 @@ impl DnsManager {
     #[cfg(feature = "test-util")]
     pub fn set_journal_fail_writes_after(&self, skip: u32) {
         self.inner.journal.set_fail_writes_after(skip);
+    }
+
+    /// Injects failures after journal publication or removal took effect (testing only).
+    #[cfg(feature = "test-util")]
+    pub fn set_journal_fail_after_io(&self, fail: bool) {
+        self.inner.journal.set_fail_after_io(fail);
     }
 
     /// Toggles injected journal removal failures (testing only).
@@ -1651,10 +1845,9 @@ impl DnsManagerBuilder {
     /// Builds the manager.
     ///
     /// Fails with [`Error::UnsupportedPlatform`] on targets that have no OS
-    /// DNS backend, with [`Error::RequiresPrivilege`] when the state
-    /// directory cannot be created or secured, and with
-    /// [`Error::BackendUnavailable`] when this host has no usable platform
-    /// backend.
+    /// DNS backend or [`Error::BackendUnavailable`] when this host has no usable
+    /// backend. State and lock directories are opened lazily by writable operations;
+    /// capabilities, interfaces and snapshots do not initialize writable storage.
     pub fn build(self) -> Result<DnsManager> {
         let owner = self
             .owner
@@ -1676,7 +1869,6 @@ impl DnsManagerBuilder {
             Some(dir) => dir,
             None => default_state_dir()?,
         };
-        ensure_private_dir(&state_dir)?;
         // Locks are globally authoritative per OS resource, independent of
         // journal storage: a custom state_dir must never create a private
         // ownership universe. The directory is created lazily on first
@@ -1684,7 +1876,7 @@ impl DnsManagerBuilder {
         // privileges.
         let global_lock_dir = global_lock_root()?.join("locks");
         let locks = ResourceLockManager::new(global_lock_dir, self.lock_timeout);
-        let journal = JournalStore::open(state_dir.join("journal"))?;
+        let journal = JournalStore::new(state_dir.join("journal"));
         Ok(DnsManager::from_inner(Arc::new(Inner {
             owner,
             backend,
@@ -1707,7 +1899,7 @@ impl Default for DnsManagerBuilder {
     }
 }
 
-fn validate_owner(owner: &str) -> Result<()> {
+pub(crate) fn validate_owner(owner: &str) -> Result<()> {
     if owner.is_empty() || owner.len() > 255 {
         return Err(Error::invalid_config(
             "owner identifier must be 1-255 characters",

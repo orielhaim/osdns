@@ -726,6 +726,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -773,22 +774,27 @@ dependencies = [
 
 [[package]]
 name = "osdns"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "atomic-write-file",
  "core-foundation",
  "core-foundation-sys",
  "idna",
  "inotify",
+ "libc",
  "netlink-packet-core",
  "netlink-packet-route",
  "netlink-sys",
+ "nix",
  "notify",
  "parking_lot",
+ "private-fs",
  "resolv-conf",
+ "rustix",
  "serde",
  "serde_json",
  "system-configuration",
+ "tempfile",
  "thiserror",
  "uuid",
  "windows-link 0.100.0",
@@ -872,6 +878,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "private-fs"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "216836ac7881f1a6a3ef0a0d92e9e8892c8f5b4070c338b0a408ab996ba219ef"
+dependencies = [
+ "getrandom",
+ "libc",
+ "rustix",
+ "thiserror",
+ "windows-link 0.100.0",
 ]
 
 [[package]]

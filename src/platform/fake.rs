@@ -135,6 +135,8 @@ impl From<&DnsConfig> for FakeState {
 /// Which backend operation to fail when injecting faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FakeOp {
+    /// Starting native observation.
+    Watch,
     /// Fail resource-incarnation validation.
     Identity,
     /// Fail capture.
@@ -206,6 +208,11 @@ struct WatchStartBlock {
 }
 
 impl FakeBackend {
+    pub(crate) fn fail_watches(&self) {
+        for (flag, _) in self.watchers.lock().iter() {
+            flag.store(true, Ordering::Release);
+        }
+    }
     pub(crate) fn new() -> Self {
         Self::with_capabilities(
             Capabilities::new(BackendKind::Fake)
@@ -1046,6 +1053,7 @@ impl Backend for FakeBackend {
     }
 
     fn start_watch(&self, callback: WatchCallback) -> Result<WatchHandle> {
+        self.check_failure(FakeOp::Watch)?;
         if !self.caps.watch {
             return Err(Error::unsupported(
                 BackendKind::Fake,

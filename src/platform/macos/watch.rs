@@ -64,6 +64,7 @@ pub(crate) fn start_store_watch(
     let watch = thread::Builder::new()
         .name("osdns-sc-watch".to_string())
         .spawn(move || {
+            let _lifetime = crate::watch::WatchWorker(Arc::clone(&thread_flag));
             let state = WatchState { callback };
             let context = SCDynamicStoreCallBackContext {
                 callout: sc_callout,
@@ -168,13 +169,37 @@ pub(crate) fn start_resolver_watch(
     use notify::Watcher;
 
     let handler_flag = flag.clone();
+    let delivery = Arc::new(Mutex::new(()));
+    let handler_delivery = Arc::clone(&delivery);
+    let handler_lifetime = crate::watch::WatchWorker(Arc::clone(&flag));
     let handler_callback = callback;
     let mut watcher = notify::recommended_watcher(
         move |event: std::result::Result<notify::Event, notify::Error>| {
+            let _lifetime = &handler_lifetime;
+            let _delivery = handler_delivery.lock();
             if handler_flag.load(Ordering::Acquire) {
                 return;
             }
-            let Ok(event) = event else { return };
+            let Ok(event) = event else {
+                handler_flag.store(true, Ordering::Release);
+                return;
+            };
+            let directory_changed = event.paths.iter().any(|path| {
+                path == std::path::Path::new("/private/etc/resolver")
+                    || path == std::path::Path::new(RESOLVER_DIR)
+            });
+            if event.need_rescan()
+                || (directory_changed
+                    && matches!(
+                        event.kind,
+                        notify::EventKind::Create(_)
+                            | notify::EventKind::Remove(_)
+                            | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                    ))
+            {
+                handler_flag.store(true, Ordering::Release);
+                return;
+            }
             for path in event.paths {
                 let Some(resource) = resolver_resource_from_path(&path) else {
                     continue;
@@ -210,6 +235,7 @@ pub(crate) fn start_resolver_watch(
     Ok(Box::new(move || {
         flag.store(true, Ordering::Release);
         drop(watcher);
+        let _delivery = delivery.lock();
     }))
 }
 #[cfg(test)]

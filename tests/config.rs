@@ -209,3 +209,23 @@ fn builder_rejects_bad_owner() {
         .unwrap_err();
     assert!(matches!(err, Error::InvalidConfig(_)));
 }
+
+#[cfg(windows)]
+#[test]
+fn native_read_only_manager_does_not_initialize_state_storage() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("uncreated-state");
+    let manager = DnsManager::builder()
+        .owner("io.osdns.read-only")
+        .state_dir(&state)
+        .build()
+        .unwrap();
+    assert!(manager.capabilities().unwrap().read);
+    let interface = manager.interfaces().unwrap().remove(0);
+    let _ = manager
+        .snapshot(&DnsScope::Interface(InterfaceSelector::Name(
+            interface.name,
+        )))
+        .unwrap();
+    assert!(!state.exists());
+}

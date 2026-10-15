@@ -1,5 +1,3 @@
-use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::fs::File;
 use std::net::IpAddr;
 use std::os::unix::fs::MetadataExt;
@@ -10,7 +8,6 @@ use std::thread;
 use serde::{Deserialize, Serialize};
 use zbus::MatchRule;
 use zbus::blocking::Connection;
-use zbus::blocking::MessageIterator;
 use zbus::proxy;
 
 use crate::capability::{BackendKind, Capabilities};
@@ -77,6 +74,23 @@ pub(crate) struct ResolvedSnapshot {
 }
 
 impl ResolvedSnapshot {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self
+            .dns
+            .iter()
+            .any(|(family, address)| !matches!((*family, address.len()), (2, 4) | (10, 16)))
+            || self
+                .domains
+                .iter()
+                .any(|(domain, _)| crate::DnsSuffix::parse(domain).is_err())
+        {
+            return Err(Error::JournalCorrupt(
+                "resolved snapshot contains invalid DNS addresses or domains".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn from_plan(plan: &NormalizedConfig) -> Self {
         Self {
             dns: resolved_dns_from_plan(plan),
@@ -102,10 +116,9 @@ impl ResolvedSnapshot {
 }
 
 pub(crate) struct SystemdResolved {
-    conn: Connection,
+    conn: linux::BusConnection,
     caps: Capabilities,
     mode: Option<String>,
-    live_links: Mutex<HashMap<String, File>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,7 +131,6 @@ pub(crate) struct ResolvedIdentity {
     iflink: Option<u32>,
     address: Option<String>,
     uevent: Option<String>,
-    handle: uuid::Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +146,7 @@ impl ObservationContext {
                 .trim()
                 .parse()
                 .map_err(|error| Error::platform(BackendKind::SystemdResolved, error))?,
-            netns: std::fs::read_link("/proc/self/ns/net")?
+            netns: std::fs::read_link("/proc/thread-self/ns/net")?
                 .to_string_lossy()
                 .into_owned(),
         };
@@ -231,6 +243,26 @@ fn classify_observation_context(
 }
 
 impl SystemdResolved {
+    fn link_identity(resource: &ResourceId) -> Result<ResourceIdentity> {
+        let ifindex = Self::ifindex_of(resource)?;
+        let context = ObservationContext::current()?;
+        let Some((data, file)) = Self::identity_data(&context, ifindex)? else {
+            return Err(Error::ResourceGone {
+                backend: BackendKind::SystemdResolved,
+                resource: resource.clone(),
+                message: "the kernel link is absent".to_string(),
+            });
+        };
+        data.validate(resource)?;
+        let mut identity = ResourceIdentity::new(
+            BackendKind::SystemdResolved,
+            resource.clone(),
+            IdentityData::SystemdResolved(data),
+        );
+        identity.live_handle = Some(Arc::new(file));
+        Ok(identity)
+    }
+
     pub(crate) fn connect() -> Result<Self> {
         let conn = Connection::system().map_err(|e| {
             Error::BackendUnavailable(format!("cannot connect to the system D-Bus: {e}"))
@@ -241,9 +273,8 @@ impl SystemdResolved {
         let mode = manager.resolv_conf_mode().ok();
         Ok(Self {
             caps: capabilities(),
-            conn,
+            conn: linux::BusConnection::new(conn),
             mode,
-            live_links: Mutex::new(HashMap::new()),
         })
     }
 
@@ -252,7 +283,7 @@ impl SystemdResolved {
     }
 
     fn manager(&self) -> Result<Resolve1ManagerProxyBlocking<'_>> {
-        Resolve1ManagerProxyBlocking::builder(&self.conn)
+        Resolve1ManagerProxyBlocking::builder(&self.conn.get().map_err(dbus_error)?)
             .build()
             .map_err(dbus_error)
     }
@@ -262,7 +293,7 @@ impl SystemdResolved {
             .manager()?
             .get_link(ifindex as i32)
             .map_err(|e| dbus_resource_error(resource, e))?;
-        let link = Resolve1LinkProxyBlocking::builder(&self.conn)
+        let link = Resolve1LinkProxyBlocking::builder(&self.conn.get().map_err(dbus_error)?)
             .path(link)
             .map_err(dbus_error)?
             .build()
@@ -319,7 +350,6 @@ impl SystemdResolved {
     fn identity_data(
         context: &ObservationContext,
         ifindex: u32,
-        handle: uuid::Uuid,
     ) -> Result<Option<(ResolvedIdentity, File)>> {
         let entry = std::fs::read_dir("/sys/class/net")?
             .filter_map(std::result::Result::ok)
@@ -348,7 +378,6 @@ impl SystemdResolved {
                 iflink: read("iflink").and_then(|value| value.parse().ok()),
                 address: read("address"),
                 uevent: read("uevent"),
-                handle,
             },
             file,
         )))
@@ -423,25 +452,8 @@ impl Backend for SystemdResolved {
     }
 
     fn identify(&self, resource: &ResourceId) -> Result<ResourceIdentity> {
-        let ifindex = Self::ifindex_of(resource)?;
-        let handle = uuid::Uuid::new_v4();
-        let context = ObservationContext::current()?;
-        let Some((data, file)) = Self::identity_data(&context, ifindex, handle)? else {
-            return Err(Error::ResourceGone {
-                backend: BackendKind::SystemdResolved,
-                resource: resource.clone(),
-                message: "the kernel link is absent".to_string(),
-            });
-        };
-        data.validate(resource)?;
-        self.live_links
-            .lock()
-            .insert(handle.simple().to_string(), file);
-        Ok(ResourceIdentity::new(
-            BackendKind::SystemdResolved,
-            resource.clone(),
-            IdentityData::SystemdResolved(data),
-        ))
+        self.conn.verify_namespace(RESOLVED_SERVICE, self.kind())?;
+        Self::link_identity(resource)
     }
 
     fn resource_status(&self, identity: &ResourceIdentity) -> Result<ResourceStatus> {
@@ -450,14 +462,11 @@ impl Backend for SystemdResolved {
         if let Some(status) = classify_observation_context(&old, &context) {
             return Ok(status);
         }
-        let current_handle = uuid::Uuid::new_v4();
-        let Some((current, current_file)) =
-            Self::identity_data(&context, old.ifindex, current_handle)?
-        else {
+        self.conn.verify_namespace(RESOLVED_SERVICE, self.kind())?;
+        let Some((current, current_file)) = Self::identity_data(&context, old.ifindex)? else {
             return Ok(ResourceStatus::Gone);
         };
-        let handles = self.live_links.lock();
-        let live_inodes = if let Some(original) = handles.get(&old.handle.simple().to_string()) {
+        let live_inodes = if let Some(original) = &identity.live_handle {
             Some((original.metadata()?.ino(), current_file.metadata()?.ino()))
         } else {
             None
@@ -548,19 +557,26 @@ impl Backend for SystemdResolved {
             .path_namespace(RESOLVED_PATH)
             .expect("valid path")
             .build();
-        let iterator =
-            MessageIterator::for_match_rule(rule, &conn, Some(64)).map_err(dbus_error)?;
+        let iterator = linux::watch_signals(&conn, rule, RESOLVED_SERVICE).map_err(dbus_error)?;
         let flag = Arc::new(AtomicBool::new(false));
         let watch_flag = flag.clone();
         let thread_conn = conn.clone();
         let worker = thread::Builder::new()
             .name("osdns-resolved-watch".to_string())
             .spawn(move || {
+                let _lifetime = crate::watch::WatchWorker(Arc::clone(&watch_flag));
                 for message in iterator {
                     if watch_flag.load(Ordering::Acquire) {
                         break;
                     }
                     let Ok(message) = message else { break };
+                    if message
+                        .header()
+                        .member()
+                        .is_some_and(|member| member.as_str() == "NameOwnerChanged")
+                    {
+                        break;
+                    }
                     let path = match message.header().path() {
                         Some(path) => path.as_str().to_string(),
                         None => continue,
@@ -631,7 +647,6 @@ mod resource_identity_tests {
             iflink: Some(8),
             address: Some("02:00:00:00:00:01".to_string()),
             uevent: Some("INTERFACE=tun0".to_string()),
-            handle: uuid::Uuid::new_v4(),
         }
     }
 
@@ -818,6 +833,29 @@ mod tests {
             let expected = ResolvedSnapshot::from_plan(&plan_with(None));
             assert_eq!(merged.dns, expected.dns);
             assert_eq!(merged.domains, expected.domains);
+        }
+    }
+}
+
+#[cfg(test)]
+mod handle_lifetime_tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn link_handle_belongs_to_identity_not_backend(#[case] retained_clone: bool) {
+        let index = linux::list_interfaces().unwrap()[0].index;
+        let resource = ResourceId::new(format!("linux:resolved:ifindex:{index}")).unwrap();
+        for _ in 0..128 {
+            let identity = SystemdResolved::link_identity(&resource).unwrap();
+            let handle = Arc::downgrade(identity.live_handle.as_ref().unwrap());
+            let clone = retained_clone.then(|| identity.clone());
+            drop(identity);
+            assert_eq!(handle.upgrade().is_some(), retained_clone);
+            drop(clone);
+            assert!(handle.upgrade().is_none());
         }
     }
 }

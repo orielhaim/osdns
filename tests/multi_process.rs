@@ -76,7 +76,7 @@ fn crashed_process_journal_survives_and_recovers() {
 
     let fake = FakeDns::new();
     let manager =
-        manager_for_testing("io.osdns.parent", &dir, &fake, Duration::from_secs(30)).unwrap();
+        manager_for_testing("io.osdns.child", &dir, &fake, Duration::from_secs(30)).unwrap();
     let outcomes = manager.recover_stale().unwrap();
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     assert!(
@@ -101,7 +101,7 @@ fn live_process_excludes_other_processes() {
 
     let fake = FakeDns::new();
     let manager =
-        manager_for_testing("io.osdns.parent", &dir, &fake, Duration::from_millis(300)).unwrap();
+        manager_for_testing("io.osdns.child", &dir, &fake, Duration::from_millis(300)).unwrap();
     let error = manager.apply(&iface_config(1, "8.8.8.8")).unwrap_err();
     assert!(
         matches!(
@@ -135,7 +135,7 @@ fn concurrent_starts_serialize_across_processes() {
 
     let fake = FakeDns::new();
     let manager =
-        manager_for_testing("io.osdns.parent", &dir, &fake, Duration::from_millis(250)).unwrap();
+        manager_for_testing("io.osdns.child", &dir, &fake, Duration::from_millis(250)).unwrap();
     let error = manager.apply(&iface_config(1, "1.1.1.1")).unwrap_err();
     assert!(matches!(
         error,

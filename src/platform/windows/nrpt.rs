@@ -15,7 +15,7 @@ use crate::capability::BackendKind;
 use crate::error::{ConflictReason, Error, Result};
 use crate::ownership::ResourceId;
 use crate::platform::windows::error::{map_error, registry_not_found};
-use crate::platform::windows::ffi::{GUID, create_hklm, open_hklm};
+use crate::platform::windows::ffi::{self, GUID, create_hklm, open_hklm};
 use crate::platform::windows::interface::{guid_from_u128, guid_to_string};
 
 pub(super) const NRPT_BASE: &str =
@@ -51,8 +51,35 @@ fn open_nrpt_base(write: bool) -> windows_registry::Result<Key> {
     open_hklm(NRPT_BASE, write)
 }
 
-fn create_rule_key(key: &str) -> windows_registry::Result<Key> {
-    create_hklm(&format!(r"{NRPT_BASE}\{key}"))
+fn create_rule_key(key: &str) -> Result<(Key, bool)> {
+    let base = create_hklm(NRPT_BASE).map_err(|error| map_error(error, "NRPT open for create"))?;
+    create_child_key(&base, key)
+}
+
+fn create_child_key(base: &Key, key: &str) -> Result<(Key, bool)> {
+    let name: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let mut raw = std::ptr::null_mut();
+    let mut disposition = 0;
+    // SAFETY: base and name are live, outputs are writable; success transfers one HKEY.
+    let status = unsafe {
+        ffi::RegCreateKeyExW(
+            base.as_raw(),
+            name.as_ptr(),
+            0,
+            std::ptr::null(),
+            ffi::REG_OPTION_NON_VOLATILE as u32,
+            (ffi::KEY_READ | ffi::KEY_WRITE | ffi::KEY_WOW64_64KEY) as u32 | 0x0001_0000,
+            std::ptr::null(),
+            &mut raw,
+            &mut disposition,
+        )
+    };
+    super::error::check_status(status, "NRPT create")?;
+    // SAFETY: the successful create call transferred the returned handle.
+    Ok((
+        unsafe { Key::from_raw(raw) },
+        disposition == ffi::REG_CREATED_NEW_KEY as u32,
+    ))
 }
 
 /// Splits routing domains into NRPT-conformant namespace chunks.
@@ -101,17 +128,64 @@ pub(crate) fn rules_from_plan(
 
 pub(crate) fn write_rule(rule: &NrptRule, owner: &str, resource: &ResourceId) -> Result<()> {
     reject_foreign_rule(&rule.key, owner, resource)?;
-    let dnskey = create_rule_key(&rule.key).map_err(|e| map_error(e, "NRPT create"))?;
-    write_rule_values(&dnskey, rule)
+    let (dnskey, created) = create_rule_key(&rule.key)?;
+    let before = if created {
+        None
+    } else {
+        let marker = read_marker(&dnskey, resource)?;
+        verify_marker(&marker, owner, resource)?;
+        Some(read_rule_values(&dnskey, &rule.key, marker)?)
+    };
+    match write_rule_values(&dnskey, rule) {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            let cleanup = match before {
+                Some(before) => write_rule_values(&dnskey, &before),
+                None => delete_created_key(&dnskey),
+            };
+            match cleanup {
+                Ok(()) => Err(primary),
+                Err(error) => Err(Error::TransactionFailed {
+                    primary: Box::new(primary),
+                    cleanup: vec![error],
+                }),
+            }
+        }
+    }
+}
+
+fn delete_created_key(key: &Key) -> Result<()> {
+    windows_link::link!("ntdll.dll" "system" fn NtDeleteKey(key: *mut core::ffi::c_void) -> i32);
+    // SAFETY: this handle refers to the exact newly created object and carries DELETE.
+    let status = unsafe { NtDeleteKey(key.as_raw()) };
+    if status >= 0 {
+        Ok(())
+    } else {
+        Err(Error::platform(
+            BackendKind::WindowsIpHelper,
+            format_args!("NtDeleteKey failed with NTSTATUS {status:#x}"),
+        ))
+    }
 }
 
 fn write_rule_values(dnskey: &Key, rule: &NrptRule) -> Result<()> {
+    write_rule_values_with(dnskey, rule, |_| Ok(()))
+}
+
+fn write_rule_values_with(
+    dnskey: &Key,
+    rule: &NrptRule,
+    mut before_write: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    before_write("Comment")?;
+    dnskey
+        .set_string("Comment", &rule.comment)
+        .map_err(|e| map_error(e, "NRPT set Comment"))?;
+    before_write("Version")?;
     dnskey
         .set_u32("Version", rule.version)
         .map_err(|e| map_error(e, "NRPT set Version"))?;
-    dnskey
-        .set_u32("ConfigOptions", rule.config_options)
-        .map_err(|e| map_error(e, "NRPT set ConfigOptions"))?;
+    before_write("Name")?;
     let namespace_refs: Vec<&str> = rule.namespaces.iter().map(|s| s.as_str()).collect();
     dnskey
         .set_multi_string("Name", &namespace_refs)
@@ -122,15 +196,18 @@ fn write_rule_values(dnskey: &Key, rule: &NrptRule) -> Result<()> {
         .map(|ip| ip.to_string())
         .collect::<Vec<_>>()
         .join(";");
+    before_write("GenericDNSServers")?;
     dnskey
         .set_string("GenericDNSServers", servers)
         .map_err(|e| map_error(e, "NRPT set GenericDNSServers"))?;
+    before_write("DisplayName")?;
     dnskey
         .set_string("DisplayName", &rule.display_name)
         .map_err(|e| map_error(e, "NRPT set DisplayName"))?;
+    before_write("ConfigOptions")?;
     dnskey
-        .set_string("Comment", &rule.comment)
-        .map_err(|e| map_error(e, "NRPT set Comment"))?;
+        .set_u32("ConfigOptions", rule.config_options)
+        .map_err(|e| map_error(e, "NRPT set ConfigOptions"))?;
     Ok(())
 }
 
@@ -249,6 +326,32 @@ fn read_rule_values(rule_key: &Key, key: &str, comment: String) -> Result<NrptRu
     })
 }
 
+pub(crate) fn validate_rule(rule: &NrptRule, owner: &str) -> Result<()> {
+    let valid_namespaces = !rule.namespaces.is_empty()
+        && rule.namespaces.len() <= MAX_NAMESPACES_PER_RULE
+        && rule.namespaces.iter().all(|namespace| {
+            namespace == "."
+                || namespace
+                    .strip_prefix('.')
+                    .and_then(|domain| crate::DnsSuffix::parse(domain).ok())
+                    .is_some_and(|domain| !domain.is_root() && namespace == &format!(".{domain}"))
+        });
+    if !valid_namespaces
+        || rule.key != guid_to_string(&rule_key(owner, &rule.namespaces))
+        || rule.comment != marker_for(owner)
+        || rule.servers.is_empty()
+        || rule.servers.iter().any(|server| server.is_unspecified())
+        || rule.version != 1
+        || rule.config_options != CONFIG_OPTIONS_OVERRIDE
+        || rule.display_name != "osdns"
+    {
+        return Err(Error::JournalCorrupt(
+            "NRPT rule has invalid policy fields or resource binding".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,6 +379,26 @@ mod tests {
             .volatile()
             .open(path)
             .unwrap()
+    }
+
+    #[test]
+    fn newly_created_unmarked_key_cleanup_uses_object_handle() {
+        let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
+        let base = CURRENT_USER.create(&path).unwrap();
+        let (created, is_new) = create_child_key(&base, "original").unwrap();
+        assert!(is_new);
+        let (_, existing) = create_child_key(&base, "original").unwrap();
+        assert!(!existing);
+        base.rename("original", "retained").unwrap();
+        let replacement = base.create("original").unwrap();
+        replacement.set_string("Comment", "foreign").unwrap();
+        delete_created_key(&created).unwrap();
+        drop(created);
+        assert!(registry_not_found(&base.open("retained").unwrap_err()));
+        assert_eq!(replacement.get_string("Comment").unwrap(), "foreign");
+        drop(replacement);
+        drop(base);
+        CURRENT_USER.remove_tree(&path).unwrap();
     }
 
     #[test]
@@ -461,5 +584,41 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[rstest::rstest]
+    #[case("Comment")]
+    #[case("Version")]
+    #[case("Name")]
+    #[case("GenericDNSServers")]
+    #[case("DisplayName")]
+    #[case("ConfigOptions")]
+    fn interrupted_rule_construction_writes_config_options_last(#[case] fail: &str) {
+        let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
+        let key = volatile_key(&path);
+        let rule = rules_from_plan(&plan(&["1.1.1.1"], &["corp.example"]), "io.test").remove(0);
+        let result = write_rule_values_with(&key, &rule, |field| {
+            if field == fail {
+                Err(Error::platform(
+                    BackendKind::WindowsIpHelper,
+                    "injected value failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert!(registry_not_found(
+            &key.get_u32("ConfigOptions").unwrap_err()
+        ));
+        if fail != "Comment" {
+            assert_eq!(key.get_string("Comment").unwrap(), marker_for("io.test"));
+        }
+        write_rule_values(&key, &rule).unwrap();
+        assert_eq!(
+            read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap(),
+            rule
+        );
+        drop(key);
+        CURRENT_USER.remove_tree(&path).unwrap();
     }
 }

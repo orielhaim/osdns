@@ -44,6 +44,70 @@ fn wait_until(predicate: impl Fn() -> bool) {
 }
 
 #[test]
+fn interrupted_observation_resubscribes_and_rescans_missed_changes() {
+    let fixture = enforce_manager("enforce-watch-loss");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.fake.inject_backend_failure(
+        osdns::testing::FakeOp::Watch,
+        1,
+        "subscription unavailable",
+    );
+    fixture.fake.fail_watches();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    wait_until(|| {
+        matches!(
+            fixture.manager.observation_health(),
+            osdns::ObservationHealth::Degraded { .. }
+        )
+    });
+    wait_until(|| {
+        fixture.manager.observation_health() == osdns::ObservationHealth::Operational
+            && fixture.fake.current_state(IFACE1).unwrap() == Some(state_with("1.1.1.1"))
+    });
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[rstest::rstest]
+#[case(osdns::testing::FakeOp::Identity)]
+#[case(osdns::testing::FakeOp::Readback)]
+fn repeated_failures_remain_scheduled_and_recover(#[case] operation: osdns::testing::FakeOp) {
+    let fixture = enforce_manager("enforce-repeated-error");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    fixture
+        .fake
+        .inject_backend_failure(operation, 12, "temporary failure");
+    for _ in 0..12 {
+        assert_eq!(
+            fixture.manager.debug_reconcile(IFACE1).unwrap(),
+            DebugReconcile::Failed
+        );
+        assert!(fixture.manager.debug_reconcile_pending(IFACE1).unwrap());
+    }
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Rebased
+    );
+    assert!(!fixture.manager.debug_reconcile_pending(IFACE1).unwrap());
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+}
+
+#[test]
 fn enforce_rebases_and_reapplies_on_external_change() {
     let fixture = enforce_manager("enforce-rebase");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
@@ -283,7 +347,7 @@ fn rebase_journal_write_failure_defers_and_preserves_external_state() {
     fixture.manager.set_journal_fail_writes(true);
 
     let outcome = fixture.manager.debug_reconcile("fake:interface:1").unwrap();
-    assert_eq!(outcome, DebugReconcile::Deferred);
+    assert_eq!(outcome, DebugReconcile::Failed);
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9")),
@@ -339,7 +403,7 @@ fn failed_rebase_rollback_preserves_external_base(#[case] finalize_live: bool) {
         .inject_backend_failure(FakeOp::Restore, 1, "rollback failed");
     assert_eq!(
         fixture.manager.debug_reconcile(IFACE1).unwrap(),
-        DebugReconcile::Deferred
+        DebugReconcile::Failed
     );
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -434,7 +498,7 @@ fn replacement_during_enforce_reapply_is_not_mutated() {
 
     assert_eq!(
         fixture.manager.debug_reconcile(IFACE1).unwrap(),
-        DebugReconcile::Deferred
+        DebugReconcile::Failed
     );
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -543,7 +607,7 @@ fn prepared_desired_match_from_external_actor_is_not_ours() {
         .inject_backend_failure(osdns::testing::FakeOp::Apply, 2, "rebase apply refused");
     assert_eq!(
         fixture.manager.debug_reconcile(IFACE1).unwrap(),
-        DebugReconcile::Deferred
+        DebugReconcile::Failed
     );
     assert_eq!(journal_record_json(&fixture.dir)["phase"], "Prepared");
     fixture
@@ -572,7 +636,7 @@ fn verified_mutation_finalizes_only_from_retained_proof() {
     fixture.manager.set_journal_fail_writes_after(1);
     assert_eq!(
         fixture.manager.debug_reconcile(IFACE1).unwrap(),
-        DebugReconcile::Deferred
+        DebugReconcile::Failed
     );
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -639,4 +703,30 @@ fn enforce_rescan_sees_change_during_watcher_start() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("9.9.9.9"))
     );
+}
+
+#[test]
+fn failed_teardown_does_not_reintroduce_the_desired_overlay() {
+    let fixture = enforce_manager("enforce-teardown");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.set_journal_fail_removes(true);
+    let failure = lease.restore().unwrap_err();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
+    assert_eq!(
+        fixture.manager.observation_health(),
+        osdns::ObservationHealth::Idle
+    );
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::NotOwned
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
+    fixture.manager.set_journal_fail_removes(false);
+    failure.lease.restore().unwrap();
 }
