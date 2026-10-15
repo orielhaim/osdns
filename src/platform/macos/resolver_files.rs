@@ -135,7 +135,18 @@ impl ResolverDir {
                     "resolver object changed before publication",
                 ));
             }
-            fs::renameat(&self.0, &name, &self.0, domain).map_err(std::io::Error::from)?;
+            if expected.is_none() {
+                fs::renameat_with(&self.0, &name, &self.0, domain, fs::RenameFlags::NOREPLACE)
+                    .map_err(|error| {
+                        if error == rustix::io::Errno::EXIST {
+                            conflict(domain, "resolver appeared before publication")
+                        } else {
+                            std::io::Error::from(error).into()
+                        }
+                    })?;
+            } else {
+                fs::renameat(&self.0, &name, &self.0, domain).map_err(std::io::Error::from)?;
+            }
             self.0.sync_all()?;
             let meta = file.metadata()?;
             Ok(Some(ResolverFile {

@@ -499,13 +499,14 @@ impl Inner {
                 osdns_warn!(
                     resource = %resource,
                     error = %error,
-                    "rebase could not persist the Prepared record; keeping the previous journal state"
+                    "Prepared rebase publication failed; attempting journal rollback"
                 );
                 live.record = old;
                 live.verified = old_verified;
                 if let Err(cleanup) = self.journal.write(&live.record) {
+                    live.journal_pending = true;
                     osdns_warn!(resource = %resource, error = %error, cleanup = %cleanup,
-                        "rebase failed to restore its previous durable journal; retrying");
+                        "rebase journal rollback is indeterminate; blocking mutation until repaired");
                 }
                 return ReconcileOutcome::Failed;
             }

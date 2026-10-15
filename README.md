@@ -53,6 +53,19 @@ Direct BSD `/etc/resolv.conf` mutation is limited to an unmanaged, single-link r
 
 Platform capabilities are exposed at runtime through `DnsManager::capabilities()`.
 
+Existing Windows NRPT rules keep their namespace, owner marker and policy fields
+fixed. An update publishes only the server-list registry value, avoiding mixed
+old/new fields across a process crash. Registry errors remain indeterminate;
+recovery never adopts an unverified Prepared update merely because DNS values
+match the desired configuration. This does not promise power-loss durability,
+atomic DNS-client activation, or atomic updates across several rules/interfaces.
+Concurrent registry writers can still race the preflight check.
+
+On macOS, scoped resolver creation uses exclusive rename so an entry appearing
+before publication is preserved. Replacement and deletion of an existing file
+still have a final comparison-to-rename/unlink race with another privileged writer.
+The backend advertises `Unconditional` mutation and `PreflightOnly` resource binding.
+
 ## Usage
 
 ```toml
@@ -430,3 +443,8 @@ Licensed under either of:
 * MIT License
 
 at your option.
+
+If an Enforce rebase cannot durably roll back an ambiguous journal publication,
+`Lease::pending_durability()` reports the resource. Further mutation waits for the
+previous journal record to be durably repaired; successful terminal cleanup can
+also resolve it. The reconciler keeps retrying with its normal backoff.

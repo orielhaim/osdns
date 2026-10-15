@@ -730,3 +730,75 @@ fn failed_teardown_does_not_reintroduce_the_desired_overlay() {
     fixture.manager.set_journal_fail_removes(false);
     failure.lease.restore().unwrap();
 }
+
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn ambiguous_rebase_journal_rollback_blocks_mutation_until_repaired(
+    #[case] rollback_rejected: bool,
+) {
+    let fixture = enforce_manager("enforce-ambiguous-journal");
+    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
+    fixture.manager.suspend_enforce_background();
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
+    let before_generation = fixture.fake.generation(IFACE1).unwrap();
+    fixture.manager.set_journal_fail_after_io(true);
+    if rollback_rejected {
+        fixture.manager.set_journal_fail_writes_after(1);
+    }
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Failed
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(state_with("9.9.9.9"))
+    );
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), before_generation);
+    let durable = journal_record_json(&fixture.dir);
+    if rollback_rejected {
+        assert_eq!(
+            durable["before"]["data"]["state"]["Configured"]["nameservers"][0],
+            "9.9.9.9"
+        );
+    }
+    assert_eq!(
+        durable["phase"],
+        if rollback_rejected {
+            "Prepared"
+        } else {
+            "Applied"
+        }
+    );
+    assert_eq!(lease.pending_durability(), lease.resources());
+    fixture.manager.set_journal_fail_after_io(false);
+    fixture.manager.set_journal_fail_writes(true);
+    fixture
+        .fake
+        .external_change(IFACE1, osdns::testing::FakeState::Empty)
+        .unwrap();
+    let before_retry = fixture.fake.generation(IFACE1).unwrap();
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Failed
+    );
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), before_retry);
+    fixture.manager.set_journal_fail_writes(false);
+    assert_eq!(
+        fixture.manager.debug_reconcile(IFACE1).unwrap(),
+        DebugReconcile::Rebased
+    );
+    assert!(lease.pending_durability().is_empty());
+    lease.restore().unwrap();
+    assert_eq!(
+        fixture.fake.current_state(IFACE1).unwrap(),
+        Some(osdns::testing::FakeState::Empty)
+    );
+}

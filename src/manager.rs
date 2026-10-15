@@ -1024,6 +1024,10 @@ impl Inner {
         live: &mut LiveRecord,
         current: Option<&PlatformSnapshot>,
     ) -> Result<()> {
+        if live.journal_pending {
+            self.journal.write(&live.record)?;
+            live.journal_pending = false;
+        }
         if live.record.phase == Phase::Applied && live.record.applied.is_some() {
             live.verified = None;
             return Ok(());

@@ -22,6 +22,8 @@ pub(crate) struct LiveRecord {
     /// Verified mutation identity retained when the durable `Applied` write
     /// failed. Never serialized; recovery must not see it.
     pub(crate) verified: Option<OwnershipProof>,
+    /// A failed journal rollback must be persisted before any further mutation.
+    pub(crate) journal_pending: bool,
 }
 
 /// The live state of a [`Lease`]: shared journal records plus the
@@ -106,7 +108,11 @@ impl Lease {
         let mut live = Vec::with_capacity(records.len());
         for (record, verified) in records.into_iter().zip(verified) {
             resources.push(record.resource.clone());
-            let shared = Arc::new(Mutex::new(LiveRecord { record, verified }));
+            let shared = Arc::new(Mutex::new(LiveRecord {
+                record,
+                verified,
+                journal_pending: false,
+            }));
             inner.register_active(Arc::clone(&shared));
             live.push(shared);
         }
@@ -123,8 +129,8 @@ impl Lease {
         }
     }
 
-    /// Resources whose latest verified state still needs durable journal finalization.
-    /// Live ownership proof remains usable, but a crash may leave an ambiguous journal.
+    /// Resources whose journal intent or verified state needs durable persistence.
+    /// Pending journal repair blocks mutation; a crash may leave an ambiguous journal.
     /// A later update or restore retries finalization; Enforce retries automatically.
     pub fn pending_durability(&self) -> Vec<ResourceId> {
         let state = self.state.lock();
@@ -134,7 +140,9 @@ impl Lease {
             .flat_map(|state| &state.live)
             .filter_map(|entry| {
                 let live = entry.lock();
-                (live.verified.is_some() || live.record.phase == crate::journal::Phase::Prepared)
+                (live.journal_pending
+                    || live.verified.is_some()
+                    || live.record.phase == crate::journal::Phase::Prepared)
                     .then(|| live.record.resource.clone())
             })
             .collect::<Vec<_>>();

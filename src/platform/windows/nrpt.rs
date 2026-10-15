@@ -127,30 +127,25 @@ pub(crate) fn rules_from_plan(
 }
 
 pub(crate) fn write_rule(rule: &NrptRule, owner: &str, resource: &ResourceId) -> Result<()> {
+    validate_rule(rule, owner)?;
     reject_foreign_rule(&rule.key, owner, resource)?;
     let (dnskey, created) = create_rule_key(&rule.key)?;
-    let before = if created {
-        None
-    } else {
+    if !created {
         let marker = read_marker(&dnskey, resource)?;
         verify_marker(&marker, owner, resource)?;
-        Some(read_rule_values(&dnskey, &rule.key, marker)?)
-    };
-    match write_rule_values(&dnskey, rule) {
+        let before = read_rule_values(&dnskey, &rule.key, marker)?;
+        validate_rule(&before, owner)?;
+        return write_rule_values(&dnskey, rule, Some(&before));
+    }
+    match write_rule_values(&dnskey, rule, None) {
         Ok(()) => Ok(()),
-        Err(primary) => {
-            let cleanup = match before {
-                Some(before) => write_rule_values(&dnskey, &before),
-                None => delete_created_key(&dnskey),
-            };
-            match cleanup {
-                Ok(()) => Err(primary),
-                Err(error) => Err(Error::TransactionFailed {
-                    primary: Box::new(primary),
-                    cleanup: vec![error],
-                }),
-            }
-        }
+        Err(primary) => match delete_created_key(&dnskey) {
+            Ok(()) => Err(primary),
+            Err(error) => Err(Error::TransactionFailed {
+                primary: Box::new(primary),
+                cleanup: vec![error],
+            }),
+        },
     }
 }
 
@@ -168,15 +163,45 @@ fn delete_created_key(key: &Key) -> Result<()> {
     }
 }
 
-fn write_rule_values(dnskey: &Key, rule: &NrptRule) -> Result<()> {
-    write_rule_values_with(dnskey, rule, |_| Ok(()))
+fn write_rule_values(dnskey: &Key, rule: &NrptRule, previous: Option<&NrptRule>) -> Result<()> {
+    write_rule_values_with(dnskey, rule, previous, |_| Ok(()))
 }
 
 fn write_rule_values_with(
     dnskey: &Key,
     rule: &NrptRule,
+    previous: Option<&NrptRule>,
     mut before_write: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    let servers = rule
+        .servers
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(";");
+    if let Some(before) = previous {
+        if before.key != rule.key
+            || before.version != rule.version
+            || before.config_options != rule.config_options
+            || before.namespaces != rule.namespaces
+            || before.display_name != rule.display_name
+            || before.comment != rule.comment
+        {
+            return Err(Error::JournalCorrupt(
+                "existing NRPT rule changes immutable policy fields".to_string(),
+            ));
+        }
+        if before.servers == rule.servers {
+            return Ok(());
+        }
+        // Only this value can change for a validated existing rule; publish it once.
+        before_write("GenericDNSServers")?;
+        dnskey
+            .set_string("GenericDNSServers", servers)
+            .map_err(|e| map_error(e, "NRPT update GenericDNSServers"))?;
+        before_write("AfterGenericDNSServers")?;
+        return Ok(());
+    }
     before_write("Comment")?;
     dnskey
         .set_string("Comment", &rule.comment)
@@ -190,12 +215,6 @@ fn write_rule_values_with(
     dnskey
         .set_multi_string("Name", &namespace_refs)
         .map_err(|e| map_error(e, "NRPT set Name"))?;
-    let servers = rule
-        .servers
-        .iter()
-        .map(|ip| ip.to_string())
-        .collect::<Vec<_>>()
-        .join(";");
     before_write("GenericDNSServers")?;
     dnskey
         .set_string("GenericDNSServers", servers)
@@ -242,7 +261,12 @@ pub(crate) fn read_owned_rule_by_key(
     };
     let comment = read_marker(&rule_key, resource)?;
     verify_marker(&comment, owner, resource)?;
-    read_rule_values(&rule_key, key, comment).map(Some)
+    let rule = read_rule_values(&rule_key, key, comment)?;
+    validate_rule(&rule, owner).map_err(|error| Error::ExternalModification {
+        resource: resource.clone(),
+        detail: error.to_string(),
+    })?;
+    Ok(Some(rule))
 }
 
 fn reject_foreign_rule(key: &str, owner: &str, resource: &ResourceId) -> Result<()> {
@@ -408,7 +432,7 @@ mod tests {
         let rule =
             rules_from_plan(&plan(&["127.0.0.1", "::1"], &["matrix.test"]), "io.test").remove(0);
         let result = std::panic::catch_unwind(|| {
-            write_rule_values(&key, &rule).unwrap();
+            write_rule_values(&key, &rule, None).unwrap();
             assert_eq!(
                 read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap(),
                 rule
@@ -470,7 +494,7 @@ mod tests {
         let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
         let key = volatile_key(&path);
         let rule = rules_from_plan(&plan(&["1.1.1.1"], &["corp.example"]), "io.owner").remove(0);
-        write_rule_values(&key, &rule).unwrap();
+        write_rule_values(&key, &rule, None).unwrap();
         let resource = ResourceId::new("windows:nrpt:test").unwrap();
         let marker = read_marker(&key, &resource).unwrap();
         let error = verify_marker(&marker, "io.other", &resource).unwrap_err();
@@ -485,19 +509,44 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn correct_owner_update_roundtrip() {
+    #[rstest::rstest]
+    #[case(None)]
+    #[case(Some("GenericDNSServers"))]
+    #[case(Some("AfterGenericDNSServers"))]
+    fn existing_rule_update_is_one_value_even_when_interrupted(#[case] interruption: Option<&str>) {
         let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
         let key = volatile_key(&path);
-        let mut rule = rules_from_plan(&plan(&["1.1.1.1"], &["corp.example"]), "io.test").remove(0);
-        write_rule_values(&key, &rule).unwrap();
-        rule.servers = vec!["8.8.8.8".parse().unwrap()];
-        write_rule_values(&key, &rule).unwrap();
+        let before = rules_from_plan(&plan(&["1.1.1.1"], &["corp.example"]), "io.test").remove(0);
+        write_rule_values(&key, &before, None).unwrap();
+        let mut rule = before.clone();
+        rule.servers = vec!["8.8.8.8".parse().unwrap(), "2001:db8::1".parse().unwrap()];
+        let result = write_rule_values_with(&key, &rule, Some(&before), |field| {
+            if interruption == Some(field) {
+                Err(Error::platform(
+                    BackendKind::WindowsIpHelper,
+                    "interrupted existing-rule update",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.is_err(), interruption.is_some());
         let read = read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap();
+        assert_eq!(
+            read,
+            if interruption == Some("GenericDNSServers") {
+                before.clone()
+            } else {
+                rule
+            }
+        );
+        write_rule_values(&key, &before, Some(&read)).unwrap();
+        assert_eq!(
+            read_rule_values(&key, &before.key, marker_for("io.test")).unwrap(),
+            before
+        );
         drop(key);
         CURRENT_USER.remove_tree(&path).unwrap();
-        assert_eq!(read.servers, vec!["8.8.8.8".parse::<IpAddr>().unwrap()]);
-        assert_eq!(read.comment, marker_for("io.test"));
     }
 
     #[test]
@@ -512,7 +561,7 @@ mod tests {
             "io.test",
         )
         .remove(0);
-        write_rule_values(&key, &rule).unwrap();
+        write_rule_values(&key, &rule, None).unwrap();
         let restored = read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap();
         drop(key);
         CURRENT_USER.remove_tree(&path).unwrap();
@@ -596,7 +645,7 @@ mod tests {
         let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
         let key = volatile_key(&path);
         let rule = rules_from_plan(&plan(&["1.1.1.1"], &["corp.example"]), "io.test").remove(0);
-        let result = write_rule_values_with(&key, &rule, |field| {
+        let result = write_rule_values_with(&key, &rule, None, |field| {
             if field == fail {
                 Err(Error::platform(
                     BackendKind::WindowsIpHelper,
@@ -613,7 +662,7 @@ mod tests {
         if fail != "Comment" {
             assert_eq!(key.get_string("Comment").unwrap(), marker_for("io.test"));
         }
-        write_rule_values(&key, &rule).unwrap();
+        write_rule_values(&key, &rule, None).unwrap();
         assert_eq!(
             read_rule_values(&key, &rule.key, marker_for("io.test")).unwrap(),
             rule

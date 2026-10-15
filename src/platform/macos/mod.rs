@@ -62,7 +62,8 @@ impl MacosBackend {
                 .with_split_dns(true)
                 .with_default_route(true)
                 .with_watch(true)
-                .with_cache_flush(false),
+                .with_cache_flush(false)
+                .with_resource_binding(crate::ResourceBinding::PreflightOnly),
         }
     }
 

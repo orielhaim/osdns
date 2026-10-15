@@ -216,14 +216,15 @@ jobs:
         if: ${{ runner.os == 'Windows' }}
         shell: pwsh
         run: |
-          $tree = cargo tree --locked --edges normal 2>&1 | Out-String
-          if ($tree -match 'windows v0\.62') { throw 'windows 0.62 still present' }
-          if ($tree -match 'windows-sys v0\.61') { throw 'windows-sys 0.61 still present in production graph' }
-          if ($tree -match 'windows-registry v0\.[0-9]\.') { throw 'old windows-registry still present' }
+          $tree = cargo tree --locked --all-features --edges normal 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'cargo tree failed' }
+          $direct = cargo tree --locked --all-features --edges normal --depth 1 --prefix none 2>&1 | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'direct cargo tree failed' }
+          if ($direct -match '(?m)^windows(?:-sys)? v') { throw 'direct Windows bindings must use generated FFI and windows-link' }
           if ($tree -match '(^|\s)tokio v') { throw 'tokio must not appear' }
           if ($tree -match 'rtnetlink') { throw 'rtnetlink must not appear on Windows' }
-          if ($tree -notmatch 'windows-registry v0\.100') { throw 'windows-registry 0.100 missing' }
-          if ($tree -notmatch 'windows-link v0\.100') { throw 'windows-link 0.100 missing' }
+          if ($direct -notmatch '(?m)^windows-registry v0\.100\.') { throw 'windows-registry 0.100 missing' }
+          if ($direct -notmatch '(?m)^windows-link v0\.100\.') { throw 'windows-link 0.100 missing' }
           Write-Host 'dependency assertions ok'
   freebsd:
     name: FreeBSD 15.1 x86_64
@@ -501,19 +502,9 @@ jobs:
           OSDNS_ALLOW_SYSTEM_MUTATION: "1"
           OSDNS_TEST_RESOLV_CONF: /tmp/osdns-resolv.conf
 
-      - name: Integration / legacy openresolv recovery
+      - name: Reject incompatible journal schemas
         run: |
-          cargo test \
-            --locked \
-            --all-features \
-            --test backend_matrix \
-            matrix_legacy_openresolv_journal_clears_without_mutation \
-            -- \
-            --exact \
-            --nocapture
-        env:
-          OSDNS_ALLOW_SYSTEM_MUTATION: "1"
-          OSDNS_TEST_RESOLV_CONF: /tmp/osdns-resolv.conf
+          cargo test --locked --all-features --test journal incompatible_published_schemas_are_retained_without_mutation
 
       - name: Integration / openresolv passthrough rejection
         run: |
