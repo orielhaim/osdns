@@ -614,7 +614,6 @@ fn matrix_bsd_openresolv_lifecycle_watch_and_external_modification() {
             .search_domains()
             .contains(&config.search_domains()[0])
     );
-    std::thread::sleep(Duration::from_millis(600));
     run_resolvconf(
         &["-a", &resolvconf_owner_tag(), "-m", "0"],
         Some(b"nameserver 192.0.2.250\n"),
@@ -810,7 +809,6 @@ fn matrix_bsd_direct_resolv_conf_watch_and_external_modification() {
             let _ = sender.send(event.clone());
         }))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(600));
     std::fs::write(&file.target, b"nameserver 192.0.2.250\n").unwrap();
     #[cfg(target_os = "freebsd")]
     {

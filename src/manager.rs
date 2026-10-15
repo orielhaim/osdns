@@ -453,7 +453,7 @@ impl Inner {
         let resource = &identity.resource;
         residue.leftover = None;
         residue.restored = None;
-        match self.apply_attempt(identity, expected_current, plan) {
+        match self.backend.apply_bound(identity, expected_current, plan) {
             MutationAttempt::Rejected { error } => Err(error),
             MutationAttempt::Indeterminate { error, produced } => {
                 match self.rollback_proven(resource, identity, produced.as_ref(), rollback_to) {
@@ -583,18 +583,8 @@ impl Inner {
         }
     }
 
-    fn apply_attempt(
-        &self,
-        identity: &ResourceIdentity,
-        expected: &PlatformSnapshot,
-        plan: &NormalizedConfig,
-    ) -> MutationAttempt {
-        self.backend.apply_bound(identity, expected, plan)
-    }
-
     fn restore_if_current(
         &self,
-        _resource: &ResourceId,
         identity: &ResourceIdentity,
         expected: &PlatformSnapshot,
         target: &PlatformSnapshot,
@@ -625,7 +615,7 @@ impl Inner {
         if self.backend.equivalent(proof, target) {
             return Some(Some(proof.clone()));
         }
-        let produced = match self.restore_if_current(resource, identity, proof, target) {
+        let produced = match self.restore_if_current(identity, proof, target) {
             Ok(produced) => produced,
             Err(error) => {
                 osdns_warn!(
@@ -687,37 +677,9 @@ impl Inner {
         identities: Vec<ResourceIdentity>,
     ) -> Result<PreparedLease> {
         let lease_id = Uuid::new_v4();
-        let was_noop = resources
+        let was_noop = befores
             .iter()
-            .zip(&befores)
-            .all(|(_resource, before)| self.backend.matches_desired(before, plan));
-        if was_noop {
-            let records: Vec<JournalRecord> = resources
-                .into_iter()
-                .zip(befores)
-                .zip(identities)
-                .map(|((resource, before), identity)| JournalRecord {
-                    owner: self.owner.clone(),
-                    lease_id,
-                    resource,
-                    backend: self.backend.kind(),
-                    identity,
-                    phase: Phase::Applied,
-                    before: before.clone(),
-                    desired: plan.clone(),
-                    applied: Some(before),
-                })
-                .collect();
-            self.persist_unmutated(&records)?;
-            self.fire(TxPoint::AfterApplied)?;
-            let n = records.len();
-            return Ok(PreparedLease {
-                lease_id,
-                records,
-                verified: vec![None; n],
-                was_noop: true,
-            });
-        }
+            .all(|before| self.backend.matches_desired(before, plan));
         let mut records: Vec<JournalRecord> = resources
             .into_iter()
             .zip(befores)
@@ -728,13 +690,27 @@ impl Inner {
                 resource,
                 backend: self.backend.kind(),
                 identity,
-                phase: Phase::Prepared,
+                phase: if was_noop {
+                    Phase::Applied
+                } else {
+                    Phase::Prepared
+                },
+                applied: was_noop.then(|| before.clone()),
                 before,
                 desired: plan.clone(),
-                applied: None,
             })
             .collect();
         self.persist_unmutated(&records)?;
+        if was_noop {
+            self.fire(TxPoint::AfterApplied)?;
+            let n = records.len();
+            return Ok(PreparedLease {
+                lease_id,
+                records,
+                verified: vec![None; n],
+                was_noop,
+            });
+        }
         self.fire(TxPoint::AfterPrepared)?;
         let mut mutations: Vec<VerifiedMutation> = Vec::new();
         for index in 0..records.len() {
@@ -1109,7 +1085,7 @@ impl Inner {
                     .to_string(),
             });
         }
-        self.restore_if_current(resource, &record.identity, applied, &record.before)?;
+        self.restore_if_current(&record.identity, applied, &record.before)?;
         self.fire(TxPoint::AfterRestoreRestore)?;
         let now = self.backend.readback(resource)?;
         if !self.backend.equivalent(&now, &record.before) {
@@ -1181,9 +1157,7 @@ impl Inner {
             .is_some_and(|applied| self.backend.owns_current(applied, &current));
         if owned {
             let applied = record.applied.as_ref().expect("applied snapshot");
-            if let Err(error) =
-                self.restore_if_current(&resource, &record.identity, applied, &record.before)
-            {
+            if let Err(error) = self.restore_if_current(&record.identity, applied, &record.before) {
                 if error.is_external_modification() {
                     return Ok(RecoveryOutcome::ExternalConflict {
                         resource,
@@ -1215,46 +1189,23 @@ impl Inner {
         })
     }
 
-    fn recover_for_resource(
-        &self,
-        records: Vec<JournalRecord>,
-    ) -> std::result::Result<(), RecoverBlock> {
-        let mut conflict = None;
-        for record in records {
-            if record.owner != self.owner {
-                return Err(RecoverBlock::Conflict(format!(
-                    "journal belongs to application owner {}",
-                    record.owner
-                )));
-            }
-            match self.recover_record(record) {
-                Ok(RecoveryOutcome::ExternalConflict { .. }) => {
-                    conflict = Some(
-                        "the current state matches neither the journal's applied state nor its original state"
-                            .to_string(),
-                    );
-                }
-                Ok(RecoveryOutcome::IdentityMismatch { .. }) => {
-                    conflict = Some(
-                        "the recorded native resource incarnation cannot be recovered safely"
-                            .to_string(),
-                    );
-                }
-                Ok(RecoveryOutcome::Failed { detail, .. }) => {
-                    conflict = Some(detail);
-                }
-                Ok(_) => {}
-                Err(error @ Error::JournalCorrupt(_)) => {
-                    return Err(RecoverBlock::Journal(error));
-                }
-                Err(error) => {
-                    return Err(RecoverBlock::Conflict(error.to_string()));
-                }
-            }
+    fn recover_for_resource(&self, record: JournalRecord) -> std::result::Result<(), RecoverBlock> {
+        if record.owner != self.owner {
+            return Err(RecoverBlock::Conflict(format!(
+                "journal belongs to application owner {}",
+                record.owner
+            )));
         }
-        match conflict {
-            Some(detail) => Err(RecoverBlock::Conflict(detail)),
-            None => Ok(()),
+        match self.recover_record(record) {
+            Ok(RecoveryOutcome::ExternalConflict { .. }) => Err(RecoverBlock::Conflict(
+                "the current state matches neither the journal's applied state nor its original state".to_string()
+            )),
+            Ok(RecoveryOutcome::IdentityMismatch { .. }) => Err(RecoverBlock::Conflict(
+                "the recorded native resource incarnation cannot be recovered safely".to_string()
+            )),
+            Ok(_) => Ok(()),
+            Err(error @ Error::JournalCorrupt(_)) => Err(RecoverBlock::Journal(error)),
+            Err(error) => Err(RecoverBlock::Conflict(error.to_string())),
         }
     }
 
@@ -1483,9 +1434,10 @@ impl DnsManager {
     /// (attempting guarded rollback on failure), persist `Applied`
     /// records, and return the lease holding the locks.
     ///
-    /// The operation is atomic per resource, not across resources: when a
-    /// later resource fails, earlier resources are rolled back best-effort
-    /// and their journals retained for [`DnsManager::recover_stale`].
+    /// Native operations can partially mutate a resource. On failure, rollback
+    /// uses backend-issued evidence where available; unresolved mutations retain
+    /// journals for [`DnsManager::recover_stale`]. No atomicity across resources
+    /// is promised.
     /// Requires elevated privileges on most platforms; see
     /// [`Error::RequiresPrivilege`].
     ///
@@ -1517,23 +1469,19 @@ impl DnsManager {
         self.inner.fire(TxPoint::AfterLock)?;
         let mut journals = self.inner.journal.records()?;
         for resource in &resources {
-            let mut selected = Vec::new();
-            let mut index = 0;
-            while index < journals.len() {
-                if &journals[index].resource == resource {
-                    selected.push(journals.swap_remove(index));
-                } else {
-                    index += 1;
-                }
-            }
-            match self.inner.recover_for_resource(selected) {
-                Ok(()) => {}
-                Err(RecoverBlock::Journal(error)) => return Err(error),
-                Err(RecoverBlock::Conflict(detail)) => {
-                    return Err(Error::Conflict {
-                        resource: resource.clone(),
-                        reason: ConflictReason::StaleJournalUnresolved { detail },
-                    });
+            if let Some(index) = journals
+                .iter()
+                .position(|record| &record.resource == resource)
+            {
+                match self.inner.recover_for_resource(journals.swap_remove(index)) {
+                    Ok(()) => {}
+                    Err(RecoverBlock::Journal(error)) => return Err(error),
+                    Err(RecoverBlock::Conflict(detail)) => {
+                        return Err(Error::Conflict {
+                            resource: resource.clone(),
+                            reason: ConflictReason::StaleJournalUnresolved { detail },
+                        });
+                    }
                 }
             }
         }

@@ -14,6 +14,10 @@ use serde_json::json;
 #[case("applied_missing")]
 #[case("invalid_owner")]
 #[case("duplicate")]
+#[case("phase")]
+#[case("before_resource")]
+#[case("backend")]
+#[case("identity_data")]
 fn inconsistent_record_claims_fail_before_native_mutation(#[case] corruption: &str) {
     let fixture = new_fixture("journal-claims");
     fixture
@@ -31,25 +35,45 @@ fn inconsistent_record_claims_fail_before_native_mutation(#[case] corruption: &s
         "filename" => std::fs::rename(&path, path.with_file_name("wrong.json")).unwrap(),
         "applied_missing" => {
             record["applied"] = json!(null);
-            write_journal(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         }
         "invalid_owner" => {
             record["owner"] = json!("invalid owner");
-            write_journal(&path, serde_json::to_vec(&record).unwrap()).unwrap();
         }
         "duplicate" => {
+            let lease_id = uuid::Uuid::new_v4();
+            record["lease_id"] = json!(lease_id);
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            let duplicate = format!("{}{}", lease_id.simple(), &filename[32..]);
             write_journal(
-                path.with_file_name("duplicate.json"),
+                path.with_file_name(duplicate),
                 serde_json::to_vec(&record).unwrap(),
             )
             .unwrap();
         }
+        "phase" => record["phase"] = json!("HalfDone"),
+        "before_resource" => record["before"]["resource"] = json!(IFACE2),
+        "backend" => record["backend"] = json!("systemd-resolved"),
+        "identity_data" => record["identity"]["data"] = json!({ "incarnation": "not-a-number" }),
         _ => unreachable!(),
     }
-    assert!(matches!(
-        fixture.manager.recover_stale(),
-        Err(Error::JournalCorrupt(_))
-    ));
+    if !matches!(corruption, "filename" | "duplicate") {
+        write_journal(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    }
+    let error = fixture.manager.recover_stale().unwrap_err();
+    let Error::JournalCorrupt(message) = error else {
+        panic!("{error:?}")
+    };
+    let expected = match corruption {
+        "filename" => "filename does not match",
+        "applied_missing" => "Applied record has no applied snapshot",
+        "invalid_owner" => "owner",
+        "duplicate" => "multiple records claim one resource",
+        "phase" => "unknown variant `HalfDone`",
+        "before_resource" | "backend" => "different resources or backends",
+        "identity_data" => "invalid type: string",
+        _ => unreachable!(),
+    };
+    assert!(message.contains(expected), "{message}");
     assert!(matches!(
         fixture.manager.apply(&iface_config(2, "8.8.8.8")),
         Err(Error::JournalCorrupt(_))
@@ -74,7 +98,7 @@ fn oversized_record_is_rejected_before_parsing_or_mutation() {
     .unwrap();
     assert!(matches!(
         fixture.manager.recover_stale(),
-        Err(Error::JournalCorrupt(_))
+        Err(Error::JournalCorrupt(message)) if message.contains("exceeds the 16 MiB storage budget")
     ));
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -231,86 +255,6 @@ fn incompatible_published_schemas_are_retained_without_mutation(
         matches!(fixture.manager.recover_stale(), Err(Error::UnsupportedJournalVersion { found, supported: 4, .. }) if found == version)
     );
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
-}
-
-#[test]
-fn unknown_phase_fails_closed() {
-    let fixture = new_fixture("journal-phase");
-    let record = json!({
-        "schema_version": 4,
-        "owner": "someone.else",
-        "lease_id": "11111111-2222-3333-4444-555555555555",
-        "resource": IFACE1,
-        "backend": "fake",
-        "identity": {
-            "backend": "fake",
-            "resource": IFACE1,
-            "data": { "incarnation": 1 }
-        },
-        "phase": "HalfDone",
-        "before": { "backend": "fake", "resource": IFACE1, "data": {} },
-        "desired": { "nameservers": ["1.1.1.1"], "search_domains": [], "routing_domains": [], "default_route": null },
-        "applied": null
-    });
-    write_journal(
-        fixture.dir.join("journal").join("weird-phase.json"),
-        serde_json::to_vec_pretty(&record).unwrap(),
-    )
-    .unwrap();
-
-    let err = fixture.manager.recover_stale().unwrap_err();
-    assert!(matches!(err, Error::JournalCorrupt(_)));
-}
-
-#[test]
-fn cross_backend_and_cross_resource_records_fail_closed() {
-    let fixture = new_fixture("journal-cross-field");
-    fixture
-        .manager
-        .apply(&iface_config(1, "1.1.1.1"))
-        .unwrap()
-        .debug_release_locks_keep_journal();
-    let file = journal_files(&fixture.dir).pop().unwrap();
-    let path = fixture.dir.join("journal").join(file);
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["before"]["resource"] = serde_json::Value::String(IFACE2.to_string());
-    write_journal(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-
-    assert!(matches!(
-        fixture.manager.recover_stale(),
-        Err(Error::JournalCorrupt(_))
-    ));
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("1.1.1.1"))
-    );
-}
-
-#[test]
-fn malformed_backend_identity_cannot_trigger_destructive_recovery() {
-    let fixture = new_fixture("journal-invalid-identity");
-    fixture
-        .manager
-        .apply(&iface_config(1, "1.1.1.1"))
-        .unwrap()
-        .debug_release_locks_keep_journal();
-    let file = journal_files(&fixture.dir).pop().unwrap();
-    let path = fixture.dir.join("journal").join(file);
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["identity"]["data"] = json!({ "incarnation": "not-a-number" });
-    write_journal(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
-
-    assert!(matches!(
-        fixture.manager.recover_stale(),
-        Err(Error::JournalCorrupt(_))
-    ));
-    assert_eq!(journal_files(&fixture.dir).len(), 1);
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("1.1.1.1"))
-    );
 }
 
 #[test]

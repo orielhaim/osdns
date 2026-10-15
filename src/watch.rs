@@ -44,13 +44,6 @@ impl DnsEvent {
             DnsEvent::ResourceRemoved { resource } => resource,
         }
     }
-
-    fn into_owned(self) -> (ResourceId, bool) {
-        match self {
-            DnsEvent::ResourceChanged { resource } => (resource, false),
-            DnsEvent::ResourceRemoved { resource } => (resource, true),
-        }
-    }
 }
 
 /// Callback invoked by a backend's event thread.
@@ -241,8 +234,9 @@ pub(crate) fn spawn_coalescer(
         if callback_flag.load(Ordering::Acquire) {
             return;
         }
-        let (resource, _) = event.clone().into_owned();
-        pending.lock().insert(resource, event.clone());
+        pending
+            .lock()
+            .insert(event.resource().clone(), event.clone());
         let _ = callback_wake.try_send(());
     });
     Ok(Coalescer {
@@ -292,7 +286,7 @@ fn flush(
     shared: &Mutex<HashMap<ResourceId, DnsEvent>>,
     flag: &AtomicBool,
 ) {
-    let mut pending = {
+    let pending = {
         let mut shared = shared.lock();
         std::mem::take(&mut *shared)
     };
@@ -302,7 +296,6 @@ fn flush(
         }
         callback(event);
     }
-    pending.clear();
 }
 
 #[cfg(test)]
@@ -310,31 +303,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coalescer_delivers_the_last_observed_state() {
-        let delivered = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&delivered);
+    fn coalescer_delivers_the_last_event_from_a_burst() {
+        let (sent, received) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
         let coalescer = spawn_coalescer(
             BackendKind::Fake,
-            Arc::new(move |event| sink.lock().push(event.clone())),
+            Arc::new(move |event| {
+                sent.send(event.clone()).unwrap();
+                blocked.lock().recv_timeout(Duration::from_secs(2)).unwrap();
+            }),
             Duration::from_millis(5),
         )
         .unwrap();
         let callback = coalescer.callback();
         let resource = ResourceId::new("fake:watch-state").unwrap();
-        callback(&DnsEvent::ResourceRemoved {
+        let changed = DnsEvent::ResourceChanged {
             resource: resource.clone(),
-        });
-        callback(&DnsEvent::ResourceChanged { resource });
-        drop(callback);
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while delivered.lock().is_empty() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
+        };
+        callback(&changed);
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            changed
+        );
+        for _ in 0..300 {
+            callback(&DnsEvent::ResourceRemoved {
+                resource: resource.clone(),
+            });
         }
+        callback(&changed);
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(2)).unwrap(),
+            changed
+        );
+        release.send(()).unwrap();
+        assert!(received.recv_timeout(Duration::from_millis(50)).is_err());
         coalescer.stop();
-        assert!(matches!(
-            delivered.lock().as_slice(),
-            [DnsEvent::ResourceChanged { .. }]
-        ));
     }
     #[test]
     fn coalescer_stop_does_not_depend_on_sender_release() {

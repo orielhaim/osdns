@@ -135,13 +135,19 @@ fn enforce_rebases_and_reapplies_on_external_change() {
 fn cooperative_still_reports_conflicts_without_reconciliation() {
     let fixture = new_fixture("enforce-coop");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
-    let _watch = fixture.manager.watch(std::sync::Arc::new(|_| {})).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let _watch = fixture
+        .manager
+        .watch(std::sync::Arc::new(move |event| {
+            sender.send(event.clone()).unwrap();
+        }))
+        .unwrap();
 
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
         .unwrap();
-    std::thread::sleep(Duration::from_millis(700));
+    receiver.recv_timeout(Duration::from_secs(2)).unwrap();
 
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
@@ -150,33 +156,6 @@ fn cooperative_still_reports_conflicts_without_reconciliation() {
     );
     let failure = lease.restore().unwrap_err();
     assert!(failure.error.is_external_modification());
-}
-
-#[test]
-fn reconciled_lease_update_and_still_ours_are_stable() {
-    let fixture = enforce_manager("enforce-still-ours");
-    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
-    let _watch = fixture.manager.watch(std::sync::Arc::new(|_| {})).unwrap();
-
-    lease.update(&iface_config(1, "8.8.8.8")).unwrap();
-    fixture
-        .fake
-        .external_change(IFACE1, state_with("8.8.8.8"))
-        .unwrap();
-
-    std::thread::sleep(Duration::from_millis(700));
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(state_with("8.8.8.8")),
-        "an event matching the applied DNS values must not trigger a reapply loop"
-    );
-
-    let failure = lease.restore().unwrap_err();
-    assert!(
-        failure.error.is_external_modification(),
-        "a same-values rewrite advances generation and is not ours"
-    );
-    failure.lease.abandon().unwrap();
 }
 
 #[test]
@@ -218,9 +197,6 @@ fn public_watch_is_optional_and_does_not_own_enforce() {
             seen_clone.lock().unwrap().push(event.clone());
         }))
         .unwrap();
-    // Let our own apply's suppression window expire so the genuine external
-    // change below reaches the user callback path.
-    std::thread::sleep(Duration::from_millis(600));
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
@@ -660,15 +636,23 @@ fn verified_mutation_finalizes_only_from_retained_proof() {
     );
 }
 
-#[test]
-fn equivalent_rewrite_is_not_still_ours() {
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn equivalent_rewrite_is_not_still_ours(#[case] after_update: bool) {
     let fixture = enforce_manager("enforce-same-dns-gen");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     fixture.manager.suspend_enforce_background();
+    let nameserver = if after_update {
+        lease.update(&iface_config(1, "8.8.8.8")).unwrap();
+        "8.8.8.8"
+    } else {
+        "1.1.1.1"
+    };
     let ours = fixture.fake.generation(IFACE1).unwrap().unwrap();
     fixture
         .fake
-        .external_change(IFACE1, state_with("1.1.1.1"))
+        .external_change(IFACE1, state_with(nameserver))
         .unwrap();
     let external = fixture.fake.generation(IFACE1).unwrap().unwrap();
     assert!(external > ours);
@@ -681,7 +665,10 @@ fn equivalent_rewrite_is_not_still_ours() {
         serde_json::json!(ours)
     );
     assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
-    lease.abandon().unwrap();
+    let failure = lease.restore().unwrap_err();
+    assert!(failure.error.is_external_modification());
+    assert_eq!(fixture.fake.generation(IFACE1).unwrap(), Some(external));
+    failure.lease.abandon().unwrap();
 }
 
 #[test]
@@ -736,6 +723,7 @@ fn failed_teardown_does_not_reintroduce_the_desired_overlay() {
 #[case(true)]
 fn ambiguous_rebase_journal_rollback_blocks_mutation_until_repaired(
     #[case] rollback_rejected: bool,
+    #[values("enforce", "update", "restore", "drop", "abandon")] finish: &str,
 ) {
     let fixture = enforce_manager("enforce-ambiguous-journal");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
@@ -790,13 +778,37 @@ fn ambiguous_rebase_journal_rollback_blocks_mutation_until_repaired(
         Some(osdns::testing::FakeState::Empty)
     );
     assert_eq!(fixture.fake.generation(IFACE1).unwrap(), before_retry);
+    for _ in 0..2 {
+        let error = lease.update(&iface_config(1, "8.8.8.8")).unwrap_err();
+        assert!(matches!(error, osdns::Error::Platform { .. }), "{error:?}");
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), before_retry);
+        assert_eq!(lease.pending_durability(), lease.resources());
+    }
     fixture.manager.set_journal_fail_writes(false);
-    assert_eq!(
-        fixture.manager.debug_reconcile(IFACE1).unwrap(),
-        DebugReconcile::Rebased
-    );
-    assert!(lease.pending_durability().is_empty());
-    lease.restore().unwrap();
+    match finish {
+        "restore" => lease.restore().unwrap(),
+        "drop" => drop(lease),
+        "abandon" => lease.abandon().unwrap(),
+        "enforce" | "update" => {
+            if finish == "update" {
+                assert!(
+                    lease
+                        .update(&iface_config(1, "8.8.8.8"))
+                        .unwrap_err()
+                        .is_external_modification()
+                );
+                assert!(lease.pending_durability().is_empty());
+            }
+            assert_eq!(
+                fixture.manager.debug_reconcile(IFACE1).unwrap(),
+                DebugReconcile::Rebased
+            );
+            assert!(lease.pending_durability().is_empty());
+            lease.restore().unwrap();
+        }
+        _ => unreachable!(),
+    }
+    assert!(journal_files(&fixture.dir).is_empty());
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(osdns::testing::FakeState::Empty)

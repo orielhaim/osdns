@@ -202,7 +202,10 @@ match lease.restore() {
 
 ## Crash recovery
 
-Mutations are backed by a durable journal.
+Journal files and resource locks use `private-fs` directory capabilities. Journal
+publication and removal request full durability through retained directory handles.
+DNS files under system directories use their backend-specific metadata and ownership
+rules; they are not private application files.
 
 The transaction order is:
 
@@ -249,6 +252,11 @@ reported as `ForeignOwner`; it is not an operating-system authorization boundary
 If an Applied write fails after verification, the live lease retains its proof
 and retries finalization. A crash before finalization may require manual conflict
 resolution because recovery cannot use volatile proof.
+
+If an Enforce rebase cannot durably roll back an ambiguous journal publication,
+`Lease::pending_durability()` reports the resource. Further mutation waits for the
+previous journal record to be durably repaired; successful terminal cleanup can
+also resolve it. The reconciler keeps retrying with its normal backoff.
 
 ## External changes
 
@@ -443,8 +451,3 @@ Licensed under either of:
 * MIT License
 
 at your option.
-
-If an Enforce rebase cannot durably roll back an ambiguous journal publication,
-`Lease::pending_durability()` reports the resource. Further mutation waits for the
-previous journal record to be durably repaired; successful terminal cleanup can
-also resolve it. The reconciler keeps retrying with its normal backoff.

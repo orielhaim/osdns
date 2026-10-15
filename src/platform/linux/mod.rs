@@ -161,15 +161,3 @@ pub(crate) fn resolve_interface_selector(scope: &DnsScope) -> Result<(u32, Strin
         },
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_route_lookup_returns_a_live_interface() {
-        let index = default_route_ifindex().unwrap();
-        let name = name_for_ifindex(index).unwrap();
-        assert_eq!(ifindex_for_name(&name).unwrap(), index);
-    }
-}

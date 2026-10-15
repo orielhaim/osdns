@@ -106,11 +106,6 @@ fn resolve1_available() -> bool {
     zbus_system_service("org.freedesktop.resolve1")
 }
 
-#[allow(dead_code)]
-fn network_manager_available() -> bool {
-    zbus_system_service("org.freedesktop.NetworkManager")
-}
-
 fn zbus_system_service(name: &str) -> bool {
     use zbus::blocking::Connection;
     use zbus::blocking::fdo::DBusProxy;
@@ -125,57 +120,6 @@ fn zbus_system_service(name: &str) -> bool {
         return false;
     };
     proxy.name_has_owner(bus).unwrap_or(false)
-}
-
-#[test]
-fn direct_resolv_conf_backend_lifecycle_when_enabled() {
-    if std::env::var_os("OSDNS_ALLOW_SYSTEM_MUTATION").is_none() {
-        return;
-    }
-    if !std::path::Path::new("/etc/resolv.conf").is_file() {
-        return;
-    }
-    let Ok(original) = std::fs::read("/etc/resolv.conf") else {
-        return;
-    };
-    if std::path::Path::new("/etc/resolv.conf").is_symlink() {
-        return;
-    }
-    let dir = temp_dir("linux-direct");
-    let manager = manager_for_backend(
-        "io.osdns.test",
-        &dir,
-        osdns::BackendKind::ResolvConfFile,
-        std::time::Duration::from_secs(30),
-    )
-    .unwrap();
-    let caps = manager.capabilities().unwrap();
-    if caps.backend != osdns::BackendKind::ResolvConfFile {
-        return;
-    }
-    let config = osdns::DnsConfig::builder(osdns::DnsScope::Global)
-        .nameserver(ip("127.0.0.1"))
-        .build()
-        .unwrap();
-    let lease = match manager.apply(&config) {
-        Ok(lease) => lease,
-        Err(osdns::Error::RequiresPrivilege(_)) => return,
-        Err(error) => panic!("unexpected apply error: {error}"),
-    };
-    let content = std::fs::read("/etc/resolv.conf").unwrap();
-    let text = String::from_utf8_lossy(&content);
-    assert!(
-        text.contains("nameserver 127.0.0.1"),
-        "applied file: {text}"
-    );
-
-    std::fs::write("/etc/resolv.conf", b"nameserver 203.0.113.9\n").unwrap();
-    let failure = lease.restore().unwrap_err();
-    assert!(failure.error.is_external_modification());
-    std::fs::write("/etc/resolv.conf", &original).unwrap();
-    let lease = failure.lease;
-    lease.restore().unwrap();
-    assert_eq!(std::fs::read("/etc/resolv.conf").unwrap(), original);
 }
 
 #[test]
@@ -207,37 +151,39 @@ fn dhcp_file_replacement_race_is_transitional() {
         .nameserver(ip("127.0.0.1"))
         .build()
         .unwrap();
+    let before = manager.snapshot(&osdns::DnsScope::Global).unwrap();
     let lease = match manager.apply(&config) {
         Ok(lease) => lease,
         Err(osdns::Error::RequiresPrivilege(_)) => return,
         Err(error) => panic!("unexpected apply error: {error}"),
     };
 
-    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let sink = events.clone();
+    let resource = lease.resources()[0].clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
     let handle = manager
         .watch(std::sync::Arc::new(move |event| {
-            sink.lock().unwrap().push(format!("{event:?}"));
+            sender.send(event.clone()).unwrap();
         }))
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(100));
 
     // DHCP-style delete/recreate churn around /etc/resolv.conf.
     for _ in 0..5 {
-        let _ = std::fs::remove_file("/etc/resolv.conf");
+        std::fs::remove_file("/etc/resolv.conf").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write("/etc/resolv.conf", &original).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    let event = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(matches!(event,
+        osdns::DnsEvent::ResourceChanged { resource: changed } |
+        osdns::DnsEvent::ResourceRemoved { resource: changed } if changed == resource));
     handle.stop();
 
-    // The file still exists after churn and our lease still verifies.
+    // Another actor restored the original file; teardown must leave it intact.
     assert!(std::path::Path::new("/etc/resolv.conf").is_file());
-    let snapshot = manager.snapshot(&osdns::DnsScope::Global).unwrap();
-    let _ = snapshot;
-    let lease_for_restore = lease;
-    lease_for_restore.restore().unwrap();
+    assert_eq!(manager.snapshot(&osdns::DnsScope::Global).unwrap(), before);
+    lease.restore().unwrap();
     assert_eq!(std::fs::read("/etc/resolv.conf").unwrap(), original);
-    std::fs::write("/etc/resolv.conf", &original).unwrap();
 }

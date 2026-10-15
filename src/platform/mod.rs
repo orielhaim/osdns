@@ -174,14 +174,6 @@ impl VerifiedMutation {
     }
 }
 
-/// Receipt of a successful (per the OS API) mutation. The transaction engine
-/// never trusts this alone; it always verifies via read-back.
-#[derive(Debug, Clone)]
-pub(crate) struct ApplyReceipt {
-    #[allow(dead_code)]
-    pub(crate) resource: ResourceId,
-}
-
 /// What a backend mutation actually did. The engine must not treat every
 /// `Err` as the same state: a CAS rejection is not a partial write.
 #[derive(Debug)]
@@ -203,7 +195,7 @@ pub(crate) enum MutationAttempt {
 }
 
 impl MutationAttempt {
-    pub(crate) fn from_apply_result(result: Result<ApplyReceipt>) -> Self {
+    pub(crate) fn from_apply_result(result: Result<()>) -> Self {
         match result {
             Ok(_) => Self::Performed { produced: None },
             Err(error) if error.is_external_modification() => Self::Rejected { error },
@@ -300,7 +292,7 @@ pub(crate) trait Backend: Send + Sync {
     /// When any step fails the backend returns `Err`, and the resource may
     /// already be partially mutated. That is
     /// [`MutationAttempt::Indeterminate`], never proof that nothing changed.
-    fn apply(&self, _resource: &ResourceId, _plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, _resource: &ResourceId, _plan: &NormalizedConfig) -> Result<()> {
         Err(Error::unsupported(
             self.kind(),
             "mutation requires a bound resource identity",
@@ -308,7 +300,9 @@ pub(crate) trait Backend: Send + Sync {
     }
 
     /// Reads the state back after a mutation for verification.
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot>;
+    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
+        self.capture(resource)
+    }
 
     /// Native compare-and-mutate strength. Defaults to the value advertised
     /// in [`Capabilities::mutation_guard`].

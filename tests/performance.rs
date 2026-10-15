@@ -108,7 +108,7 @@ fn repeated_real_updates_stay_in_budget() {
     let _isolation = count_lock();
     let fixture = new_fixture("perf-update");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
-    let (_, first_bytes) = count(|| lease.update(&iface_config(1, "8.8.8.8")).unwrap());
+    lease.update(&iface_config(1, "8.8.8.8")).unwrap();
     for i in 0..50 {
         let ns = if i % 2 == 0 { "1.1.1.1" } else { "8.8.8.8" };
         let (calls, bytes) = count(|| lease.update(&iface_config(1, ns)).unwrap());
@@ -120,7 +120,6 @@ fn repeated_real_updates_stay_in_budget() {
             bytes < 2_000_000,
             "update allocates {bytes} bytes per op (budget 2MB, journal JSON dominates)"
         );
-        let _ = first_bytes;
     }
     lease.restore().unwrap();
 }

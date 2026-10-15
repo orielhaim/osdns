@@ -5,23 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] - 2026-09-24
-
-### Added
-
-* FreeBSD and NetBSD global DNS backends with native CI, interface
-  enumeration, and kqueue watch support.
+## [0.3.0] - Unreleased
 
 ### Changed
 
-* Openresolv is global-DNS only; per-interface DNS is no longer advertised.
-* Resolver backend detection now uses actual ownership.
+* Rebuilt transactions around coherent native-resource observations and explicit
+  rejected, performed, and indeterminate mutation outcomes. Rollback requires
+  backend-issued evidence; equivalent DNS values alone do not prove a mutation.
+* Journal files and resource locks now use retained `private-fs` directory
+  capabilities, with atomic publication, full durability, and retryable ambiguous
+  publication and removal errors. Read-only managers do not initialize storage.
+* Journal schema 4 separates typed runtime snapshots from the durable format and
+  validates resource, backend, owner, filename, and unique resource claims.
+  Older schemas are intentionally unsupported and are never migrated or ignored.
+  Restore or abandon journals with the version that wrote them before upgrading.
+* Live leases retain volatile mutation evidence when Applied publication fails.
+  Failed compensation after an ambiguous rebase publication blocks further
+  mutation until the journal is repaired; terminal cleanup can also resolve it.
+* Partial restore and abandon retain unresolved resources and release completed
+  resources. Updates cannot resume once teardown starts. Failed abandon and Drop
+  retry journal removal without restoring DNS.
+* Watch delivery coalesces events in bounded queues and suppresses own changes by
+  authoritative readback. Enforce restarts interrupted observation, rescans active
+  leases, and retains scheduled retries across transient errors.
+* NetworkManager uses versioned Reapply bound to the recorded D-Bus owner and
+  activation. Apply and restore share one guarded mutation pipeline.
+  systemd-resolved retains live link handles and verifies the bus namespace.
+* Linux default-interface selection uses synchronous Netlink dumps and rejects
+  absent or ambiguous main-table defaults. Select an interface explicitly when
+  the routing table has no unique default.
+* Direct resolver-file backends preserve supported native metadata and reject
+  unsupported hard links, ACLs, extended attributes, or file flags. They cannot
+  atomically compare against concurrent privileged edits.
+* macOS uses native SystemConfiguration property lists and preserves unmanaged
+  fields. Scoped resolver files use retained directory handles and exclusive
+  creation; replacement and deletion retain a final privileged-writer race.
+* Windows NRPT creation and cleanup retain registry handles. Existing-rule updates
+  change only the server list while preserving validated policy and owner fields.
+  Registry publication does not promise power-loss durability or atomic activation.
 
-### Fixed
+### Added
 
-* The `Resolvconf` backend is explicitly Openresolv-only; Openresolv 3.12+
-  is required, passthrough mode is rejected, and classic Debian `resolvconf`
-  is rejected.
+* FreeBSD and NetBSD global DNS backends, native CI, interface enumeration,
+  resolver limits, and kqueue notifications.
+* `Lease::pending_durability()` exposes journal repair still required by live
+  leases. Observation health and pending reconciliation are visible to callers.
 
 ## [0.2.3] - 2026-09-20
 

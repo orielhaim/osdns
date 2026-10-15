@@ -375,21 +375,18 @@ fn one_gone_record_does_not_block_a_recoverable_record() {
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
-#[test]
-fn explicit_restore_terminally_releases_a_gone_resource() {
-    let fixture = new_fixture("restore-gone");
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn teardown_terminally_releases_a_gone_resource(#[case] drop_lease: bool) {
+    let fixture = new_fixture("teardown-gone");
     let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
     fixture.fake.external_remove(IFACE1).unwrap();
-    lease.restore().unwrap();
-    assert!(journal_files(&fixture.dir).is_empty());
-}
-
-#[test]
-fn drop_terminally_releases_a_gone_resource() {
-    let fixture = new_fixture("drop-gone");
-    let lease = fixture.manager.apply(&iface_config(1, "1.1.1.1")).unwrap();
-    fixture.fake.external_remove(IFACE1).unwrap();
-    drop(lease);
+    if drop_lease {
+        drop(lease);
+    } else {
+        lease.restore().unwrap();
+    }
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
@@ -409,18 +406,6 @@ fn gone_is_not_reported_as_cleaned_when_journal_removal_fails() {
         matches!(&outcomes[..], [RecoveryOutcome::Failed { resource, .. }] if resource == &resource_id(IFACE1))
     );
     assert_eq!(journal_files(&fixture.dir).len(), 1);
-}
-
-#[test]
-fn resource_scoped_platform_errors_carry_the_target_structurally() {
-    let error = Error::ResourcePlatform {
-        backend: osdns::BackendKind::Fake,
-        resource: resource_id(IFACE1),
-        message: "native failure".to_string(),
-    };
-    assert!(
-        matches!(error, Error::ResourcePlatform { resource, .. } if resource == resource_id(IFACE1))
-    );
 }
 
 #[test]

@@ -13,7 +13,7 @@ use osdns::testing::{CrashOutcome, FakeState, FaultInjector, TxPoint};
 use osdns::{Error, Lease, RecoveryOutcome};
 
 #[test]
-fn external_change_during_capture_window_fails_transaction() {
+fn capture_boundary_failure_changes_nothing() {
     let fixture = new_fixture("race-capture");
     let injector = FaultInjector::new();
     injector.fail_at(TxPoint::AfterCapture, "simulated read-back hiccup");
@@ -57,7 +57,7 @@ fn unconditional_backend_rechecks_state_before_mutation() {
 }
 
 #[test]
-fn external_change_between_apply_and_readback_is_rolled_back() {
+fn failure_after_apply_rolls_back_to_captured_state() {
     let fixture = new_fixture("race-apply");
     let injector = FaultInjector::new();
     injector.fail_at(TxPoint::AfterApply, "read-back unavailable");
@@ -88,7 +88,10 @@ fn delete_then_recreate_requires_a_fresh_lease() {
         Error::ResourceGone { .. }
     ));
 
-    let _ = fixture.fake.external_change(IFACE1, state_with("9.9.9.9"));
+    fixture
+        .fake
+        .external_change(IFACE1, state_with("9.9.9.9"))
+        .unwrap();
     lease.restore().unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),

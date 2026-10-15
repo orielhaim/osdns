@@ -4,10 +4,9 @@
 mod common;
 
 use common::*;
-use osdns::WatchHandle;
 use osdns::testing::{FakeOp, FakeState};
 use osdns::{DnsConfig, Error, RecoveryOutcome};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn config(index: u32, ns: &str) -> DnsConfig {
     iface_config(index, ns)
@@ -229,106 +228,79 @@ fn drop_keeps_journal_on_external_modification() {
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
-#[test]
-fn backend_failure_rolls_back_and_removes_journal() {
-    let fixture = new_fixture("engine-apply-fail");
-    fixture
-        .fake
-        .inject_backend_failure(FakeOp::Apply, 1, "simulated OS rejection");
+#[rstest::rstest]
+#[case::rejected("rejected")]
+#[case::readback_unavailable("readback")]
+#[case::readback_mismatch("mismatch")]
+#[case::partial_mutation("partial")]
+fn failed_apply_preserves_original_state_without_journal_leak(#[case] failure: &str) {
+    let fixture = new_fixture("engine-apply-failure");
+    let generation = fixture.fake.generation(IFACE1).unwrap();
+    match failure {
+        "rejected" => fixture
+            .fake
+            .inject_backend_failure(FakeOp::Apply, 1, "OS rejection"),
+        "readback" => {
+            fixture
+                .fake
+                .inject_backend_failure(FakeOp::Readback, 1, "read-back unavailable")
+        }
+        "mismatch" => fixture
+            .fake
+            .lie_once_on_readback(state_with("203.0.113.99")),
+        "partial" => fixture.fake.inject_partial_apply_failure(1),
+        _ => unreachable!(),
+    }
     let err = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }));
+    if failure == "mismatch" {
+        assert!(matches!(err, Error::VerificationFailed { .. }), "{err:?}");
+    } else {
+        assert!(matches!(err, Error::Platform { .. }), "{err:?}");
+    }
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(FakeState::Empty)
     );
-    assert!(journal_files(&fixture.dir).is_empty());
-}
-
-#[test]
-fn readback_failure_rolls_back_to_before() {
-    let fixture = new_fixture("engine-readback-fail");
-    fixture
-        .fake
-        .inject_backend_failure(FakeOp::Readback, 1, "read-back unavailable");
-    let err = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }));
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(FakeState::Empty),
-        "rollback must have restored the original state"
-    );
-    assert!(journal_files(&fixture.dir).is_empty());
-}
-
-#[test]
-fn lying_readback_fails_verification_and_rolls_back() {
-    let fixture = new_fixture("engine-verify-fail");
-    fixture
-        .fake
-        .lie_once_on_readback(state_with("203.0.113.99"));
-    let err = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap_err();
-    assert!(matches!(err, Error::VerificationFailed { .. }));
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(FakeState::Empty),
-        "rollback after verification failure must restore the original state"
-    );
+    if failure == "rejected" {
+        assert_eq!(fixture.fake.generation(IFACE1).unwrap(), generation);
+    } else {
+        assert_ne!(fixture.fake.generation(IFACE1).unwrap(), generation);
+    }
     assert!(journal_files(&fixture.dir).is_empty());
 }
 
 #[test]
 fn watch_delivers_events_until_stopped() {
     let fixture = new_fixture("engine-watch");
-    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let handle: WatchHandle = fixture
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let handle = fixture
         .manager
         .watch(Arc::new(move |event| {
-            let name = match event {
-                osdns::DnsEvent::ResourceChanged { resource } => {
-                    format!("changed:{resource}")
-                }
-                osdns::DnsEvent::ResourceRemoved { resource } => {
-                    format!("removed:{resource}")
-                }
-                _ => "other".to_string(),
-            };
-            sink.lock().unwrap().push(name);
+            sender.send(event.clone()).unwrap();
         }))
         .unwrap();
-
-    let _lease = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(600));
     fixture
         .fake
         .external_change(IFACE1, state_with("9.9.9.9"))
         .unwrap();
-    wait_for(&events, &format!("changed:{IFACE1}"));
-
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap(),
+        osdns::DnsEvent::ResourceChanged {
+            resource: resource_id(IFACE1)
+        }
+    );
     handle.stop();
     fixture
         .fake
         .external_change(IFACE1, state_with("8.8.8.8"))
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    let count = events.lock().unwrap().len();
-    fixture
-        .fake
-        .external_change(IFACE1, state_with("7.7.7.7"))
-        .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(150));
-    assert_eq!(events.lock().unwrap().len(), count, "no events after stop");
-}
-
-fn wait_for(events: &Arc<Mutex<Vec<String>>>, expected: &str) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while std::time::Instant::now() < deadline {
-        if events.lock().unwrap().iter().any(|e| e == expected) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    panic!("event {expected:?} was not delivered in time");
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err()
+    );
 }
 
 #[test]
@@ -448,20 +420,6 @@ fn noop_lease_updates_without_rebind() {
         fixture.fake.current_state(IFACE1).unwrap(),
         Some(state_with("1.1.1.1")),
         "restore returns to the base captured by the no-op apply"
-    );
-    assert!(journal_files(&fixture.dir).is_empty());
-}
-
-#[test]
-fn partial_apply_failure_rolls_back_without_journal_leak() {
-    let fixture = new_fixture("engine-partial-apply");
-    fixture.fake.inject_partial_apply_failure(1);
-    let err = fixture.manager.apply(&config(1, "1.1.1.1")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
-    assert_eq!(
-        fixture.fake.current_state(IFACE1).unwrap(),
-        Some(FakeState::Empty),
-        "the partial mutation must have been rolled back"
     );
     assert!(journal_files(&fixture.dir).is_empty());
 }

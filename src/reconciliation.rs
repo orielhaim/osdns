@@ -427,7 +427,7 @@ impl Inner {
         rollback_to: &PlatformSnapshot,
     ) -> ReconcileOutcome {
         let mut residue = crate::manager::MutationResidue::new();
-        let identity = lock_live(entry).record.identity.clone();
+        let identity = entry.lock().record.identity.clone();
         match self.mutate_and_verify(
             &identity,
             expected,
@@ -439,7 +439,7 @@ impl Inner {
             Ok(mutation) => self.commit_applied(resource, entry, mutation),
             Err(_) => {
                 if residue.leftover.is_some() {
-                    lock_live(entry).verified = residue.leftover;
+                    entry.lock().verified = residue.leftover;
                 }
                 ReconcileOutcome::Failed
             }
@@ -454,7 +454,7 @@ impl Inner {
         mutation: crate::platform::VerifiedMutation,
     ) -> ReconcileOutcome {
         let persisted = mutation.persist();
-        let mut live = lock_live(entry);
+        let mut live = entry.lock();
         live.record.applied = Some(persisted.clone());
         live.record.phase = Phase::Applied;
         match self.journal.write(&live.record) {
@@ -488,7 +488,7 @@ impl Inner {
         external_base: &PlatformSnapshot,
     ) -> ReconcileOutcome {
         {
-            let mut live = lock_live(entry);
+            let mut live = entry.lock();
             let old = live.record.clone();
             let old_verified = live.verified.clone();
             live.record.before = external_base.clone();
@@ -515,13 +515,9 @@ impl Inner {
             return ReconcileOutcome::Deferred;
         }
 
-        let desired = lock_live(entry).record.desired.clone();
+        let desired = entry.lock().record.desired.clone();
         self.apply_overlay(resource, entry, external_base, &desired, external_base)
     }
-}
-
-fn lock_live(entry: &Arc<Mutex<LiveRecord>>) -> parking_lot::MutexGuard<'_, LiveRecord> {
-    entry.lock()
 }
 
 /// Spawns the reconciliation worker for an Enforce-policy manager and returns

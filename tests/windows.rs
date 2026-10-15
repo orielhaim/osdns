@@ -82,7 +82,7 @@ fn global_scope_is_unsupported() {
 }
 
 #[test]
-fn validation_rejects_unrepresentable_configs() {
+fn validation_accepts_supported_split_dns() {
     let Some((manager, _state_dir)) = real_manager("win-validate") else {
         return;
     };

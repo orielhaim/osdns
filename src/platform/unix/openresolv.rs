@@ -16,7 +16,7 @@ use crate::ownership::ResourceId;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
 use crate::platform::unix::detect::{self, RESOLV_CONF_PATH};
 use crate::platform::unix::{ResourceMapper, WatchDirectory};
-use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
+use crate::platform::{Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 const STANDARD_STATE_DIRS: [&str; 2] = ["/run/resolvconf", "/var/run/resolvconf"];
@@ -1001,23 +1001,14 @@ impl Backend for Resolvconf {
         }
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<()> {
         let tag = self.tag_of(resource)?;
         self.add(
             &tag,
             &build_resolv_conf_content(plan),
             &ResolvconfAttributes::applied(),
         )?;
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
-    }
-
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let tag = self.tag_of(resource)?;
-        let record = self.read_record_state(&tag)?;
-        let live = self.read_live(resource)?;
-        Ok(self.to_platform(resource, record, Some(live)))
+        Ok(())
     }
 
     fn restore_bound(

@@ -15,8 +15,8 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::{
-    ApplyReceipt, Backend, IdentityData, MutationAttempt, PlatformSnapshot, ResourceIdentity,
-    ResourceStatus, SnapshotData,
+    Backend, IdentityData, MutationAttempt, PlatformSnapshot, ResourceIdentity, ResourceStatus,
+    SnapshotData,
 };
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
@@ -728,7 +728,7 @@ impl Backend for FakeBackend {
         self.snapshot_of(resource)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<()> {
         self.check_failure(FakeOp::Apply)?;
         let partial = {
             let mut inner = self.lock_inner();
@@ -762,9 +762,7 @@ impl Backend for FakeBackend {
                 format_args!("injected partial mutation before failure"),
             ));
         }
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
+        Ok(())
     }
 
     fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {

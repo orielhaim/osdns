@@ -37,40 +37,38 @@ fn fake_state(ns: &str, default_route: Option<bool>) -> FakeState {
 
 // ---- 1. default_route = None preserves; Some sets ----
 
-#[test]
-fn unspecified_default_route_preserves_true() {
-    let fixture = new_fixture("sem-dr-true");
+#[rstest::rstest]
+#[case(false)]
+#[case(true)]
+fn unspecified_default_route_preserves_current_value(#[case] enabled: bool) {
+    let fixture = new_fixture("sem-dr-preserve");
+    fixture
+        .fake
+        .external_change(IFACE1, fake_state("9.9.9.9", Some(enabled)))
+        .unwrap();
     let lease = fixture
         .manager
-        .apply(&config_with_default("1.1.1.1", Some(true)))
+        .apply(&config_with_default("1.1.1.1", None))
         .unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(fake_state("1.1.1.1", Some(true)))
+        Some(fake_state("1.1.1.1", Some(enabled)))
     );
-    lease.update(&config_with_default("1.1.1.1", None)).unwrap();
+    lease.update(&config_with_default("8.8.8.8", None)).unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(fake_state("1.1.1.1", Some(true))),
-        "None must preserve the existing true, never silently become false"
+        Some(fake_state("8.8.8.8", Some(enabled)))
+    );
+    lease.update(&config_with_default("8.8.8.8", None)).unwrap();
+    assert_eq!(
+        fixture.manager.snapshot(&scope1()).unwrap().default_route(),
+        Some(enabled)
     );
     lease.restore().unwrap();
-}
-
-#[test]
-fn unspecified_default_route_preserves_false() {
-    let fixture = new_fixture("sem-dr-false");
-    let lease = fixture
-        .manager
-        .apply(&config_with_default("1.1.1.1", Some(false)))
-        .unwrap();
-    lease.update(&config_with_default("1.1.1.1", None)).unwrap();
     assert_eq!(
         fixture.fake.current_state(IFACE1).unwrap(),
-        Some(fake_state("1.1.1.1", Some(false))),
-        "None must preserve the existing false"
+        Some(fake_state("9.9.9.9", Some(enabled)))
     );
-    lease.restore().unwrap();
 }
 
 #[test]
@@ -97,53 +95,21 @@ fn explicit_default_route_sets_value() {
     lease.restore().unwrap();
 }
 
-#[test]
-fn apply_with_unspecified_default_route_preserves() {
-    // Apply itself (not just update) must respect None: pre-seed true via an
-    // explicit apply, restore the lease without touching state is impossible
-    // (restore reverts), so instead verify via update-noop + readback.
-    let fixture = new_fixture("sem-dr-apply");
-    let lease = fixture
-        .manager
-        .apply(&config_with_default("1.1.1.1", Some(true)))
-        .unwrap();
-    // A no-op update with None must not rewrite the flag.
-    lease.update(&config_with_default("1.1.1.1", None)).unwrap();
-    let snapshot = fixture.manager.snapshot(&scope1()).unwrap();
-    assert_eq!(snapshot.default_route(), Some(true));
-    lease.restore().unwrap();
-}
-
 // ---- 2. capability matrix: unsupported fails before mutation ----
 
-fn caps_without(what: &str) -> Capabilities {
-    let base = Capabilities::new(BackendKind::Fake)
-        .with_read(true)
-        .with_global_dns(true)
-        .with_per_interface_dns(true)
-        .with_search_domains(true)
-        .with_split_dns(true)
-        .with_default_route(true)
-        .with_watch(true)
-        .with_cache_flush(true);
-    match what {
-        "default_route" => Capabilities::new(BackendKind::Fake)
+#[test]
+fn unsupported_default_route_fails_before_mutation() {
+    let dir = temp_dir("sem-unsupported-dr");
+    let fake = osdns::testing::FakeDns::with_capabilities(
+        Capabilities::new(BackendKind::Fake)
             .with_read(true)
             .with_global_dns(true)
             .with_per_interface_dns(true)
             .with_search_domains(true)
             .with_split_dns(true)
-            .with_default_route(false)
             .with_watch(true)
             .with_cache_flush(true),
-        _ => base,
-    }
-}
-
-#[test]
-fn unsupported_default_route_fails_before_mutation() {
-    let dir = temp_dir("sem-unsupported-dr");
-    let fake = osdns::testing::FakeDns::with_capabilities(caps_without("default_route"));
+    );
     let manager = osdns::testing::manager_for_testing(
         "io.osdns.test",
         &dir,
@@ -287,89 +253,39 @@ fn configured_nameservers(state: Option<FakeState>) -> Vec<std::net::IpAddr> {
     }
 }
 
-#[test]
-fn update_failure_before_first_resource_changes_nothing() {
+#[rstest::rstest]
+#[case::first_mutation(FakeOp::Apply, 0)]
+#[case::second_mutation(FakeOp::Apply, 1)]
+#[case::third_mutation(FakeOp::Apply, 2)]
+#[case::mutation_readback(FakeOp::Readback, 3)]
+fn update_failure_restores_previous_state_and_keeps_lease_usable(
+    #[case] operation: FakeOp,
+    #[case] skip: u32,
+) {
     let (fixture, lease) = three_resource_lease();
     fixture
         .fake
-        .inject_backend_failure(FakeOp::Apply, 1, "fail before A");
+        .inject_backend_failure_after(operation, skip, 1, "update failure");
     let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
     assert!(matches!(err, Error::Platform { .. }), "{err:?}");
     for resource in lease.resources() {
         assert_eq!(
             configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
             vec![ip("1.1.1.1")],
-            "resource {resource} must keep the old configuration"
+            "resource {resource}"
         );
     }
     assert_eq!(journal_files(&fixture.dir).len(), 3);
-    lease.restore().unwrap();
-}
-
-#[test]
-fn update_failure_during_second_resource_rolls_back_first() {
-    let (fixture, lease) = three_resource_lease();
-    fixture
-        .fake
-        .inject_backend_failure_after(FakeOp::Apply, 1, 1, "fail during B");
-    let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
-    for resource in lease.resources() {
-        assert_eq!(
-            configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
-            vec![ip("1.1.1.1")],
-            "resource {resource} must be rolled back to the old configuration"
-        );
-    }
-    assert_eq!(journal_files(&fixture.dir).len(), 3);
-    // The lease is still usable after the failed update.
     lease.update(&updated_three("8.8.8.8")).unwrap();
     for resource in lease.resources() {
         assert_eq!(
             configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
-            vec![ip("8.8.8.8")]
+            vec![ip("8.8.8.8")],
+            "resource {resource}"
         );
     }
     lease.restore().unwrap();
-}
-
-#[test]
-fn update_failure_during_third_resource_rolls_back_all() {
-    let (fixture, lease) = three_resource_lease();
-    fixture
-        .fake
-        .inject_backend_failure_after(FakeOp::Apply, 2, 1, "fail during C");
-    let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
-    for resource in lease.resources() {
-        assert_eq!(
-            configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
-            vec![ip("1.1.1.1")],
-            "resource {resource} must be rolled back"
-        );
-    }
-    assert_eq!(journal_files(&fixture.dir).len(), 3);
-    lease.restore().unwrap();
-}
-
-#[test]
-fn update_failure_during_readback_rolls_back() {
-    let (fixture, lease) = three_resource_lease();
-    // 3 ownership readbacks, then the first mutation readback fails.
-    fixture
-        .fake
-        .inject_backend_failure_after(FakeOp::Readback, 3, 1, "readback failed");
-    let err = lease.update(&updated_three("8.8.8.8")).unwrap_err();
-    assert!(matches!(err, Error::Platform { .. }), "{err:?}");
-    for resource in lease.resources() {
-        assert_eq!(
-            configured_nameservers(fixture.fake.current_state(resource.as_str()).unwrap()),
-            vec![ip("1.1.1.1")],
-            "resource {resource} must keep the old configuration"
-        );
-    }
-    assert_eq!(journal_files(&fixture.dir).len(), 3);
-    lease.restore().unwrap();
+    assert!(journal_files(&fixture.dir).is_empty());
 }
 
 #[test]

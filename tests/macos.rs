@@ -161,7 +161,6 @@ fn resolver_file_watch_reports_external_changes() {
             _ => {}
         }))
         .unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(200));
 
     std::fs::create_dir_all("/etc/resolver").unwrap();
     std::fs::write("/etc/resolver/watch-probe.test", b"nameserver 127.0.0.1\n").unwrap();

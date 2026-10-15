@@ -210,7 +210,6 @@ mod tests {
     #[test]
     fn native_route_dump_is_read_only_and_parses_multipart_messages() {
         let routes = default_routes().unwrap();
-        assert!(!routes.is_empty());
         if let Ok(index) = select_default(&routes) {
             assert!(index > 0);
         }

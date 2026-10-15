@@ -445,26 +445,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn multi_sz_malformed_terminator_is_error_not_absence() {
+    #[rstest::rstest]
+    #[case::missing_double_nul("a\0".encode_utf16().flat_map(u16::to_le_bytes).collect())]
+    #[case::unpaired_surrogate(vec![0x00, 0xD8, 0x00, 0x00, 0x00, 0x00])]
+    fn malformed_multi_sz_is_error_not_absence(#[case] bytes: Vec<u8>) {
         let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
         let key = volatile_key(&path);
-        // Single trailing NUL only — invalid for a non-empty REG_MULTI_SZ list.
-        let bytes: Vec<u8> = "a\0".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-        key.set_bytes("Name", Type::MultiString, &bytes).unwrap();
-        let error = key.get_multi_string("Name").unwrap_err();
-        drop(key);
-        CURRENT_USER.remove_tree(&path).unwrap();
-        // Must not look like "value missing".
-        assert!(!registry_not_found(&error));
-    }
-
-    #[test]
-    fn multi_sz_malformed_utf16_is_error() {
-        let path = format!(r"Software\osdns-test-{}", uuid::Uuid::new_v4());
-        let key = volatile_key(&path);
-        // Odd-length / unpaired surrogate payload with double-NUL terminator shape.
-        let bytes = vec![0x00, 0xD8, 0x00, 0x00, 0x00, 0x00];
         key.set_bytes("Name", Type::MultiString, &bytes).unwrap();
         let error = key.get_multi_string("Name").unwrap_err();
         drop(key);

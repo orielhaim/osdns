@@ -11,7 +11,7 @@ use crate::normalize::NormalizedConfig;
 use crate::ownership::ResourceId;
 use crate::platform::text_config::{build_resolv_conf_content, parse_resolv_conf_content};
 use crate::platform::unix::{ResourceMapper, WatchDirectory};
-use crate::platform::{ApplyReceipt, Backend, PlatformSnapshot, SnapshotData};
+use crate::platform::{Backend, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) trait DirectPolicy: Send + Sync {
@@ -167,11 +167,7 @@ impl DirectResolvConf {
         })
     }
 
-    fn apply_snapshot(
-        &self,
-        current: &DirectSnapshot,
-        plan: &NormalizedConfig,
-    ) -> Result<ApplyReceipt> {
+    fn apply_snapshot(&self, current: &DirectSnapshot, plan: &NormalizedConfig) -> Result<()> {
         let desired = build_resolv_conf_content(plan);
         self.write_content(&desired, current, false, current)?;
         let observed = self.read_current()?;
@@ -191,9 +187,7 @@ impl DirectResolvConf {
                 message: detail.to_string(),
             });
         }
-        Ok(ApplyReceipt {
-            resource: self.resource.clone(),
-        })
+        Ok(())
     }
 
     fn verify_expected(&self, expected: &DirectSnapshot) -> Result<()> {
@@ -313,10 +307,6 @@ impl Backend for DirectResolvConf {
     }
 
     fn capture(&self, _resource: &ResourceId) -> Result<PlatformSnapshot> {
-        Ok(self.to_platform(&self.read_current()?))
-    }
-
-    fn readback(&self, _resource: &ResourceId) -> Result<PlatformSnapshot> {
         Ok(self.to_platform(&self.read_current()?))
     }
 

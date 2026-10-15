@@ -22,8 +22,7 @@ use crate::platform::text_config::{
     resolved_domains_to_public,
 };
 use crate::platform::{
-    ApplyReceipt, Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus,
-    SnapshotData,
+    Backend, IdentityData, PlatformSnapshot, ResourceIdentity, ResourceStatus, SnapshotData,
 };
 use crate::watch::{DnsEvent, WatchCallback, WatchHandle};
 
@@ -485,22 +484,14 @@ impl Backend for SystemdResolved {
         to_platform_snapshot(resource, snapshot)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<()> {
         let ifindex = Self::ifindex_of(resource)?;
         // Preserve the current default-route flag when the plan leaves it
         // unspecified (`None`); only an explicit `Some(_)` may change it.
         let current = self.snapshot_of(resource, ifindex)?;
         let merged = ResolvedSnapshot::merged_from_plan(&current, plan);
         self.apply_snapshot(resource, ifindex, &merged)?;
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
-    }
-
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        let ifindex = Self::ifindex_of(resource)?;
-        let snapshot = self.snapshot_of(resource, ifindex)?;
-        to_platform_snapshot(resource, snapshot)
+        Ok(())
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {

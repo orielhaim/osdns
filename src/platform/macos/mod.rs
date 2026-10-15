@@ -7,9 +7,9 @@
 //! resolver files carry a first-line owner marker; a file that exists
 //! without our marker is never overwritten - the apply reports
 //! [`Error::Conflict`] with [`ConflictReason::ResourceOccupied`] instead.
-//! This makes multi-instance cleanup races impossible: a lease can only ever
-//! delete the exact files it created, never "everything that looks like
-//! ours".
+//! Replacement and deletion remain preflight-only: macOS cannot atomically
+//! compare an existing resolver file's identity and rename or unlink its name.
+//! A concurrent privileged writer can race the final comparison.
 //!
 //! The dynamic store changes touch only the runtime (`State:`) copy; the
 //! persisted (`Setup:`) copy belongs to the user. Unrelated dictionary
@@ -26,7 +26,7 @@ use crate::interface::InterfaceInfo;
 use crate::normalize::{DnsSuffix, NormalizedConfig};
 use crate::ownership::ResourceId;
 use crate::platform::macos::system_configuration as sc;
-use crate::platform::{ApplyReceipt, Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
+use crate::platform::{Backend, MutationAttempt, PlatformSnapshot, SnapshotData};
 use crate::watch::{WatchCallback, WatchHandle};
 
 pub(crate) mod resolver_files;
@@ -398,7 +398,7 @@ impl Backend for MacosBackend {
         self.to_platform(resource, &snapshot)
     }
 
-    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<ApplyReceipt> {
+    fn apply(&self, resource: &ResourceId, plan: &NormalizedConfig) -> Result<()> {
         let kind = Self::parse_resource(resource)?;
         match kind {
             ResourceKind::Service(id) => {
@@ -417,13 +417,7 @@ impl Backend for MacosBackend {
                 ));
             }
         }
-        Ok(ApplyReceipt {
-            resource: resource.clone(),
-        })
-    }
-
-    fn readback(&self, resource: &ResourceId) -> Result<PlatformSnapshot> {
-        self.capture(resource)
+        Ok(())
     }
 
     fn restore(&self, resource: &ResourceId, snapshot: &PlatformSnapshot) -> Result<()> {
